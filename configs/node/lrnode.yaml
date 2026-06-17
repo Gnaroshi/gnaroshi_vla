@@ -1,0 +1,7 @@
+name: lrnode
+description: Local LR-NODE Seer experiment context.
+default_cuda_visible_devices: "4,5,6,7"
+known_protocol_root: /home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616
+notes: >
+  This is a node/profile config record only. It does not allocate GPUs or
+  launch distributed jobs by itself.

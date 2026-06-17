@@ -1,0 +1,8 @@
+name: seer_ours_debug
+architecture: seer
+method: ours
+env: seer_libero
+action: sanity
+result_subdir: results/seer/ours/seer_ours_debug
+upstream_workdir: architectures/seer/upstream
+notes: Lightweight debug composition for the current LR-NODE Seer method.

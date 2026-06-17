@@ -1,0 +1,9 @@
+architecture: seer
+method: original
+env: seer_libero
+experiment: seer_original_debug
+action: sanity
+notes: >
+  Debug experiment record for Seer original/baseline behavior. This does not
+  launch evaluation by default.
+

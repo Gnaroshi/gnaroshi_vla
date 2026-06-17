@@ -1,0 +1,6 @@
+name: original
+architecture: seer
+description: Seer baseline behavior with LR-NODE disabled where scripts expose the flag.
+expected_flags:
+  use_lrnode_latent_update: 0
+  lrnode_eval_skip_full_forward: 0

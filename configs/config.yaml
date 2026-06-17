@@ -1,0 +1,16 @@
+defaults:
+  - architecture: seer
+  - method: ours
+  - env: seer_libero
+  - node: lrnode
+  - experiment: seer_ours_debug
+  - _self_
+
+project:
+  name: vla_ours
+  root: /home/mingyujung/private/vla_ours
+  results_root: results
+
+run:
+  action: sanity
+  notes: Initial lightweight debug composition.

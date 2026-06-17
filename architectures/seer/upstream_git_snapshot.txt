@@ -1,0 +1,13 @@
+source_path: /home/mingyujung/private/seer/seer_node3
+integrated_path: architectures/seer/upstream
+git_available: false
+reason: >
+  /home/mingyujung/private/seer/seer_node3 contains an empty .git directory,
+  but git status, git remote -v, and git rev-parse HEAD all report that it is
+  not a git repository.
+integration_policy: >
+  Initial integration is a non-git source copy. Future architecture repositories
+  should be cloned under architectures/<architecture>/upstream and their remote,
+  branch, commit, and dirty status should be recorded here and in
+  architectures/registry.yaml.
+

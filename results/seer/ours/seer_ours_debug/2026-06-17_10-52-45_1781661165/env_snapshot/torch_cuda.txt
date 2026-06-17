@@ -1,0 +1,13 @@
+torch_importable: true
+torch_version: 2.2.0+cu121
+cuda_available: True
+torch_cuda_version: 12.1
+cuda_device_count: 8
+cuda_device_0: NVIDIA GeForce RTX 3090
+cuda_device_1: NVIDIA GeForce RTX 3090
+cuda_device_2: NVIDIA GeForce RTX 3090
+cuda_device_3: NVIDIA GeForce RTX 3090
+cuda_device_4: NVIDIA GeForce RTX 3090
+cuda_device_5: NVIDIA GeForce RTX 3090
+cuda_device_6: NVIDIA GeForce RTX 3090
+cuda_device_7: NVIDIA GeForce RTX 3090

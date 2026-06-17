@@ -1,0 +1,181 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120" role="img" aria-labelledby="title desc">
+  <title id="title">Seer baseline and LR-NODE architecture</title>
+  <desc id="desc">Comparison diagram of the original Seer full-forward policy and the current LR-NODE latent update experiment.</desc>
+  <defs>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#ea580c"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#dc2626"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #d7dee8; stroke-width: 2; filter: url(#shadow); }
+      .panel-title { font: 800 30px "Noto Sans CJK KR", "Apple SD Gothic Neo", "Malgun Gothic", Inter, Arial, sans-serif; fill: #0f172a; }
+      .section-title { font: 800 23px "Noto Sans CJK KR", "Apple SD Gothic Neo", "Malgun Gothic", Inter, Arial, sans-serif; fill: #172554; }
+      .label { font: 700 19px "Noto Sans CJK KR", "Apple SD Gothic Neo", "Malgun Gothic", Inter, Arial, sans-serif; fill: #0f172a; }
+      .small { font: 500 15px "Noto Sans CJK KR", "Apple SD Gothic Neo", "Malgun Gothic", Inter, Arial, sans-serif; fill: #475569; }
+      .tiny { font: 500 13px "Noto Sans CJK KR", "Apple SD Gothic Neo", "Malgun Gothic", Inter, Arial, sans-serif; fill: #64748b; }
+      .code { font: 700 15px "JetBrains Mono", "SFMono-Regular", Consolas, monospace; fill: #334155; }
+      .box-blue { fill: #eff6ff; stroke: #60a5fa; stroke-width: 2; }
+      .box-blue-strong { fill: #dbeafe; stroke: #2563eb; stroke-width: 2.5; }
+      .box-green { fill: #ecfdf5; stroke: #34d399; stroke-width: 2; }
+      .box-green-strong { fill: #d1fae5; stroke: #059669; stroke-width: 2.5; }
+      .box-orange { fill: #fff7ed; stroke: #fb923c; stroke-width: 2; }
+      .box-orange-strong { fill: #fed7aa; stroke: #ea580c; stroke-width: 2.5; }
+      .box-red { fill: #fef2f2; stroke: #f87171; stroke-width: 2; }
+      .box-gray { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 2; }
+      .dash-red { stroke: #dc2626; stroke-width: 3; stroke-dasharray: 10 8; fill: none; marker-end: url(#arrow-red); }
+      .arrow-blue { stroke: #2563eb; stroke-width: 3; fill: none; marker-end: url(#arrow-blue); }
+      .arrow-green { stroke: #059669; stroke-width: 3; fill: none; marker-end: url(#arrow-green); }
+      .arrow-orange { stroke: #ea580c; stroke-width: 3; fill: none; marker-end: url(#arrow-orange); }
+      .note { fill: #fffbeb; stroke: #f59e0b; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1800" height="1120"/>
+
+  <text x="70" y="72" style="font: 900 40px 'Noto Sans CJK KR','Apple SD Gothic Neo','Malgun Gothic',Inter,Arial,sans-serif; fill:#0f172a;">
+    기존 Seer vs 현재 LR-NODE 실험 구조
+  </text>
+  <text x="72" y="108" class="small">
+    LR-NODE는 기존 action head를 대체하지 않고, action head에 들어가는 action_latent_full만 cheap visual-delta + fixed Euler NODE로 업데이트한다.
+  </text>
+
+  <!-- Left panel: baseline Seer -->
+  <rect x="60" y="145" width="650" height="880" rx="22" class="panel"/>
+  <text x="95" y="195" class="panel-title">1. 기존 Seer Baseline</text>
+  <text x="98" y="228" class="small">매 환경 step마다 full Seer forward를 수행</text>
+
+  <rect x="105" y="270" width="560" height="88" rx="14" class="box-blue"/>
+  <text x="135" y="304" class="label">입력 window</text>
+  <text x="135" y="330" class="small">primary RGB, wrist RGB, proprio/state, language goal</text>
+
+  <path d="M385 358 L385 407" class="arrow-blue"/>
+
+  <rect x="105" y="410" width="560" height="98" rx="14" class="box-blue"/>
+  <text x="135" y="445" class="label">토큰화 / embedding</text>
+  <text x="135" y="472" class="small">image patch tokens + state tokens + goal token</text>
+
+  <path d="M385 508 L385 557" class="arrow-blue"/>
+
+  <rect x="105" y="560" width="560" height="105" rx="14" class="box-blue-strong"/>
+  <text x="135" y="596" class="label">Seer Transformer full forward</text>
+  <text x="135" y="624" class="small">무거운 perception / temporal reasoning 경로</text>
+  <text x="135" y="647" class="tiny">LR-NODE disabled이면 이 경로의 수치 동작은 그대로 유지</text>
+
+  <path d="M385 665 L385 714" class="arrow-blue"/>
+
+  <rect x="105" y="717" width="560" height="104" rx="14" class="box-orange"/>
+  <text x="135" y="753" class="label">action_latent_full</text>
+  <text x="135" y="781" class="code">[B, S, action_pred_steps, D]</text>
+  <text x="135" y="804" class="tiny">action decoder/head에 직접 들어가는 latent token</text>
+
+  <path d="M385 821 L385 870" class="arrow-orange"/>
+
+  <rect x="105" y="873" width="560" height="92" rx="14" class="box-blue-strong"/>
+  <text x="135" y="908" class="label">기존 action decoder / head</text>
+  <text x="135" y="936" class="small">arm action + gripper action 출력</text>
+
+  <rect x="250" y="978" width="270" height="42" rx="21" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="306" y="1005" class="label">robot action</text>
+
+  <!-- Right panel: LR-NODE -->
+  <rect x="750" y="145" width="990" height="880" rx="22" class="panel"/>
+  <text x="785" y="195" class="panel-title">2. 현재 실험: LR-NODE Latent-Reactive NODE</text>
+  <text x="788" y="228" class="small">Full Seer를 teacher/cache refresh로 쓰고, skip step에서는 latent만 빠르게 업데이트</text>
+
+  <!-- Training section -->
+  <rect x="785" y="260" width="920" height="360" rx="18" fill="#ffffff" stroke="#bfdbfe" stroke-width="2"/>
+  <text x="815" y="300" class="section-title">Training: adjacent timestep latent distillation</text>
+
+  <rect x="815" y="330" width="235" height="92" rx="14" class="box-blue"/>
+  <text x="838" y="365" class="label">Full Seer teacher</text>
+  <text x="838" y="392" class="small">z_full[t], z_full[t+1]</text>
+
+  <rect x="815" y="475" width="235" height="92" rx="14" class="box-green"/>
+  <text x="838" y="510" class="label">cheap delta 입력</text>
+  <text x="838" y="537" class="small">RGB_t, RGB_t+1, q_t, q_t+1</text>
+
+  <path d="M1050 521 L1120 521" class="arrow-green"/>
+
+  <rect x="1125" y="475" width="250" height="92" rx="14" class="box-green-strong"/>
+  <text x="1148" y="510" class="label">FastVisualDeltaEncoder</text>
+  <text x="1148" y="537" class="small">64x64 diff-CNN + proprio delta</text>
+
+  <path d="M1050 376 L1120 444" class="dash-red"/>
+  <path d="M1375 521 L1445 521" class="arrow-green"/>
+
+  <rect x="1450" y="475" width="225" height="92" rx="14" class="box-orange-strong"/>
+  <text x="1472" y="510" class="label">u_delta</text>
+  <text x="1472" y="537" class="code">[B, S-1, motion_dim]</text>
+
+  <path d="M932 422 C932 447, 1025 447, 1125 447" class="dash-red"/>
+  <path d="M1563 475 L1563 422" class="arrow-orange"/>
+
+  <rect x="1125" y="330" width="550" height="92" rx="14" class="box-orange-strong"/>
+  <text x="1148" y="365" class="label">ControlledLatentNODE: fixed Euler update</text>
+  <text x="1148" y="392" class="code">z_pred = z_t + sigmoid(gate) * dt * MLP(z_t, u_delta, dt, age)</text>
+
+  <path d="M1400 330 L1400 287" class="arrow-orange"/>
+  <rect x="1125" y="245" width="550" height="44" rx="12" class="note"/>
+  <text x="1148" y="273" class="small">adaptive ODE solver 없음. RAFT/CoTracker 없음. MVP는 diff-CNN + Euler.</text>
+
+  <path d="M1400 422 L1400 453" class="arrow-orange"/>
+  <rect x="1125" y="585" width="250" height="26" rx="13" fill="#fff7ed" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="1143" y="604" class="tiny">gate는 -4.0 bias로 작게 시작</text>
+
+  <path d="M1675 376 L1695 376 L1695 640 L1530 640" class="dash-red"/>
+  <rect x="1125" y="635" width="405" height="74" rx="14" class="box-red"/>
+  <text x="1148" y="665" class="label">losses</text>
+  <text x="1148" y="692" class="small">L_latent + L_action_distill + L_smooth</text>
+
+  <rect x="815" y="635" width="270" height="74" rx="14" class="box-gray"/>
+  <text x="838" y="665" class="label">기존 action head 재사용</text>
+  <text x="838" y="692" class="small">distill branch에서는 freeze 가능</text>
+  <path d="M1125 672 L1085 672" class="dash-red"/>
+
+  <!-- Eval section -->
+  <rect x="785" y="735" width="920" height="245" rx="18" fill="#ffffff" stroke="#bbf7d0" stroke-width="2"/>
+  <text x="815" y="775" class="section-title">Evaluation: K-step query / skipped-step latent update</text>
+
+  <rect x="815" y="805" width="250" height="82" rx="14" class="box-blue-strong"/>
+  <text x="838" y="838" class="label">step % K == 0</text>
+  <text x="838" y="865" class="small">Full Seer 실행, z/key obs cache</text>
+
+  <path d="M1065 846 L1138 846" class="arrow-blue"/>
+
+  <rect x="1145" y="805" width="230" height="82" rx="14" class="box-green"/>
+  <text x="1168" y="838" class="label">skip step</text>
+  <text x="1168" y="865" class="small">cached z + current obs</text>
+
+  <path d="M1375 846 L1448 846" class="arrow-green"/>
+
+  <rect x="1455" y="805" width="220" height="82" rx="14" class="box-orange-strong"/>
+  <text x="1478" y="838" class="label">LR-NODE update</text>
+  <text x="1478" y="865" class="small">z_cache -> z_next</text>
+
+  <path d="M1565 887 L1565 926 L960 926 L960 890" class="arrow-orange"/>
+  <text x="1035" y="918" class="tiny">updated z를 다시 cache하고 다음 skip step에 사용</text>
+
+  <rect x="815" y="920" width="250" height="42" rx="21" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="849" y="947" class="label">same action head -> action</text>
+
+  <rect x="1110" y="920" width="565" height="42" rx="21" fill="#f1f5f9" stroke="#94a3b8" stroke-width="2"/>
+  <text x="1138" y="947" class="small">eval JSON/log: full calls, LR-NODE calls, latency, query reduction, success rate, videos</text>
+
+  <!-- Guardrails -->
+  <rect x="60" y="1040" width="1680" height="46" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="92" y="1070" class="small">
+    Guardrails: LR-NODE는 CLI flag로 비활성 기본값을 유지하며, 기존 Seer action head와 use_node_action_head branch를 제거하거나 대체하지 않는다.
+  </text>
+</svg>

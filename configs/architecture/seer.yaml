@@ -1,0 +1,11 @@
+name: seer
+status: active
+upstream_path: architectures/seer/upstream
+ours_path: architectures/seer/ours
+adapters_path: architectures/seer/adapters
+scripts_path: architectures/seer/scripts
+source_baseline_path: /home/mingyujung/private/seer/seer_node3
+default_env: seer_libero
+supported_methods:
+  - original
+  - ours

@@ -1,0 +1,17 @@
+[CONTEXT] root=/home/mingyujung/private/vla_ours
+[CONTEXT] architecture=seer method=ours env=seer_libero node=lrnode
+[CONTEXT] python=/home/mingyujung/miniconda3/envs/seer_libero/bin/python
+[CONTEXT] python_version=3.10.19
+[OK] architecture upstream: /home/mingyujung/private/vla_ours/architectures/seer/upstream
+[OK] architecture ours: /home/mingyujung/private/vla_ours/architectures/seer/ours
+[OK] architecture adapters: /home/mingyujung/private/vla_ours/architectures/seer/adapters
+[OK] env config: /home/mingyujung/private/vla_ours/configs/env/seer_libero.yaml
+[OK] method config: /home/mingyujung/private/vla_ours/configs/method/ours.yaml
+[OK] results schema: /home/mingyujung/private/vla_ours/results/README.md
+[OK] excluded heavy path absent: runs_lrnode_protocol_20260616
+[OK] excluded heavy path absent: archived_experiment_results_20260616
+[OK] excluded heavy path absent: checkpoints
+[OK] excluded heavy path absent: wandb
+[OPTIONAL] hydra importable=True
+[OPTIONAL] omegaconf importable=True
+[OPTIONAL] torch importable=True

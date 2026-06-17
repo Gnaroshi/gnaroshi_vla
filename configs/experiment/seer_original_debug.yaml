@@ -1,0 +1,8 @@
+name: seer_original_debug
+architecture: seer
+method: original
+env: seer_libero
+action: sanity
+result_subdir: results/seer/original/seer_original_debug
+upstream_workdir: architectures/seer/upstream
+notes: Lightweight debug composition for Seer baseline/original behavior.

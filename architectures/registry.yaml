@@ -1,0 +1,18 @@
+architectures:
+  - name: seer
+    status: active
+    upstream_path: architectures/seer/upstream
+    ours_path: architectures/seer/ours
+    adapters_path: architectures/seer/adapters
+    default_env: seer_libero
+    supported_methods:
+      - original
+      - ours
+    source_baseline_path: /home/mingyujung/private/seer/seer_node3
+    source_git_status: unavailable
+    notes: >
+      Current architecture integrated from seer_node3 by source copy. The source
+      directory contains an empty .git directory, but git commands do not
+      recognize it as a valid repository. Treat this initial integration as
+      non-git until architecture upstream repositories are cloned later.
+

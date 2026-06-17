@@ -1,0 +1,9 @@
+name: ours
+architecture: seer
+description: Current LR-NODE based Seer method.
+method_family: lrnode
+expected_flags:
+  use_lrnode_latent_update: 1
+  lrnode_train_latent_distill: 1
+code_status: mixed_into_current_seer_copy
+mixed_files_manifest: architectures/seer/MODIFIED_UPSTREAM_FILES.md

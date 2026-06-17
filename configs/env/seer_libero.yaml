@@ -1,0 +1,15 @@
+env_id: seer_libero
+architecture: seer
+manager: conda
+conda_env_name: seer_libero
+activation_command: conda activate seer_libero
+python_check_command: python -c "import sys; print(sys.executable)"
+torch_check_command: python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+env_export_files:
+  - architectures/seer/env/environment.seer_libero.yml
+  - architectures/seer/env/conda-list.seer_libero.txt
+  - architectures/seer/env/pip-freeze.seer_libero.txt
+notes: >
+  Hydra/config composition records this environment selection, but launch
+  scripts must activate the conda environment before Python starts.
+

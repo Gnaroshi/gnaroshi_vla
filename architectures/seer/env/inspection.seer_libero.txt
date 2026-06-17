@@ -1,0 +1,31 @@
+# seer_libero inspection
+
+## conda env list
+
+# conda environments:
+#
+# * -> active
+# + -> frozen
+base                 *   /home/mingyujung/miniconda3
+baku_libero              /home/mingyujung/miniconda3/envs/baku_libero
+seer_libero              /home/mingyujung/miniconda3/envs/seer_libero
+seer_libero-plus         /home/mingyujung/miniconda3/envs/seer_libero-plus
+
+
+## which python
+/home/mingyujung/miniconda3/envs/seer_libero/bin/python
+
+
+## python --version
+Python 3.10.19
+
+
+## sys.executable
+/home/mingyujung/miniconda3/envs/seer_libero/bin/python
+
+
+## torch/cuda
+torch 2.2.0+cu121
+cuda available False
+cuda 12.1
+
