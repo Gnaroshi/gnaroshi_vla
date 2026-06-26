@@ -1,0 +1,11 @@
+name: simvla_4gpu
+description: Default local 4-GPU SimVLA training profile.
+default_cuda_visible_devices_small: "0,1,2,3"
+default_cuda_visible_devices_large: "4,5,6,7"
+default_num_processes: 4
+default_main_process_port: 29504
+notes: >
+  This is a node/profile config record only. The SimVLA wrapper reads runtime
+  environment variables such as CUDA_VISIBLE_DEVICES, SIMVLA_NUM_PROCESSES, and
+  SIMVLA_MAIN_PROCESS_PORT when launching accelerate.
+

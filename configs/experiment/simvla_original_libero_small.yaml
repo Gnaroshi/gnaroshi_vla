@@ -1,0 +1,15 @@
+name: simvla_original_libero_small
+architecture: simvla
+method: original
+env: simvla_libero
+node: simvla_4gpu
+action: simvla_train_small
+result_subdir: results/simvla/original/simvla_libero_small
+upstream_workdir: architectures/simvla/SimVLA
+dataset_root: /home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO
+dataset_subdir: datasets
+model_size: small
+default_batch_size: 64
+default_learning_coef: 0.1
+notes: Upstream/original SimVLA LIBERO small action-transformer training.
+

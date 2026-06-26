@@ -19,7 +19,9 @@ keeps its own upstream repository, environment setup, configs, and execution
 style. Top-level configs record which environment should be used, but launch
 scripts must activate that environment before Python starts.
 
-## Current Architecture: Seer
+## Current Architectures
+
+### Seer
 
 - Source baseline: `/home/mingyujung/private/seer/seer_node3`
 - Integrated copy: `architectures/seer/upstream/`
@@ -29,6 +31,16 @@ scripts must activate that environment before Python starts.
 `seer_node3` was treated as a known-working baseline asset. It was copied, not
 renamed or modified.
 
+### SimVLA
+
+- Upstream repository: `https://github.com/LUOyk1999/SimVLA.git`
+- Upstream clone: `architectures/simvla/SimVLA/`
+- Known environment: `conda activate simvla_libero`
+- LIBERO root: `/home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO`
+
+SimVLA is kept as a clean upstream git clone. Dataset symlinks and training
+launchers are managed outside upstream under `architectures/simvla/scripts/`.
+
 ## Layout
 
 ```text
@@ -37,6 +49,13 @@ gnaroshi_vla/
     registry.yaml
     seer/
       upstream/
+      ours/
+      adapters/
+      configs/
+      env/
+      scripts/
+    simvla/
+      SimVLA/
       ours/
       adapters/
       configs/
@@ -79,6 +98,26 @@ SEER_SCRIPT=scripts/LIBERO_LONG/Seer/eval.sh \
 This is intentionally explicit because many upstream scripts launch distributed
 GPU jobs.
 
+For SimVLA dataset setup and checks:
+
+```bash
+bash architectures/simvla/scripts/prepare_libero_links.sh
+python architectures/simvla/scripts/check_libero_dataset.py
+bash scripts/run_experiment.sh architecture=simvla method=original env=simvla_libero \
+  node=simvla_4gpu experiment=simvla_original_libero_small action=simvla_check_data
+```
+
+To start SimVLA training with top-level result logging:
+
+```bash
+bash scripts/run_experiment.sh architecture=simvla method=original env=simvla_libero \
+  node=simvla_4gpu experiment=simvla_original_libero_small action=simvla_train_small
+```
+
+The SimVLA wrapper accepts environment overrides such as `CUDA_VISIBLE_DEVICES`,
+`SIMVLA_BATCH_SIZE`, `SIMVLA_NUM_PROCESSES`, `SIMVLA_MAIN_PROCESS_PORT`, and
+`SIMVLA_ITERS`.
+
 ## Adding a Future Architecture
 
 1. Create `architectures/<new_arch>/`.
@@ -117,3 +156,5 @@ README pointing to external checkpoint storage.
 - Generated runs/logs: `wandb/`, `lightning_logs/`, `runs/`, `logs/`
 - Heavy model files: `checkpoints/`, `ckpts/`, `*.pth`, `*.pt`, `*.ckpt`
 - Per-run checkpoint directories under `results/`
+- Upstream nested clone contents unless intentionally converted to a git
+  submodule, for example `architectures/simvla/SimVLA/`

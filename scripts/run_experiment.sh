@@ -53,17 +53,20 @@ echo "[RUN CONTEXT] experiment=${experiment}"
 echo "[RUN CONTEXT] action=${action}"
 echo "[RUN CONTEXT] result_dir=${result_dir}"
 
-if [[ "${env_id}" == "seer_libero" ]]; then
-    if command -v conda >/dev/null 2>&1; then
-        # shellcheck disable=SC1091
-        eval "$(conda shell.bash hook)"
-        conda activate seer_libero
-    else
-        echo "[WARN] conda not found; continuing with current shell environment" >&2
-    fi
-else
-    echo "[WARN] no activation rule implemented for env=${env_id}; continuing with current shell environment" >&2
-fi
+case "${env_id}" in
+    seer_libero|simvla_libero)
+        if command -v conda >/dev/null 2>&1; then
+            # shellcheck disable=SC1091
+            eval "$(conda shell.bash hook)"
+            conda activate "${env_id}"
+        else
+            echo "[WARN] conda not found; continuing with current shell environment" >&2
+        fi
+        ;;
+    *)
+        echo "[WARN] no activation rule implemented for env=${env_id}; continuing with current shell environment" >&2
+        ;;
+esac
 
 echo "[PYTHON] $(command -v python)"
 python --version
@@ -88,6 +91,9 @@ else
 fi
 
 upstream_dir="${ROOT_DIR}/architectures/${architecture}/upstream"
+if [[ "${architecture}" == "simvla" ]]; then
+    upstream_dir="${ROOT_DIR}/architectures/simvla/SimVLA"
+fi
 if git -C "${upstream_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     {
         git -C "${upstream_dir}" rev-parse HEAD
@@ -135,6 +141,32 @@ case "${action}" in
             exit 2
         fi
         run_cmd=(bash "${upstream_dir}/${SEER_SCRIPT}")
+        ;;
+    simvla_prepare_data)
+        if [[ "${architecture}" != "simvla" ]]; then
+            echo "[ERROR] action=simvla_prepare_data is only valid for architecture=simvla" >&2
+            exit 2
+        fi
+        run_cmd=(bash "${ROOT_DIR}/architectures/simvla/scripts/prepare_libero_links.sh")
+        ;;
+    simvla_check_data)
+        if [[ "${architecture}" != "simvla" ]]; then
+            echo "[ERROR] action=simvla_check_data is only valid for architecture=simvla" >&2
+            exit 2
+        fi
+        run_cmd=(python "${ROOT_DIR}/architectures/simvla/scripts/check_libero_dataset.py")
+        ;;
+    simvla_train_small|simvla_train_large)
+        if [[ "${architecture}" != "simvla" ]]; then
+            echo "[ERROR] action=${action} is only valid for architecture=simvla" >&2
+            exit 2
+        fi
+        model_size="${action#simvla_train_}"
+        run_cmd=(
+            bash "${ROOT_DIR}/architectures/simvla/scripts/train_libero.sh"
+            --model-size "${model_size}"
+            --result-dir "${result_dir}"
+        )
         ;;
     *)
         echo "[ERROR] Unknown action: ${action}" >&2

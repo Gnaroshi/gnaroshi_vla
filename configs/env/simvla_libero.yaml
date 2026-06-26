@@ -1,0 +1,16 @@
+env_id: simvla_libero
+architecture: simvla
+manager: conda
+conda_env_name: simvla_libero
+activation_command: conda activate simvla_libero
+python_check_command: python -c "import sys; print(sys.executable)"
+torch_check_command: python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+env_export_files:
+  - architectures/simvla/env/environment.simvla_libero.yml
+  - architectures/simvla/env/conda-list.simvla_libero.txt
+  - architectures/simvla/env/pip-freeze.simvla_libero.txt
+  - architectures/simvla/env/inspection.simvla_libero.txt
+notes: >
+  Hydra/config composition records this environment selection, but launch
+  scripts must activate the conda environment before Python starts.
+

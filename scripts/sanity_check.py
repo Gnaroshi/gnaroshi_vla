@@ -36,6 +36,15 @@ def require_path(path: Path, label: str) -> bool:
     return False
 
 
+def architecture_upstream_path(root: Path, architecture: str) -> Path:
+    default = root / "architectures" / architecture / "upstream"
+    if default.exists():
+        return default
+    if architecture == "simvla":
+        return root / "architectures" / "simvla" / "SimVLA"
+    return default
+
+
 def main() -> int:
     args = parse_key_values(sys.argv[1:])
     root = Path(__file__).resolve().parents[1]
@@ -44,8 +53,9 @@ def main() -> int:
     print(f"[CONTEXT] python={sys.executable}")
     print(f"[CONTEXT] python_version={sys.version.split()[0]}")
 
+    upstream = architecture_upstream_path(root, args["architecture"])
     checks = [
-        require_path(root / "architectures" / args["architecture"] / "upstream", "architecture upstream"),
+        require_path(upstream, "architecture upstream"),
         require_path(root / "architectures" / args["architecture"] / "ours", "architecture ours"),
         require_path(root / "architectures" / args["architecture"] / "adapters", "architecture adapters"),
         require_path(root / "configs" / "env" / f"{args['env']}.yaml", "env config"),
@@ -53,7 +63,6 @@ def main() -> int:
         require_path(root / "results" / "README.md", "results schema"),
     ]
 
-    upstream = root / "architectures" / args["architecture"] / "upstream"
     for heavy_name in ["runs_lrnode_protocol_20260616", "archived_experiment_results_20260616", "checkpoints", "wandb"]:
         heavy_path = upstream / heavy_name
         if heavy_path.exists():

@@ -1,0 +1,15 @@
+name: simvla
+status: active
+upstream_path: architectures/simvla/SimVLA
+ours_path: architectures/simvla/ours
+adapters_path: architectures/simvla/adapters
+scripts_path: architectures/simvla/scripts
+source_repository: https://github.com/LUOyk1999/SimVLA.git
+source_commit: 32700d0ad8991996e123e4b685abe370ce6e9aab
+default_env: simvla_libero
+supported_methods:
+  - original
+notes: >
+  SimVLA is kept as a clean upstream git clone under architectures/simvla/SimVLA.
+  gnaroshi_vla-managed wrappers and configs live outside the upstream clone.
+

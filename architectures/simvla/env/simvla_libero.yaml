@@ -1,0 +1,17 @@
+env_id: simvla_libero
+architecture: simvla
+manager: conda
+conda_env_name: simvla_libero
+activation_command: conda activate simvla_libero
+python_check_command: python -c "import sys; print(sys.executable)"
+torch_check_command: python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+notes: >
+  Environment created for SimVLA LIBERO training. It follows upstream SimVLA
+  installation requirements, including PyTorch CUDA 12.4, transformers>=4.57.0,
+  accelerate, flash-attn, TensorFlow, and HDF5 tooling.
+snapshot_files:
+  - architectures/simvla/env/environment.simvla_libero.yml
+  - architectures/simvla/env/conda-list.simvla_libero.txt
+  - architectures/simvla/env/pip-freeze.simvla_libero.txt
+  - architectures/simvla/env/inspection.simvla_libero.txt
+

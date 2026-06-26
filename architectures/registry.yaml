@@ -16,3 +16,18 @@ architectures:
       recognize it as a valid repository. Treat this initial integration as
       non-git until architecture upstream repositories are cloned later.
 
+  - name: simvla
+    status: active
+    upstream_path: architectures/simvla/SimVLA
+    ours_path: architectures/simvla/ours
+    adapters_path: architectures/simvla/adapters
+    default_env: simvla_libero
+    supported_methods:
+      - original
+    source_repository: https://github.com/LUOyk1999/SimVLA.git
+    source_commit: 32700d0ad8991996e123e4b685abe370ce6e9aab
+    dataset_root: /home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO
+    notes: >
+      Upstream SimVLA is kept as a separate clean git clone under
+      architectures/simvla/SimVLA. gnaroshi_vla-managed wrappers, configs, and
+      result conventions live outside the upstream clone.

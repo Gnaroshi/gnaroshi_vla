@@ -35,12 +35,18 @@ ckpts/
 *.ckpt
 *.safetensors
 
+# Upstream architecture clones kept as separate git repositories unless
+# intentionally converted to git submodules.
+architectures/simvla/SimVLA/
+
 # Per-run checkpoint payloads. Keep README/schema files.
 results/*/*/*/*/
 results/*/*/*/*/checkpoints/
 
 # Keep these tracked if this workspace later commits them.
 !results/README.md
+!architectures/**/env/
+!architectures/**/env/README.md
 !architectures/**/env/*.yml
 !architectures/**/env/*.yaml
 !architectures/**/env/*.txt
