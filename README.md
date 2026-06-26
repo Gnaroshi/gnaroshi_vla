@@ -1,9 +1,9 @@
-# vla_ours
+# gnaroshi_vla
 
-`vla_ours` is a top-level research workspace for multi-architecture VLA experiments.
-It is intentionally not named `vla_seer_ours` because Seer is only the first
-architecture being integrated. Future architectures such as OpenPI or
-VLA-Adapter should live beside Seer under `architectures/`.
+`gnaroshi_vla` is a top-level research workspace for multi-architecture VLA
+experiments. It is intentionally architecture-neutral because Seer is only the
+first architecture being integrated. Future architectures such as SimVLA,
+OpenPI, or VLA-Adapter should live beside Seer under `architectures/`.
 
 ## Design
 
@@ -32,7 +32,7 @@ renamed or modified.
 ## Layout
 
 ```text
-vla_ours/
+gnaroshi_vla/
   architectures/
     registry.yaml
     seer/
@@ -117,4 +117,3 @@ README pointing to external checkpoint storage.
 - Generated runs/logs: `wandb/`, `lightning_logs/`, `runs/`, `logs/`
 - Heavy model files: `checkpoints/`, `ckpts/`, `*.pth`, `*.pt`, `*.ckpt`
 - Per-run checkpoint directories under `results/`
-

@@ -66,6 +66,44 @@ def _is_rank0() -> bool:
         return True
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return bool(int(os.environ.get(name, default)))
+
+
+def _eval_control_hz() -> float:
+    value = float(os.environ.get("EVAL_CONTROL_HZ", os.environ.get("LIBERO_CONTROL_HZ", "20")))
+    if value <= 0:
+        raise ValueError(f"EVAL_CONTROL_HZ must be positive, got {value}")
+    return value
+
+
+def _base_control_hz() -> float:
+    value = float(os.environ.get("EVAL_BASE_CONTROL_HZ", "20"))
+    if value <= 0:
+        raise ValueError(f"EVAL_BASE_CONTROL_HZ must be positive, got {value}")
+    return value
+
+
+def _scaled_step_count(base_steps: int, control_hz: float) -> int:
+    if not _env_flag("EVAL_SCALE_MAX_STEPS_WITH_HZ", "1"):
+        return int(base_steps)
+    return max(1, int(round(float(base_steps) * control_hz / _base_control_hz())))
+
+
+def _settle_steps(control_hz: float) -> int:
+    base_settle_steps = int(os.environ.get("EVAL_BASE_SETTLE_STEPS", "5"))
+    if not _env_flag("EVAL_SCALE_SETTLE_STEPS_WITH_HZ", os.environ.get("EVAL_SCALE_MAX_STEPS_WITH_HZ", "1")):
+        return base_settle_steps
+    return max(1, int(round(float(base_settle_steps) * control_hz / _base_control_hz())))
+
+
+def _env_horizon(eval_max_steps: int, settle_steps: int) -> int:
+    requested = int(os.environ.get("EVAL_ENV_HORIZON", "0"))
+    if requested > 0:
+        return requested
+    return max(1000, int(eval_max_steps) + int(settle_steps) + 10)
+
+
 def save_episode_video(frames, out_path: str, fps: int = 20):
     """Save eval frames to mp4, falling back to gif if ffmpeg/libx264 is unavailable."""
     if frames is None or len(frames) == 0 or imageio is None:
@@ -102,7 +140,8 @@ class ModelWrapper:
     def __init__(self, model, tokenizer, image_processor, cast_dtype, history_len=10,
                  use_ensembling=False, ensembling_temp=0.01, libero_eval_max_steps=600, action_pred_steps=3,
                  gripper_width=False, use_lrnode_latent_update=0, lrnode_eval_skip_full_forward=0,
-                 lrnode_query_interval=1, lrnode_eval_step_log=0, lrnode_eval_shadow_full_forward=0):
+                 lrnode_query_interval=1, lrnode_eval_step_log=0, lrnode_eval_shadow_full_forward=0,
+                 lrnode_eval_refresh_policy="periodic", lrnode_eval_max_full_forwards_per_episode=1):
         super().__init__()
         self.model = model
         self.cast_type = cast_dtype
@@ -128,6 +167,13 @@ class ModelWrapper:
         self.lrnode_query_interval = max(1, int(lrnode_query_interval))
         self.lrnode_eval_step_log = bool(lrnode_eval_step_log)
         self.lrnode_eval_shadow_full_forward = bool(lrnode_eval_shadow_full_forward)
+        self.lrnode_eval_refresh_policy = str(lrnode_eval_refresh_policy)
+        if self.lrnode_eval_refresh_policy not in {"periodic", "first_only", "fixed_budget"}:
+            raise ValueError(f"Unknown lrnode_eval_refresh_policy={self.lrnode_eval_refresh_policy}")
+        self.lrnode_eval_max_full_forwards_per_episode = max(
+            1, int(lrnode_eval_max_full_forwards_per_episode)
+        )
+        self.lrnode_episode_full_forward_calls = 0
         self.lrnode_cached_latent = None
         self.lrnode_cached_image_primary = None
         self.lrnode_cached_image_wrist = None
@@ -182,6 +228,7 @@ class ModelWrapper:
         self.lrnode_cached_image_wrist = None
         self.lrnode_cached_state = None
         self.lrnode_cached_age = 0
+        self.lrnode_episode_full_forward_calls = 0
         self.current_step_records = []
         self.current_episode_start_time = time.perf_counter()
         self.last_action = None
@@ -234,12 +281,37 @@ class ModelWrapper:
         return action
 
     def _should_use_lrnode(self, timestep):
-        return (
+        if not (
             self.use_lrnode_latent_update
             and self.lrnode_eval_skip_full_forward
             and self.lrnode_cached_latent is not None
-            and timestep % self.lrnode_query_interval != 0
-        )
+        ):
+            return False
+
+        if self.lrnode_eval_refresh_policy == "first_only":
+            return True
+
+        if self.lrnode_eval_refresh_policy == "fixed_budget":
+            if self.lrnode_episode_full_forward_calls >= self.lrnode_eval_max_full_forwards_per_episode:
+                return True
+            stride = max(
+                1,
+                int(np.ceil(float(self.libero_eval_max_steps) / self.lrnode_eval_max_full_forwards_per_episode)),
+            )
+            return timestep % stride != 0
+
+        return timestep % self.lrnode_query_interval != 0
+
+    def _full_refresh_reason(self, timestep):
+        if self.lrnode_cached_latent is None:
+            return "cache_empty"
+        if not (self.use_lrnode_latent_update and self.lrnode_eval_skip_full_forward):
+            return "normal_full"
+        if self.lrnode_eval_refresh_policy == "periodic":
+            return "scheduled_periodic"
+        if self.lrnode_eval_refresh_policy == "fixed_budget":
+            return "scheduled_fixed_budget"
+        return "forced_full"
 
     def _cache_full_forward_state(self, action_latent, selected_step, image_x, gripper, state):
         if not self.use_lrnode_latent_update:
@@ -333,6 +405,8 @@ class ModelWrapper:
             "full_forward_calls": self.full_forward_calls,
             "lrnode_update_calls": self.lrnode_update_calls,
             "num_fallback_full_calls": 0,
+            "refresh_policy": self.lrnode_eval_refresh_policy,
+            "max_full_forwards_per_episode": int(self.lrnode_eval_max_full_forwards_per_episode),
             "avg_full_forward_latency_sec": avg_full_latency,
             "avg_lrnode_latency_sec": avg_lrnode_latency,
             "avg_fast_encoder_latency_sec": (
@@ -402,6 +476,8 @@ class ModelWrapper:
             time.perf_counter() - self.current_episode_start_time
             if self.current_episode_start_time is not None else 0.0
         )
+        control_hz = _eval_control_hz()
+        settle_steps = _settle_steps(control_hz)
         metrics = {
             "episode_id": int(getattr(env, "exp_id", 0)),
             "task_id": int(getattr(env, "task_id", -1)),
@@ -409,9 +485,17 @@ class ModelWrapper:
             "seed": int(getattr(args, "seed", 0)),
             "success": int(success),
             "num_steps": int(steps),
+            "control_hz": float(control_hz),
+            "base_control_hz": float(_base_control_hz()),
+            "eval_max_steps": int(args.libero_eval_max_steps),
+            "settle_steps": int(settle_steps),
+            "env_horizon": int(_env_horizon(args.libero_eval_max_steps, settle_steps)),
+            "scale_max_steps_with_hz": int(_env_flag("EVAL_SCALE_MAX_STEPS_WITH_HZ", "1")),
             "lrnode_enabled": int(self.use_lrnode_latent_update),
             "eval_skip_full_forward": int(self.lrnode_eval_skip_full_forward),
             "query_interval": int(self.lrnode_query_interval),
+            "refresh_policy": self.lrnode_eval_refresh_policy,
+            "max_full_forwards_per_episode": int(self.lrnode_eval_max_full_forwards_per_episode),
             "mode_full_count": int(full_count),
             "mode_update_count": int(update_count),
             "mode_hold_count": int(hold_count),
@@ -476,6 +560,8 @@ class ModelWrapper:
             "mode": "full",
             "cache_age": int(self.lrnode_cached_age),
             "query_interval": int(self.lrnode_query_interval),
+            "refresh_policy": self.lrnode_eval_refresh_policy,
+            "max_full_forwards_per_episode": int(self.lrnode_eval_max_full_forwards_per_episode),
             "full_forward_ms": 0.0,
             "fast_encoder_ms": 0.0,
             "node_update_ms": 0.0,
@@ -674,11 +760,12 @@ class ModelWrapper:
                 full_ms = (time.perf_counter() - t0) * 1000.0
                 self.full_forward_latency_sum += full_ms / 1000.0
                 self.full_forward_calls += 1
+                self.lrnode_episode_full_forward_calls += 1
                 step_record.update(
                     {
                         "mode": "full",
                         "full_forward_ms": full_ms,
-                        "full_refresh_reason": "scheduled" if timestep % self.lrnode_query_interval == 0 else "cache_empty",
+                        "full_refresh_reason": self._full_refresh_reason(timestep),
                     }
                 )
 
@@ -800,6 +887,9 @@ def evaluate_policy_ddp(args, model):
     device_id = torch.distributed.get_rank()
     results = []
     local_episode_metrics = []
+    control_hz = _eval_control_hz()
+    settle_steps = _settle_steps(control_hz)
+    env_horizon = _env_horizon(args.libero_eval_max_steps, settle_steps)
     if "libero" in args.finetune_type:
         if args.finetune_type == "libero_10":
             global num_eval_episodes
@@ -831,9 +921,16 @@ def evaluate_policy_ddp(args, model):
             "bddl_file_name": task_bddl_file,
             "camera_heights": args.libero_img_size,
             "camera_widths": args.libero_img_size,
-            "render_gpu_device_id": device_id
+            "render_gpu_device_id": device_id,
+            "control_freq": int(round(control_hz)),
+            "horizon": env_horizon,
         }
         print("device_id :", device_id)
+        print(
+            f"[LIBERO ENV] control_freq={env_args['control_freq']}, "
+            f"eval_max_steps={args.libero_eval_max_steps}, "
+            f"settle_steps={settle_steps}, horizon={env_horizon}"
+        )
         env = OffScreenRenderEnv(**env_args)
         env.exp_id = exp_id
         env.task_id = task_id
@@ -850,7 +947,7 @@ def evaluate_policy_ddp(args, model):
         init_state = init_states[exp_id]
         obs = env.set_init_state(init_state)
 
-        for _ in range(5):  # simulate the physics without any actions
+        for _ in range(settle_steps):  # simulate the physics without any actions
             env.step(np.zeros(7))
 
         result, episode_metrics = evaluate_libero_task(task, env, obs, args, model)
@@ -1071,10 +1168,23 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
     success_rate = float(np.mean(valid_results)) if valid_results else 0.0
     lrnode_stats = merge_lrnode_stats(lrnode_stats_list)
     episode_metrics = episode_metrics or []
-    control_hz = float(os.environ.get("EVAL_CONTROL_HZ", os.environ.get("LIBERO_CONTROL_HZ", "20")))
+    control_hz = _eval_control_hz()
+    settle_steps = _settle_steps(control_hz)
+    env_horizon = _env_horizon(args.libero_eval_max_steps, settle_steps)
     query_interval = max(1, int(args.lrnode_query_interval))
-    effective_full_query_hz = control_hz / query_interval if bool(args.lrnode_eval_skip_full_forward) else control_hz
-    effective_lrnode_update_hz = max(0.0, control_hz - effective_full_query_hz)
+    nominal_full_query_hz = control_hz / query_interval if bool(args.lrnode_eval_skip_full_forward) else control_hz
+    nominal_lrnode_update_hz = max(0.0, control_hz - nominal_full_query_hz)
+    num_env_steps = int(lrnode_stats.get("num_env_steps", 0))
+    if num_env_steps > 0:
+        effective_full_query_hz = (
+            control_hz * float(lrnode_stats.get("full_forward_calls", 0)) / float(num_env_steps)
+        )
+        effective_lrnode_update_hz = (
+            control_hz * float(lrnode_stats.get("lrnode_update_calls", 0)) / float(num_env_steps)
+        )
+    else:
+        effective_full_query_hz = nominal_full_query_hz
+        effective_lrnode_update_hz = nominal_lrnode_update_hz
 
     task_results = []
     for j in range(task_num):
@@ -1094,12 +1204,31 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
         "run_name": args.run_name,
         "suite": args.finetune_type,
         "success_rate": success_rate,
+        "environment": {
+            "control_freq": int(round(control_hz)),
+            "control_hz": control_hz,
+            "base_control_hz": _base_control_hz(),
+            "eval_max_steps": int(args.libero_eval_max_steps),
+            "settle_steps": int(settle_steps),
+            "env_horizon": int(env_horizon),
+            "scale_max_steps_with_hz": _env_flag("EVAL_SCALE_MAX_STEPS_WITH_HZ", "1"),
+            "scale_settle_steps_with_hz": _env_flag(
+                "EVAL_SCALE_SETTLE_STEPS_WITH_HZ",
+                os.environ.get("EVAL_SCALE_MAX_STEPS_WITH_HZ", "1"),
+            ),
+        },
         "lrnode": {
             "enabled": bool(args.use_lrnode_latent_update),
             "eval_skip_full_forward": bool(args.lrnode_eval_skip_full_forward),
             "query_interval": query_interval,
+            "eval_refresh_policy": getattr(args, "lrnode_eval_refresh_policy", "periodic"),
+            "max_full_forwards_per_episode": int(
+                getattr(args, "lrnode_eval_max_full_forwards_per_episode", 1)
+            ),
             "control_hz": control_hz,
             "effective_action_hz": control_hz,
+            "nominal_full_query_hz": nominal_full_query_hz,
+            "nominal_lrnode_update_hz": nominal_lrnode_update_hz,
             "effective_full_query_hz": effective_full_query_hz,
             "effective_lrnode_update_hz": effective_lrnode_update_hz,
             "detach_input_latent": bool(args.lrnode_detach_input_latent),
@@ -1196,6 +1325,18 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
 def eval_one_epoch_libero_ddp(args, model, image_processor, tokenizer):
     cast_dtype = get_cast_dtype(args.precision)
     hist_len = args.sequence_length
+    control_hz = _eval_control_hz()
+    base_eval_max_steps = int(args.libero_eval_max_steps)
+    scaled_eval_max_steps = _scaled_step_count(base_eval_max_steps, control_hz)
+    if _is_rank0():
+        print(
+            f"[LIBERO ENV] EVAL_CONTROL_HZ={control_hz:.2f}, "
+            f"base_control_hz={_base_control_hz():.2f}, "
+            f"base_eval_max_steps={base_eval_max_steps}, "
+            f"actual_eval_max_steps={scaled_eval_max_steps}, "
+            f"scale_max_steps_with_hz={_env_flag('EVAL_SCALE_MAX_STEPS_WITH_HZ', '1')}"
+        )
+    args.libero_eval_max_steps = scaled_eval_max_steps
     wrapped_model = ModelWrapper(
         model,
         tokenizer,
@@ -1211,5 +1352,7 @@ def eval_one_epoch_libero_ddp(args, model, image_processor, tokenizer):
         lrnode_eval_skip_full_forward=args.lrnode_eval_skip_full_forward,
         lrnode_query_interval=args.lrnode_query_interval,
         lrnode_eval_step_log=args.lrnode_eval_step_log,
-        lrnode_eval_shadow_full_forward=args.lrnode_eval_shadow_full_forward)
+        lrnode_eval_shadow_full_forward=args.lrnode_eval_shadow_full_forward,
+        lrnode_eval_refresh_policy=args.lrnode_eval_refresh_policy,
+        lrnode_eval_max_full_forwards_per_episode=args.lrnode_eval_max_full_forwards_per_episode)
     evaluate_policy_ddp(args, wrapped_model)

@@ -1,4 +1,4 @@
-# Codex Guidance for vla_ours
+# Codex Guidance for gnaroshi_vla
 
 This is a multi-architecture VLA research workspace.
 
@@ -24,4 +24,3 @@ Rules for future sessions:
   `results/<architecture>/<method>/<experiment>/<timestamp_runid>/`.
 - Do not copy large checkpoints into the workspace by default. Record paths or
   symlinks instead.
-

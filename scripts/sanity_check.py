@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lightweight vla_ours sanity checks.
+"""Lightweight gnaroshi_vla sanity checks.
 
 This script intentionally avoids importing heavy Seer modules or launching GPU
 jobs. It checks workspace structure and reports whether optional packages such as
@@ -70,4 +70,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

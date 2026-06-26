@@ -207,6 +207,26 @@ def get_parser(is_eval=False):
     parser.add_argument("--loss_action", default=False, action="store_true")
     parser.add_argument("--loss_image", default=False, action="store_true")
 
+    # Seer-only teacher distillation control. Disabled by default.
+    parser.add_argument(
+        "--seer_distill_teacher_ckpt",
+        type=str,
+        default=None,
+        help=(
+            "Optional frozen Seer teacher checkpoint for Seer-only distillation controls. "
+            "This is separate from LR-NODE and is used to test whether teacher KD itself, "
+            "without the LR-NODE skip module, changes full-Seer K=1 performance."
+        ),
+    )
+    parser.add_argument("--seer_distill_action_weight", type=float, default=0.0)
+    parser.add_argument("--seer_distill_latent_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--seer_distill_teacher_eval_mode",
+        type=int,
+        default=1,
+        help="When 1, keep the Seer distillation teacher in eval mode during training.",
+    )
+
     # LR-NODE latent update. Disabled by default.
     parser.add_argument("--use_lrnode_latent_update", type=int, default=0)
     parser.add_argument("--lrnode_train_latent_distill", type=int, default=0)
@@ -273,6 +293,23 @@ def get_parser(is_eval=False):
     parser.add_argument("--lrnode_debug_artifact_interval", type=int, default=0)
     parser.add_argument("--lrnode_eval_step_log", type=int, default=0)
     parser.add_argument("--lrnode_eval_shadow_full_forward", type=int, default=0)
+    parser.add_argument(
+        "--lrnode_eval_refresh_policy",
+        type=str,
+        default="periodic",
+        choices=["periodic", "first_only", "fixed_budget"],
+        help=(
+            "Full-Seer refresh policy during LR-NODE eval. 'periodic' is the existing K-step "
+            "refresh; 'first_only' runs full Seer only once at episode start; 'fixed_budget' "
+            "uses lrnode_eval_max_full_forwards_per_episode full queries spread across the episode."
+        ),
+    )
+    parser.add_argument(
+        "--lrnode_eval_max_full_forwards_per_episode",
+        type=int,
+        default=1,
+        help="Episode-level full-Seer query budget for first_only/fixed_budget LR-NODE eval policies.",
+    )
     
     # calvin
     parser.add_argument("--except_lang", default=False, action="store_true")

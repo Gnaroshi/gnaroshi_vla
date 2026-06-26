@@ -7,8 +7,8 @@ defaults:
   - _self_
 
 project:
-  name: vla_ours
-  root: /home/mingyujung/private/vla_ours
+  name: gnaroshi_vla
+  root: /home/mingyujung/private/gnaroshi_vla
   results_root: results
 
 run:

@@ -46,6 +46,53 @@ def _save_eval_args_snapshot(args):
             json.dump(payload, f, indent=2, default=str)
 
 
+def _checkpoint_state_dict(checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if "model_state_dict" not in checkpoint:
+        raise KeyError(f"Checkpoint does not contain 'model_state_dict': {checkpoint_path}")
+    return checkpoint, checkpoint["model_state_dict"]
+
+
+def _is_lrnode_adapter_only_state_dict(state_dict):
+    keys = list(state_dict.keys())
+    if not keys:
+        return False
+    has_lrnode = any("lrnode_" in key or ".lrnode" in key for key in keys)
+    has_core_seer = any(
+        marker in key
+        for key in keys
+        for marker in (
+            "transformer_backbone",
+            "action_decoder",
+            "action_pred_token",
+            "perceiver_resampler",
+            "image_primary_projector",
+            "image_wrist_projector",
+        )
+    )
+    return has_lrnode and not has_core_seer
+
+
+def _load_checkpoint_into_model(ddp_model, checkpoint_path, label, rank):
+    checkpoint, state_dict = _checkpoint_state_dict(checkpoint_path)
+    ret = ddp_model.load_state_dict(state_dict, False)
+    if rank == 0:
+        print(f"[CKPT LOAD:{label}] path={checkpoint_path}")
+        print(f"[CKPT LOAD:{label}] epoch={checkpoint.get('epoch', 'NA')}")
+        print(f"[CKPT LOAD:{label}] state_dict_keys={len(state_dict)}")
+        print(f"[CKPT LOAD:{label}] adapter_only={_is_lrnode_adapter_only_state_dict(state_dict)}")
+        try:
+            print(f"[CKPT LOAD:{label}] missing_keys={len(ret.missing_keys)}")
+            if len(ret.missing_keys) > 0:
+                print(ret.missing_keys[:50])
+            print(f"[CKPT LOAD:{label}] unexpected_keys={len(ret.unexpected_keys)}")
+            if len(ret.unexpected_keys) > 0:
+                print(ret.unexpected_keys[:50])
+        except Exception:
+            pass
+    return ret, state_dict
+
+
 @record
 def main():
     parser = get_parser(is_eval=True)
@@ -61,6 +108,11 @@ def main():
         print(f"[EVAL ARGS] use_lrnode_latent_update={bool(args.use_lrnode_latent_update)}")
         print(f"[EVAL ARGS] lrnode_eval_skip_full_forward={bool(args.lrnode_eval_skip_full_forward)}")
         print(f"[EVAL ARGS] lrnode_query_interval={args.lrnode_query_interval}")
+        print(f"[EVAL ARGS] lrnode_eval_refresh_policy={args.lrnode_eval_refresh_policy}")
+        print(
+            "[EVAL ARGS] "
+            f"lrnode_eval_max_full_forwards_per_episode={args.lrnode_eval_max_full_forwards_per_episode}"
+        )
         print(f"[EVAL ARGS] lrnode_hidden_dim={args.lrnode_hidden_dim}")
         print(f"[EVAL ARGS] lrnode_motion_dim={args.lrnode_motion_dim}")
         print(f"[EVAL ARGS] lrnode_fast_encoder_type={args.lrnode_fast_encoder_type}")
@@ -133,21 +185,38 @@ def main():
     model._init_model_type()
     ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=True)
 
+    if (
+        bool(args.use_lrnode_latent_update)
+        and args.lrnode_train_protocol == "adapter"
+        and args.resume_from_checkpoint is not None
+        and args.finetune_from_pretrained_ckpt is None
+    ):
+        _, resume_state_dict = _checkpoint_state_dict(args.resume_from_checkpoint)
+        if _is_lrnode_adapter_only_state_dict(resume_state_dict):
+            raise ValueError(
+                "Adapter-only LR-NODE checkpoint was passed to --resume_from_checkpoint "
+                "without --finetune_from_pretrained_ckpt. Eval would leave the frozen Seer/action "
+                "head randomly initialized. Pass the baseline full Seer checkpoint via "
+                "--finetune_from_pretrained_ckpt, then pass the adapter checkpoint via "
+                "--resume_from_checkpoint."
+            )
+
+    if args.finetune_from_pretrained_ckpt is not None:
+        _load_checkpoint_into_model(
+            ddp_model,
+            args.finetune_from_pretrained_ckpt,
+            "base",
+            args.rank,
+        )
+
     if args.resume_from_checkpoint is not None:
+        _load_checkpoint_into_model(
+            ddp_model,
+            args.resume_from_checkpoint,
+            "resume_or_adapter",
+            args.rank,
+        )
         if args.rank == 0:
-            print(f"Loading checkpoint from {args.resume_from_checkpoint}")
-        checkpoint = torch.load(args.resume_from_checkpoint, map_location="cpu")
-        ret = ddp_model.load_state_dict(checkpoint["model_state_dict"], False)
-        if args.rank == 0:
-            try:
-                print(f"[CKPT LOAD] missing_keys: {len(ret.missing_keys)}")
-                if len(ret.missing_keys) > 0:
-                    print(ret.missing_keys[:50])
-                print(f"[CKPT LOAD] unexpected_keys: {len(ret.unexpected_keys)}")
-                if len(ret.unexpected_keys) > 0:
-                    print(ret.unexpected_keys[:50])
-            except Exception:
-                pass
             m = ddp_model.module
             print(f"[EVAL MODEL] use_lrnode_latent_update={getattr(m, 'use_lrnode_latent_update', None)}")
             print(f"[EVAL MODEL] lrnode_hidden_dim={getattr(m, 'lrnode_hidden_dim', None)}")

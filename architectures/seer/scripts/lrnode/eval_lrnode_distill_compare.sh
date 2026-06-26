@@ -23,7 +23,7 @@ if [[ -z "${BASELINE_CKPT:-}" && -z "${BASELINE_RUN_NAME:-}" && -z "${BASELINE_C
     BASELINE_CKPT_ROOT="${LRNODE_SAVE_CHECKPOINT_PATH}"
     echo "[EVAL INFO] loaded latest baseline run from ${latest_baseline}"
 fi
-BASELINE_CKPT_ID="${BASELINE_CKPT_ID:-37}"
+BASELINE_CKPT_ID="${BASELINE_CKPT_ID:-33}"
 if [[ -z "${BASELINE_CKPT:-}" && ( -z "${BASELINE_RUN_NAME:-}" || -z "${BASELINE_CKPT_ROOT:-}" ) ]]; then
     echo "[ERROR] Baseline checkpoint is not configured." >&2
     echo "[ERROR] Run scratch.sh first or set BASELINE_CKPT=/path/to/baseline.pth." >&2
@@ -66,7 +66,8 @@ export LRNODE_PROTOCOL_ROOT="${protocol_root}"
 export LRNODE_TRAIN_PROTOCOL="adapter"
 export LRNODE_FREEZE_SEER_FOR_ADAPTER="1"
 export LRNODE_ASSERT_ONLY_LRNODE_TRAINABLE="1"
-export LRNODE_QUERY_INTERVALS_STR="${LRNODE_QUERY_INTERVALS_STR:-2 3 4 5 6 8}"
+export LRNODE_EVAL_BASE_CKPT="${LRNODE_EVAL_BASE_CKPT:-${BASELINE_CKPT}}"
+export LRNODE_QUERY_INTERVALS_STR="${LRNODE_QUERY_INTERVALS_STR-2 3 4 5 6 8}"
 
 # Keep efficiency logging on. Shadow full-forward is off by default because it
 # changes measured policy latency by adding extra full forward calls.

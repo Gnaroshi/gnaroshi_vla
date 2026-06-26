@@ -1,6 +1,6 @@
 # Seer Architecture
 
-Seer is the first architecture integrated into `vla_ours`.
+Seer is the first architecture integrated into `gnaroshi_vla`.
 
 ## Directories
 
@@ -9,7 +9,7 @@ Seer is the first architecture integrated into `vla_ours`.
 - `adapters/`: wrappers and integration points between upstream Seer and our method.
 - `configs/`: Seer-local config notes and overlays.
 - `env/`: Seer environment documentation and export files.
-- `scripts/`: Seer helper scripts managed by `vla_ours`.
+- `scripts/`: Seer helper scripts managed by `gnaroshi_vla`.
 
 ## Environment
 
@@ -32,4 +32,3 @@ mixed files in `MODIFIED_UPSTREAM_FILES.md`.
 
 Future refactors should move method-owned code into `ours/` and use `adapters/`
 for upstream integration.
-

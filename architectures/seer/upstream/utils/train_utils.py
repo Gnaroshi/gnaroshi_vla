@@ -1,7 +1,7 @@
 import time
 import os
 import json
-from contextlib import suppress
+from contextlib import suppress, contextmanager
 from pathlib import Path
 
 import torch
@@ -66,6 +66,10 @@ def module_grad_norm(module):
             continue
         total_sq_norm += float(param.grad.detach().float().norm(2).item() ** 2)
     return total_sq_norm ** 0.5
+
+
+def _is_lrnode_parameter_name(name):
+    return name.startswith("lrnode_delta_encoder.") or name.startswith("lrnode_dynamics.")
 
 
 def _float_item(value):
@@ -166,6 +170,25 @@ def _corrcoef(x, y):
     return (x * y).sum() / denom
 
 
+@contextmanager
+def _preserve_torch_rng(device=None):
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_state = None
+    cuda_device = None
+    if torch.cuda.is_available():
+        if device is None:
+            cuda_device = torch.cuda.current_device()
+        else:
+            cuda_device = int(device)
+        cuda_rng_state = torch.cuda.get_rng_state(cuda_device)
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, cuda_device)
+
+
 def _save_lrnode_debug_artifacts(args, global_step, tensors):
     interval = int(getattr(args, "lrnode_debug_artifact_interval", 0))
     if interval <= 0 or getattr(args, "rank", 0) != 0 or global_step % interval != 0:
@@ -226,6 +249,7 @@ def _save_lrnode_debug_artifacts(args, global_step, tensors):
 def train_one_epoch_calvin(
     args,
     model,
+    seer_distill_teacher_model,
     epoch,
     calvin_loader,
     optimizer,
@@ -303,6 +327,18 @@ def train_one_epoch_calvin(
         label_actions = torch.cat([actions[:, j:args.sequence_length-args.atten_goal+j, :].unsqueeze(-2) for j in range(args.action_pred_steps)], dim=-2) 
 
         train_lrnode = bool(args.use_lrnode_latent_update and args.lrnode_train_latent_distill)
+        train_seer_distill = (
+            seer_distill_teacher_model is not None
+            and (
+                float(getattr(args, "seer_distill_action_weight", 0.0)) > 0.0
+                or float(getattr(args, "seer_distill_latent_weight", 0.0)) > 0.0
+            )
+        )
+        if train_lrnode and train_seer_distill:
+            raise RuntimeError(
+                "LR-NODE distillation and Seer-only distillation controls are intentionally "
+                "mutually exclusive. Run distill_node.sh and distill_seer.sh as separate controls."
+            )
         lrnode_teacher_target_mode = getattr(args, "lrnode_teacher_target_mode", "shifted_context")
         if lrnode_teacher_target_mode not in {"shifted_context", "adjacent_sequence"}:
             raise RuntimeError(
@@ -315,67 +351,50 @@ def train_one_epoch_calvin(
 
         with autocast():  # image_primary, image_wrist, state, language_instruction
             use_shifted_context_target = train_lrnode and lrnode_teacher_target_mode == "shifted_context"
-            model_outputs = model(
-                image_primary=input_image_primary,
-                image_wrist=input_image_wrist,
-                state=input_state,
-                text_token=input_text_token,
-                action=actions[:, :args.sequence_length, :],
-                return_action_latent=train_lrnode,
-                lrnode_compute_loss=train_lrnode and not use_shifted_context_target,
-                lrnode_key_image_primary=input_image_primary[:, :-1] if train_lrnode and not use_shifted_context_target else None,
-                lrnode_key_image_wrist=input_image_wrist[:, :-1] if train_lrnode and not use_shifted_context_target else None,
-                lrnode_cur_image_primary=input_image_primary[:, 1:] if train_lrnode and not use_shifted_context_target else None,
-                lrnode_cur_image_wrist=input_image_wrist[:, 1:] if train_lrnode and not use_shifted_context_target else None,
-                lrnode_q_key=input_state[:, :-1] if train_lrnode and not use_shifted_context_target else None,
-                lrnode_q_cur=input_state[:, 1:] if train_lrnode and not use_shifted_context_target else None,
-                lrnode_detach_input_latent=bool(args.lrnode_detach_input_latent),
-                lrnode_detach_teacher_latent=bool(args.lrnode_detach_teacher_latent),
-                lrnode_freeze_action_head_for_lrnode=bool(args.lrnode_freeze_action_head_for_lrnode),
-                lrnode_multistep_train=bool(args.lrnode_multistep_train),
-                lrnode_train_max_horizon=int(args.lrnode_train_max_horizon),
-            )
-            if train_lrnode:
-                arm_pred_action = model_outputs["arm_pred_action"]
-                gripper_pred_action = model_outputs["gripper_pred_action"]
-                image_pred = model_outputs["image_pred"]
-                arm_pred_state = model_outputs["arm_pred_state"]
-                gripper_pred_state = model_outputs["gripper_pred_state"]
-                loss_arm_action = model_outputs["loss_arm_action"]
-                action_latent_full = model_outputs["action_latent"]
-                if use_shifted_context_target:
-                    if bool(args.lrnode_multistep_train):
-                        raise RuntimeError(
-                            "lrnode_multistep_train=1 is only implemented for "
-                            "lrnode_teacher_target_mode=adjacent_sequence."
-                        )
-                    if images_primary.shape[1] < args.sequence_length + 1:
-                        raise RuntimeError(
-                            "LR-NODE shifted_context target requires one extra frame beyond "
-                            f"sequence_length={args.sequence_length}, got image window length {images_primary.shape[1]}"
-                        )
-                    if input_states.shape[1] < args.sequence_length + 1:
-                        raise RuntimeError(
-                            "LR-NODE shifted_context target requires one extra state beyond "
-                            f"sequence_length={args.sequence_length}, got state window length {input_states.shape[1]}"
-                        )
-                    if action_latent_full is None or action_latent_full.dim() != 4:
-                        raise RuntimeError(
-                            "LR-NODE shifted_context target requires action_latent_full "
-                            f"[B, S, action_pred_steps, D], got {None if action_latent_full is None else tuple(action_latent_full.shape)}"
-                        )
+            lrnode_z_teacher_next_external = None
+            lrnode_selected_step = None
+            seer_teacher_outputs = None
+            input_image_primary_next = None
+            input_image_wrist_next = None
+            input_state_next = None
+            if use_shifted_context_target:
+                if bool(args.lrnode_multistep_train):
+                    raise RuntimeError(
+                        "lrnode_multistep_train=1 is only implemented for "
+                        "lrnode_teacher_target_mode=adjacent_sequence."
+                    )
+                if images_primary.shape[1] < args.sequence_length + 1:
+                    raise RuntimeError(
+                        "LR-NODE shifted_context target requires one extra frame beyond "
+                        f"sequence_length={args.sequence_length}, got image window length {images_primary.shape[1]}"
+                    )
+                if input_states.shape[1] < args.sequence_length + 1:
+                    raise RuntimeError(
+                        "LR-NODE shifted_context target requires one extra state beyond "
+                        f"sequence_length={args.sequence_length}, got state window length {input_states.shape[1]}"
+                    )
 
-                    input_image_primary_next = images_primary[:, 1:args.sequence_length + 1, :]
-                    input_image_wrist_next = images_wrist[:, 1:args.sequence_length + 1, :]
-                    input_text_token_next = text_tokens[:, 1:args.sequence_length + 1, :]
-                    input_state_next = input_states[:, 1:args.sequence_length + 1, :]
-                    action_next = actions[:, 1:args.sequence_length + 1, :]
-                    if input_text_token_next.shape[1] != args.sequence_length:
-                        raise RuntimeError(
-                            "LR-NODE shifted_context target requires text context length "
-                            f"{args.sequence_length}, got {input_text_token_next.shape[1]}"
-                        )
+                input_image_primary_next = images_primary[:, 1:args.sequence_length + 1, :]
+                input_image_wrist_next = images_wrist[:, 1:args.sequence_length + 1, :]
+                input_text_token_next = text_tokens[:, 1:args.sequence_length + 1, :]
+                input_state_next = input_states[:, 1:args.sequence_length + 1, :]
+                action_next = actions[:, 1:args.sequence_length + 1, :]
+                if input_text_token_next.shape[1] != args.sequence_length:
+                    raise RuntimeError(
+                        "LR-NODE shifted_context target requires text context length "
+                        f"{args.sequence_length}, got {input_text_token_next.shape[1]}"
+                    )
 
+                lrnode_selected_step = int(getattr(args, "lrnode_context_selected_step", -1))
+                if lrnode_selected_step < 0:
+                    lrnode_selected_step = args.sequence_length + lrnode_selected_step
+                if lrnode_selected_step < 0 or lrnode_selected_step >= args.sequence_length:
+                    raise RuntimeError(
+                        f"lrnode_context_selected_step resolves to {lrnode_selected_step}, "
+                        f"but valid range is [0, {args.sequence_length - 1}]"
+                    )
+
+                with _preserve_torch_rng(device_id):
                     with torch.no_grad():
                         teacher_outputs_next = model(
                             image_primary=input_image_primary_next,
@@ -386,78 +405,107 @@ def train_one_epoch_calvin(
                             return_action_latent=True,
                             lrnode_compute_loss=False,
                         )
-                    if teacher_outputs_next["action_latent"] is None or teacher_outputs_next["action_latent"].dim() != 4:
-                        raise RuntimeError(
-                            "LR-NODE shifted_context teacher forward did not return action_latent "
-                            f"[B, S, action_pred_steps, D], got "
-                            f"{None if teacher_outputs_next['action_latent'] is None else tuple(teacher_outputs_next['action_latent'].shape)}"
-                        )
-
-                    selected_step = int(getattr(args, "lrnode_context_selected_step", -1))
-                    if selected_step < 0:
-                        selected_step = args.sequence_length + selected_step
-                    if selected_step < 0 or selected_step >= args.sequence_length:
-                        raise RuntimeError(
-                            f"lrnode_context_selected_step resolves to {selected_step}, "
-                            f"but valid range is [0, {args.sequence_length - 1}]"
-                        )
-
-                    # Architecture-agnostic teacher-probe target:
-                    # C_t is the normal policy context, C_{t+1} is the same policy context shifted by one
-                    # environment step. For Seer, we probe the selected action-token latent from both contexts.
-                    z_prev = action_latent_full[:, selected_step]
-                    z_teacher_next = teacher_outputs_next["action_latent"][:, selected_step]
-                    if bool(args.lrnode_detach_input_latent):
-                        z_prev = z_prev.detach()
-                    if bool(args.lrnode_detach_teacher_latent):
-                        z_teacher_next = z_teacher_next.detach()
-
-                    z_pred_next = base_model.lrnode_predict_next_latent(
-                        z_prev=z_prev,
-                        key_image_primary=input_image_primary[:, selected_step],
-                        key_image_wrist=input_image_wrist[:, selected_step],
-                        cur_image_primary=input_image_primary_next[:, selected_step],
-                        cur_image_wrist=input_image_wrist_next[:, selected_step],
-                        q_key=input_state[:, selected_step],
-                        q_cur=input_state_next[:, selected_step],
-                        dt=1.0,
-                        age=1.0,
+                if teacher_outputs_next["action_latent"] is None or teacher_outputs_next["action_latent"].dim() != 4:
+                    raise RuntimeError(
+                        "LR-NODE shifted_context teacher forward did not return action_latent "
+                        f"[B, S, action_pred_steps, D], got "
+                        f"{None if teacher_outputs_next['action_latent'] is None else tuple(teacher_outputs_next['action_latent'].shape)}"
                     )
-                    lrnode_gate = getattr(base_model.lrnode_dynamics, "last_gate", None)
-                    lrnode_u_delta = getattr(base_model.lrnode_delta_encoder, "last_u_delta", None)
-                    lrnode_dz = getattr(base_model.lrnode_dynamics, "last_dz", None)
-                    lrnode_update = getattr(base_model.lrnode_dynamics, "last_update", None)
-                    if z_pred_next.shape != z_teacher_next.shape:
-                        raise RuntimeError(
-                            f"LR-NODE shifted_context latent prediction shape mismatch: "
-                            f"pred={tuple(z_pred_next.shape)}, teacher={tuple(z_teacher_next.shape)}"
-                        )
+                lrnode_z_teacher_next_external = teacher_outputs_next["action_latent"][:, lrnode_selected_step]
 
-                    lrnode_arm_action, lrnode_gripper_action = base_model.decode_lrnode_action_from_latent(
-                        z_pred_next,
-                        freeze_action_head=bool(args.lrnode_freeze_action_head_for_lrnode),
-                    )
+            if train_seer_distill:
+                if bool(getattr(args, "seer_distill_teacher_eval_mode", 1)):
+                    seer_distill_teacher_model.eval()
+                with _preserve_torch_rng(device_id):
                     with torch.no_grad():
-                        teacher_arm_action, teacher_gripper_action = base_model.decode_action_from_latent(
-                            z_teacher_next.detach()
+                        seer_teacher_outputs = seer_distill_teacher_model(
+                            image_primary=input_image_primary,
+                            image_wrist=input_image_wrist,
+                            state=input_state,
+                            text_token=input_text_token,
+                            action=actions[:, :args.sequence_length, :],
+                            return_action_latent=True,
+                            lrnode_compute_loss=False,
                         )
-                        hold_arm_action, hold_gripper_action = base_model.decode_action_from_latent(
-                            z_prev.detach()
-                        )
-                        lrnode_teacher_action = torch.cat([teacher_arm_action, teacher_gripper_action], dim=-1)
-                        lrnode_hold_action = torch.cat([hold_arm_action, hold_gripper_action], dim=-1)
-                else:
-                    z_prev = model_outputs["lrnode_z_prev"]
-                    z_teacher_next = model_outputs["lrnode_z_teacher_next"]
-                    z_pred_next = model_outputs["lrnode_z_pred_next"]
-                    lrnode_arm_action = model_outputs["lrnode_arm_action"]
-                    lrnode_gripper_action = model_outputs["lrnode_gripper_action"]
-                    lrnode_teacher_action = model_outputs["lrnode_teacher_action"]
-                    lrnode_hold_action = model_outputs["lrnode_hold_action"]
-                    lrnode_gate = model_outputs["lrnode_gate"]
-                    lrnode_u_delta = model_outputs.get("lrnode_u_delta")
-                    lrnode_dz = model_outputs.get("lrnode_dz")
-                    lrnode_update = model_outputs.get("lrnode_update")
+                if not isinstance(seer_teacher_outputs, dict):
+                    raise RuntimeError("Seer distillation teacher forward did not return an output dict")
+
+            model_outputs = model(
+                image_primary=input_image_primary,
+                image_wrist=input_image_wrist,
+                state=input_state,
+                text_token=input_text_token,
+                action=actions[:, :args.sequence_length, :],
+                return_action_latent=(train_lrnode or train_seer_distill),
+                lrnode_compute_loss=train_lrnode,
+                lrnode_key_image_primary=(
+                    input_image_primary[:, lrnode_selected_step]
+                    if use_shifted_context_target else
+                    (input_image_primary[:, :-1] if train_lrnode else None)
+                ),
+                lrnode_key_image_wrist=(
+                    input_image_wrist[:, lrnode_selected_step]
+                    if use_shifted_context_target else
+                    (input_image_wrist[:, :-1] if train_lrnode else None)
+                ),
+                lrnode_cur_image_primary=(
+                    input_image_primary_next[:, lrnode_selected_step]
+                    if use_shifted_context_target else
+                    (input_image_primary[:, 1:] if train_lrnode else None)
+                ),
+                lrnode_cur_image_wrist=(
+                    input_image_wrist_next[:, lrnode_selected_step]
+                    if use_shifted_context_target else
+                    (input_image_wrist[:, 1:] if train_lrnode else None)
+                ),
+                lrnode_q_key=(
+                    input_state[:, lrnode_selected_step]
+                    if use_shifted_context_target else
+                    (input_state[:, :-1] if train_lrnode else None)
+                ),
+                lrnode_q_cur=(
+                    input_state_next[:, lrnode_selected_step]
+                    if use_shifted_context_target else
+                    (input_state[:, 1:] if train_lrnode else None)
+                ),
+                lrnode_detach_input_latent=bool(args.lrnode_detach_input_latent),
+                lrnode_detach_teacher_latent=bool(args.lrnode_detach_teacher_latent),
+                lrnode_freeze_action_head_for_lrnode=bool(args.lrnode_freeze_action_head_for_lrnode),
+                lrnode_multistep_train=bool(args.lrnode_multistep_train),
+                lrnode_train_max_horizon=int(args.lrnode_train_max_horizon),
+                lrnode_z_teacher_next_external=lrnode_z_teacher_next_external,
+                lrnode_selected_step=lrnode_selected_step,
+            )
+            if train_lrnode:
+                arm_pred_action = model_outputs["arm_pred_action"]
+                gripper_pred_action = model_outputs["gripper_pred_action"]
+                image_pred = model_outputs["image_pred"]
+                arm_pred_state = model_outputs["arm_pred_state"]
+                gripper_pred_state = model_outputs["gripper_pred_state"]
+                loss_arm_action = model_outputs["loss_arm_action"]
+                action_latent_full = model_outputs["action_latent"]
+                z_prev = model_outputs["lrnode_z_prev"]
+                z_teacher_next = model_outputs["lrnode_z_teacher_next"]
+                z_pred_next = model_outputs["lrnode_z_pred_next"]
+                lrnode_arm_action = model_outputs["lrnode_arm_action"]
+                lrnode_gripper_action = model_outputs["lrnode_gripper_action"]
+                lrnode_teacher_action = model_outputs["lrnode_teacher_action"]
+                lrnode_hold_action = model_outputs["lrnode_hold_action"]
+                lrnode_gate = model_outputs["lrnode_gate"]
+                lrnode_u_delta = model_outputs.get("lrnode_u_delta")
+                lrnode_dz = model_outputs.get("lrnode_dz")
+                lrnode_update = model_outputs.get("lrnode_update")
+            elif train_seer_distill:
+                arm_pred_action = model_outputs["arm_pred_action"]
+                gripper_pred_action = model_outputs["gripper_pred_action"]
+                image_pred = model_outputs["image_pred"]
+                arm_pred_state = model_outputs["arm_pred_state"]
+                gripper_pred_state = model_outputs["gripper_pred_state"]
+                loss_arm_action = model_outputs["loss_arm_action"]
+                action_latent_full = model_outputs["action_latent"]
+                lrnode_u_delta = None
+                lrnode_dz = None
+                lrnode_update = None
             else:
                 arm_pred_action, gripper_pred_action, image_pred, arm_pred_state, gripper_pred_state, loss_arm_action = model_outputs
                 lrnode_u_delta = None
@@ -501,6 +549,8 @@ def train_one_epoch_calvin(
         loss_lrnode_bc = torch.tensor([0.0]).to(device_id)
         loss_lrnode_hold_latent = torch.tensor([0.0]).to(device_id)
         loss_lrnode_hold_action = torch.tensor([0.0]).to(device_id)
+        loss_seer_distill_action = torch.tensor([0.0]).to(device_id)
+        loss_seer_distill_latent = torch.tensor([0.0]).to(device_id)
         lrnode_z_prev_mean = torch.tensor([0.0]).to(device_id)
         lrnode_z_prev_std = torch.tensor([0.0]).to(device_id)
         lrnode_z_teacher_mean = torch.tensor([0.0]).to(device_id)
@@ -513,6 +563,8 @@ def train_one_epoch_calvin(
         lrnode_gate_max = torch.tensor([0.0]).to(device_id)
         train_log_metrics = {}
         lrnode_action = None
+        seer_student_action = None
+        seer_teacher_action = None
 
         if train_lrnode:
             if action_latent_full is None:
@@ -586,6 +638,40 @@ def train_one_epoch_calvin(
                         )
                         loss_lrnode_bc = loss_lrnode_bc_arm + loss_lrnode_bc_gripper
 
+        if train_seer_distill:
+            if seer_teacher_outputs is None:
+                raise RuntimeError("train_seer_distill=True but teacher outputs are missing")
+            seer_student_action = torch.cat([arm_pred_action, gripper_pred_action], dim=-1)
+            seer_teacher_action = torch.cat(
+                [
+                    seer_teacher_outputs["arm_pred_action"],
+                    seer_teacher_outputs["gripper_pred_action"],
+                ],
+                dim=-1,
+            ).detach()
+            if seer_student_action.shape != seer_teacher_action.shape:
+                raise RuntimeError(
+                    f"Seer action distillation shape mismatch: student={tuple(seer_student_action.shape)}, "
+                    f"teacher={tuple(seer_teacher_action.shape)}"
+                )
+            loss_seer_distill_action = torch.nn.functional.l1_loss(
+                seer_student_action,
+                seer_teacher_action,
+            )
+            if float(getattr(args, "seer_distill_latent_weight", 0.0)) > 0.0:
+                teacher_latent = seer_teacher_outputs.get("action_latent")
+                if action_latent_full is None or teacher_latent is None:
+                    raise RuntimeError("Seer latent distillation requires student and teacher action_latent")
+                if action_latent_full.shape != teacher_latent.shape:
+                    raise RuntimeError(
+                        f"Seer latent distillation shape mismatch: student={tuple(action_latent_full.shape)}, "
+                        f"teacher={tuple(teacher_latent.shape)}"
+                    )
+                loss_seer_distill_latent = torch.nn.functional.mse_loss(
+                    action_latent_full,
+                    teacher_latent.detach(),
+                )
+
         base_loss_weighted = (
             args.loss_arm_action_ratio * loss_arm_action
             + args.loss_gripper_action_ratio * loss_gripper_action
@@ -597,19 +683,29 @@ def train_one_epoch_calvin(
             + args.lrnode_smooth_weight * loss_lrnode_smooth
             + args.lrnode_bc_weight * loss_lrnode_bc
         )
-        loss_calvin = base_loss_weighted + lrnode_loss_weighted
+        seer_distill_loss_weighted = (
+            float(getattr(args, "seer_distill_action_weight", 0.0)) * loss_seer_distill_action
+            + float(getattr(args, "seer_distill_latent_weight", 0.0)) * loss_seer_distill_latent
+        )
+        loss_calvin = base_loss_weighted + lrnode_loss_weighted + seer_distill_loss_weighted
 
         train_log_metrics.update(
             {
                 "train/total_loss": loss_calvin,
                 "train/base_total_loss_without_lrnode": base_loss_weighted,
                 "train/lrnode_total_loss_weighted": lrnode_loss_weighted,
+                "train/seer_distill_total_loss_weighted": seer_distill_loss_weighted,
                 "train/base/loss_arm_action_raw": loss_arm_action,
                 "train/base/loss_arm_action_weighted": args.loss_arm_action_ratio * loss_arm_action,
                 "train/base/loss_gripper_action_raw": loss_gripper_action,
                 "train/base/loss_gripper_action_weighted": args.loss_gripper_action_ratio * loss_gripper_action,
                 "train/base/loss_image_raw": loss_image,
                 "train/base/loss_image_weighted": 0.1 * loss_image,
+                "train/seer_distill/enabled": torch.tensor(float(train_seer_distill), device=device_id),
+                "train/seer_distill/loss_action_raw": loss_seer_distill_action,
+                "train/seer_distill/loss_action_weighted": float(getattr(args, "seer_distill_action_weight", 0.0)) * loss_seer_distill_action,
+                "train/seer_distill/loss_latent_raw": loss_seer_distill_latent,
+                "train/seer_distill/loss_latent_weighted": float(getattr(args, "seer_distill_latent_weight", 0.0)) * loss_seer_distill_latent,
                 "train/lrnode/loss_latent_raw": loss_lrnode_latent,
                 "train/lrnode/loss_latent_weighted": args.lrnode_latent_weight * loss_lrnode_latent,
                 "train/lrnode/loss_action_distill_raw": loss_lrnode_action_distill,
@@ -628,6 +724,25 @@ def train_one_epoch_calvin(
                 ),
             }
         )
+
+        if train_seer_distill and seer_student_action is not None and seer_teacher_action is not None:
+            action_diff = (seer_student_action.detach().float() - seer_teacher_action.detach().float()).abs()
+            train_log_metrics.update(
+                {
+                    "train/seer_distill/action_l1": action_diff.mean(),
+                    "train/seer_distill/arm_l1": action_diff[..., :6].mean(),
+                    "train/seer_distill/gripper_l1": action_diff[..., 6:].mean(),
+                    "train/seer_distill/trans_l1": action_diff[..., :3].mean(),
+                    "train/seer_distill/rot_l1": action_diff[..., 3:6].mean(),
+                }
+            )
+            train_log_metrics.update(_tensor_stats("train/seer_distill/student_action", seer_student_action.detach().float()))
+            train_log_metrics.update(_tensor_stats("train/seer_distill/teacher_action", seer_teacher_action.detach().float()))
+            if action_latent_full is not None and seer_teacher_outputs.get("action_latent") is not None:
+                train_log_metrics["train/seer_distill/cos_latent"] = _cosine_mean(
+                    action_latent_full,
+                    seer_teacher_outputs["action_latent"],
+                )
 
         if train_lrnode and z_pred_next is not None:
             eps = 1e-8
@@ -808,6 +923,8 @@ def train_one_epoch_calvin(
         loss_lrnode_action_distill = loss_lrnode_action_distill / args.gradient_accumulation_steps
         loss_lrnode_smooth = loss_lrnode_smooth / args.gradient_accumulation_steps
         loss_lrnode_bc = loss_lrnode_bc / args.gradient_accumulation_steps
+        loss_seer_distill_action = loss_seer_distill_action / args.gradient_accumulation_steps
+        loss_seer_distill_latent = loss_seer_distill_latent / args.gradient_accumulation_steps
         mv_avg_loss.append(loss.item())
 
         ### backward pass ###
@@ -834,7 +951,40 @@ def train_one_epoch_calvin(
                     "train/grad/action_decoder": module_grad_norm(base_model.action_decoder),
                 }
             )
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+        separate_lrnode_clip = (
+            train_lrnode
+            and bool(args.lrnode_detach_input_latent)
+            and bool(args.lrnode_detach_teacher_latent)
+            and bool(args.lrnode_freeze_action_head_for_lrnode)
+        )
+        if separate_lrnode_clip:
+            non_lrnode_params = [
+                param
+                for name, param in base_model.named_parameters()
+                if param.requires_grad and not _is_lrnode_parameter_name(name)
+            ]
+            lrnode_params = [
+                param
+                for name, param in base_model.named_parameters()
+                if param.requires_grad and _is_lrnode_parameter_name(name)
+            ]
+            clip_norm_non_lrnode = torch.nn.utils.clip_grad_norm_(non_lrnode_params, 0.1)
+            clip_norm_lrnode = torch.nn.utils.clip_grad_norm_(lrnode_params, 0.1)
+            train_log_metrics.update(
+                {
+                    "train/grad_clip/non_lrnode_norm": clip_norm_non_lrnode,
+                    "train/grad_clip/lrnode_norm": clip_norm_lrnode,
+                    "train/grad_clip/separate_lrnode_clip": torch.tensor(1.0, device=device_id),
+                }
+            )
+        else:
+            clip_norm_total = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+            train_log_metrics.update(
+                {
+                    "train/grad_clip/total_norm": clip_norm_total,
+                    "train/grad_clip/separate_lrnode_clip": torch.tensor(0.0, device=device_id),
+                }
+            )
         reduced_train_log_metrics = (
             _gather_mean_scalar_dict(train_log_metrics)
             if args.report_to_wandb
@@ -888,6 +1038,8 @@ def train_one_epoch_calvin(
                         "loss_lrnode_action_distill": loss_lrnode_action_distill.item() * args.gradient_accumulation_steps,
                         "loss_lrnode_smooth": loss_lrnode_smooth.item() * args.gradient_accumulation_steps,
                         "loss_lrnode_bc": loss_lrnode_bc.item() * args.gradient_accumulation_steps,
+                        "loss_seer_distill_action": loss_seer_distill_action.item() * args.gradient_accumulation_steps,
+                        "loss_seer_distill_latent": loss_seer_distill_latent.item() * args.gradient_accumulation_steps,
                         "global_step": global_step,
                     },
                 )
@@ -920,7 +1072,7 @@ def train_one_epoch_calvin(
                     )
 
         avg_horizon = min(100, len(mv_avg_loss))
-        t.set_postfix({"avg loss": sum(mv_avg_loss[-avg_horizon:]) / avg_horizon, "loss": loss_calvin.item(), "loss_image": loss_image.item(), "loss_arm_action": loss_arm_action.item(), "loss_gripper_action": loss_gripper_action.item(), "loss_lrnode_latent": loss_lrnode_latent.item(), "loss_lrnode_action_distill": loss_lrnode_action_distill.item()})
+        t.set_postfix({"avg loss": sum(mv_avg_loss[-avg_horizon:]) / avg_horizon, "loss": loss_calvin.item(), "loss_image": loss_image.item(), "loss_arm_action": loss_arm_action.item(), "loss_gripper_action": loss_gripper_action.item(), "loss_lrnode_latent": loss_lrnode_latent.item(), "loss_lrnode_action_distill": loss_lrnode_action_distill.item(), "loss_seer_distill_action": loss_seer_distill_action.item()})
 
         # if args.save_every_iter != -1 and args.save_checkpoint and global_step % args.save_every_iter == 0 and global_step > 0:
                 

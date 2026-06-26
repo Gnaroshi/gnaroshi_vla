@@ -1,5 +1,7 @@
 # seer_libero inspection
 
+generated_at: 2026-06-26
+
 ## conda env list
 
 # conda environments:
@@ -8,8 +10,10 @@
 # + -> frozen
 base                 *   /home/mingyujung/miniconda3
 baku_libero              /home/mingyujung/miniconda3/envs/baku_libero
+pfig                     /home/mingyujung/miniconda3/envs/pfig
 seer_libero              /home/mingyujung/miniconda3/envs/seer_libero
 seer_libero-plus         /home/mingyujung/miniconda3/envs/seer_libero-plus
+simvla_libero            /home/mingyujung/miniconda3/envs/simvla_libero
 
 
 ## which python

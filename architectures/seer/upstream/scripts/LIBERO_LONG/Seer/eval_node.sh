@@ -15,8 +15,10 @@ export SAVE_VIDEO="${SAVE_VIDEO:-1}"
 export SAVE_VIDEO_SUCC="${SAVE_VIDEO_SUCC:-1}"
 export SAVE_VIDEO_FAIL="${SAVE_VIDEO_FAIL:-1}"
 export SAVE_VIDEO_ALL_RANKS="${SAVE_VIDEO_ALL_RANKS:-1}"
-export VIDEO_FPS="${VIDEO_FPS:-20}"
 export VIDEO_STRIDE="${VIDEO_STRIDE:-1}"
+export EVAL_BASE_CONTROL_HZ="${EVAL_BASE_CONTROL_HZ:-20}"
+export EVAL_SCALE_MAX_STEPS_WITH_HZ="${EVAL_SCALE_MAX_STEPS_WITH_HZ:-1}"
+export EVAL_SCALE_SETTLE_STEPS_WITH_HZ="${EVAL_SCALE_SETTLE_STEPS_WITH_HZ:-1}"
 
 protocol_root="${LRNODE_PROTOCOL_ROOT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616}"
 ours_env="${OURS_ENV:-${protocol_root}/train/_latest/scratch_node.env}"
@@ -51,8 +53,12 @@ result_root="${EVAL_RESULT_ROOT:-${protocol_root}/eval/lrnode_scratch_sweep_${ru
 
 node=1
 node_num="${NODE_NUM:-4}"
-master_port="${MASTER_PORT:-10342}"
+master_port="${MASTER_PORT:-12442}"
 eval_control_hz="${EVAL_CONTROL_HZ:-20}"
+if [[ -z "${VIDEO_FPS:-}" ]]; then
+    VIDEO_FPS="$(awk -v hz="${eval_control_hz}" 'BEGIN { printf "%d", hz }')"
+fi
+export VIDEO_FPS
 
 LRNODE_HIDDEN_DIM="${LRNODE_HIDDEN_DIM:-256}"
 LRNODE_MOTION_DIM="${LRNODE_MOTION_DIM:-128}"
@@ -75,6 +81,7 @@ echo "[EVAL INFO] checkpoint_dir=${resume_from_checkpoint}"
 echo "[EVAL INFO] result_root=${result_root}"
 echo "[EVAL INFO] ckpt_ids=${ckpt_ids_str}"
 echo "[EVAL INFO] query_intervals=${query_intervals_str}"
+echo "[EVAL INFO] eval_control_hz=${eval_control_hz}, scale_max_steps=${EVAL_SCALE_MAX_STEPS_WITH_HZ}, base_control_hz=${EVAL_BASE_CONTROL_HZ}"
 echo "[EVAL INFO] video SAVE_VIDEO=${SAVE_VIDEO}, success=${SAVE_VIDEO_SUCC}, fail=${SAVE_VIDEO_FAIL}, all_ranks=${SAVE_VIDEO_ALL_RANKS}, stride=${VIDEO_STRIDE}"
 
 for query_interval in "${query_intervals[@]}"; do

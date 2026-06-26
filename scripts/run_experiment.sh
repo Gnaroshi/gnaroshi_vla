@@ -82,9 +82,9 @@ if git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         git -C "${ROOT_DIR}" rev-parse HEAD
         git -C "${ROOT_DIR}" status --short
         git -C "${ROOT_DIR}" remote -v
-    } > "${result_dir}/git_snapshot/vla_ours.txt" 2>&1
+    } > "${result_dir}/git_snapshot/gnaroshi_vla.txt" 2>&1
 else
-    echo "not a git repository" > "${result_dir}/git_snapshot/vla_ours.txt"
+    echo "not a git repository" > "${result_dir}/git_snapshot/gnaroshi_vla.txt"
 fi
 
 upstream_dir="${ROOT_DIR}/architectures/${architecture}/upstream"
@@ -181,4 +181,3 @@ EOF
 "${run_cmd[@]}" > >(tee "${result_dir}/logs/stdout.log") 2> >(tee "${result_dir}/logs/stderr.log" >&2)
 
 echo "[RUN DONE] result_dir=${result_dir}"
-

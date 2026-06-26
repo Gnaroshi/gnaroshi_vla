@@ -16,7 +16,6 @@ from models.gpt2 import GPT2Model
 from models.lrnode_modules import FastVisualDeltaEncoder, ControlledLatentNODE
 from transformers import GPT2Config
 from pdb import set_trace
-import random 
 
 
 @contextmanager
@@ -315,7 +314,7 @@ class SeerAgent(nn.Module):
         # initialize network
         self.initialize_weights()
         if self.use_lrnode_latent_update:
-            self._build_lrnode_modules()
+            self._build_lrnode_modules_preserving_rng()
 
         # freeze vision encoder
         vit_checkpoint = torch.load(self.vit_checkpoint_path, map_location='cpu')
@@ -344,6 +343,19 @@ class SeerAgent(nn.Module):
         )
         self.lrnode_delta_encoder.apply(self._init_weights)
         self.lrnode_dynamics.apply(self._init_weights)
+
+    def _build_lrnode_modules_preserving_rng(self):
+        # LR-NODE must not perturb the random stream used by the baseline model
+        # setup that follows this constructor, such as CLIP/dataset setup.
+        torch_rng_state = torch.get_rng_state()
+        numpy_rng_state = np.random.get_state()
+        python_rng_state = random.getstate()
+        try:
+            self._build_lrnode_modules()
+        finally:
+            torch.set_rng_state(torch_rng_state)
+            np.random.set_state(numpy_rng_state)
+            random.setstate(python_rng_state)
 
     def initialize_weights(self):
         # initialization
@@ -485,6 +497,8 @@ class SeerAgent(nn.Module):
         lrnode_freeze_action_head_for_lrnode=None,
         lrnode_multistep_train=None,
         lrnode_train_max_horizon=None,
+        lrnode_z_teacher_next_external=None,
+        lrnode_selected_step=None,
         lrnode_dt=1.0,
         lrnode_age=1.0,
     ):  
@@ -623,22 +637,78 @@ class SeerAgent(nn.Module):
                 raise RuntimeError(
                     f"Expected action_latent_full [B, S, action_pred_steps, D], got {tuple(action_latent_full.shape)}"
                 )
-            if action_latent_full.shape[1] > 1:
-                if lrnode_detach_input_latent is None:
-                    lrnode_detach_input_latent = self.lrnode_detach_input_latent
-                if lrnode_detach_teacher_latent is None:
-                    lrnode_detach_teacher_latent = self.lrnode_detach_teacher_latent
-                if lrnode_freeze_action_head_for_lrnode is None:
-                    lrnode_freeze_action_head_for_lrnode = self.lrnode_freeze_action_head_for_lrnode
-                if lrnode_multistep_train is None:
-                    lrnode_multistep_train = self.lrnode_multistep_train
-                if lrnode_train_max_horizon is None:
-                    lrnode_train_max_horizon = self.lrnode_train_max_horizon
+            if lrnode_detach_input_latent is None:
+                lrnode_detach_input_latent = self.lrnode_detach_input_latent
+            if lrnode_detach_teacher_latent is None:
+                lrnode_detach_teacher_latent = self.lrnode_detach_teacher_latent
+            if lrnode_freeze_action_head_for_lrnode is None:
+                lrnode_freeze_action_head_for_lrnode = self.lrnode_freeze_action_head_for_lrnode
+            if lrnode_multistep_train is None:
+                lrnode_multistep_train = self.lrnode_multistep_train
+            if lrnode_train_max_horizon is None:
+                lrnode_train_max_horizon = self.lrnode_train_max_horizon
 
-                # LR-NODE is intended to be a student latent updater. If z_prev is not
-                # detached, or if the action head is not frozen for this branch, the
-                # experiment becomes auxiliary joint training rather than teacher-student
-                # latent distillation.
+            required_lrnode_inputs = {
+                "lrnode_key_image_primary": lrnode_key_image_primary,
+                "lrnode_key_image_wrist": lrnode_key_image_wrist,
+                "lrnode_cur_image_primary": lrnode_cur_image_primary,
+                "lrnode_cur_image_wrist": lrnode_cur_image_wrist,
+            }
+            missing_lrnode_inputs = [
+                name for name, value in required_lrnode_inputs.items() if value is None
+            ]
+
+            # LR-NODE is intended to be a student latent updater. If z_prev is not
+            # detached, or if the action head is not frozen for this branch, the
+            # experiment becomes auxiliary joint training rather than teacher-student
+            # latent distillation.
+            if lrnode_z_teacher_next_external is not None:
+                if bool(lrnode_multistep_train):
+                    raise RuntimeError(
+                        "External shifted-context LR-NODE teacher target does not support "
+                        "lrnode_multistep_train=1."
+                    )
+                if missing_lrnode_inputs:
+                    raise RuntimeError(
+                        "LR-NODE shifted-context forward is missing inputs: "
+                        + ", ".join(missing_lrnode_inputs)
+                    )
+                selected_step = int(
+                    action_latent_full.shape[1] - 1
+                    if lrnode_selected_step is None
+                    else lrnode_selected_step
+                )
+                if selected_step < 0:
+                    selected_step = action_latent_full.shape[1] + selected_step
+                if selected_step < 0 or selected_step >= action_latent_full.shape[1]:
+                    raise RuntimeError(
+                        f"lrnode_selected_step resolves to {selected_step}, "
+                        f"but valid range is [0, {action_latent_full.shape[1] - 1}]"
+                    )
+
+                lrnode_z_prev = action_latent_full[:, selected_step]
+                lrnode_z_teacher_next = lrnode_z_teacher_next_external.to(
+                    device=action_latent_full.device,
+                    dtype=action_latent_full.dtype,
+                )
+                if lrnode_detach_input_latent:
+                    lrnode_z_prev = lrnode_z_prev.detach()
+                if lrnode_detach_teacher_latent:
+                    lrnode_z_teacher_next = lrnode_z_teacher_next.detach()
+
+                lrnode_z_pred_next = self.lrnode_predict_next_latent(
+                    z_prev=lrnode_z_prev,
+                    key_image_primary=lrnode_key_image_primary,
+                    key_image_wrist=lrnode_key_image_wrist,
+                    cur_image_primary=lrnode_cur_image_primary,
+                    cur_image_wrist=lrnode_cur_image_wrist,
+                    q_key=lrnode_q_key,
+                    q_cur=lrnode_q_cur,
+                    dt=lrnode_dt,
+                    age=lrnode_age,
+                )
+                lrnode_gate = getattr(self.lrnode_dynamics, "last_gate", None)
+            elif action_latent_full.shape[1] > 1:
                 if lrnode_multistep_train:
                     max_horizon = min(max(2, int(lrnode_train_max_horizon)), action_latent_full.shape[1])
                     z_prev_list = []
@@ -676,15 +746,6 @@ class SeerAgent(nn.Module):
                     if gate_list:
                         lrnode_gate = torch.cat(gate_list, dim=0)
                 else:
-                    required_lrnode_inputs = {
-                        "lrnode_key_image_primary": lrnode_key_image_primary,
-                        "lrnode_key_image_wrist": lrnode_key_image_wrist,
-                        "lrnode_cur_image_primary": lrnode_cur_image_primary,
-                        "lrnode_cur_image_wrist": lrnode_cur_image_wrist,
-                    }
-                    missing_lrnode_inputs = [
-                        name for name, value in required_lrnode_inputs.items() if value is None
-                    ]
                     if missing_lrnode_inputs:
                         raise RuntimeError(
                             "LR-NODE distillation forward is missing inputs: "
@@ -711,6 +772,7 @@ class SeerAgent(nn.Module):
                     )
                     lrnode_gate = getattr(self.lrnode_dynamics, "last_gate", None)
 
+            if lrnode_z_pred_next is not None:
                 if lrnode_z_pred_next.shape != lrnode_z_teacher_next.shape:
                     raise RuntimeError(
                         f"LR-NODE latent prediction shape mismatch: pred={tuple(lrnode_z_pred_next.shape)}, "

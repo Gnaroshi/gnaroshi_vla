@@ -159,13 +159,10 @@ for ckpt_id in "${pthlist[@]}"; do
     fi
 
     export CUDA_DEVICE_ORDER=PCI_BUS_ID
-    export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-#    export CUDA_VISIBLE_DEVICES=0,1,2,3
-#    export CUDA_VISIBLE_DEVICES=4,5,6,7
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 
     node=1
-    node_num=8
-#    node_num=4
+    node_num="${NODE_NUM:-4}"
 #    master_port=10911
 #    master_port=10912
     master_port=10913

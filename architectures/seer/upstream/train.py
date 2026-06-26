@@ -100,24 +100,9 @@ def _save_train_args_snapshot(args):
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({k: v for k, v in vars(args).items()}, f, indent=2, default=str)
 
-@record
-def main(args):
-    os.environ["WANDB_DIR"] = f"{os.path.abspath(args.save_checkpoint_path)}"
-    if args.save_checkpoints_to_wandb and args.save_checkpoint and not args.report_to_wandb:
-        raise ValueError("save_checkpoints_to_wandb requires report_to_wandb")
-    if args.offline:
-        os.environ["WANDB_MODE"] = "offline"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    args.local_rank, args.rank, args.world_size = world_info_from_env()
-    device_id = init_distributed_device(args)
-    print("device_id: ", device_id)
-    random_seed(args.seed)
-    ptbs = args.world_size * args.batch_size * args.gradient_accumulation_steps
-    print("training batch size:", ptbs)
-    args.run_name = args.run_name.replace("Seer", f"Seer_ptbs{ptbs}_{args.transformer_layers}layers_{args.transformer_heads}heads_hd{args.hidden_dim}")
-    print("run_name:", args.run_name)
-    _save_train_args_snapshot(args)
-    model = SeerAgent(
+
+def _build_seer_agent_from_args(args, device_id, use_lrnode_latent_update=None):
+    return SeerAgent(
         finetune_type=args.finetune_type,
         clip_device=device_id,
         vit_checkpoint_path=args.vit_checkpoint_path,
@@ -138,7 +123,11 @@ def main(args):
         transformer_heads=args.transformer_heads,
         phase=args.phase,
         gripper_width=args.gripper_width,
-        use_lrnode_latent_update=args.use_lrnode_latent_update,
+        use_lrnode_latent_update=(
+            args.use_lrnode_latent_update
+            if use_lrnode_latent_update is None
+            else use_lrnode_latent_update
+        ),
         lrnode_hidden_dim=args.lrnode_hidden_dim,
         lrnode_motion_dim=args.lrnode_motion_dim,
         lrnode_fast_encoder_type=args.lrnode_fast_encoder_type,
@@ -152,6 +141,58 @@ def main(args):
         lrnode_gate_init_bias=args.lrnode_gate_init_bias,
         lrnode_trace=args.lrnode_trace,
     )
+
+
+def _apply_precision_policy(model, args):
+    if args.precision == "bf16" or args.precision == "amp_bfloat16" or args.precision == "amp_bf16":
+        model = model.bfloat16()
+    elif args.precision == "fp16":
+        model = model.half()
+    elif args.precision == "fp32":
+        model = model.float()
+        if 'vision_encoder' in args.bf16_module:
+            model.vision_encoder.bfloat16()
+        if "causal_transformer" in args.bf16_module:
+            model.transformer_backbone.bfloat16()
+        if "image_decoder" in args.bf16_module:
+            model.image_decoder.bfloat16()
+            model.image_decoder_obs_pred_projector.bfloat16()
+    return model
+
+
+def _load_raw_model_checkpoint(model, ckpt_path):
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    stripped = OrderedDict()
+    for key, value in state_dict.items():
+        if key.startswith("module."):
+            stripped[key[len("module."):]] = value
+        else:
+            stripped[key] = value
+    missing, unexpected = model.load_state_dict(stripped, strict=False)
+    return {
+        "missing": list(missing),
+        "unexpected": list(unexpected),
+    }
+
+@record
+def main(args):
+    os.environ["WANDB_DIR"] = f"{os.path.abspath(args.save_checkpoint_path)}"
+    if args.save_checkpoints_to_wandb and args.save_checkpoint and not args.report_to_wandb:
+        raise ValueError("save_checkpoints_to_wandb requires report_to_wandb")
+    if args.offline:
+        os.environ["WANDB_MODE"] = "offline"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    args.local_rank, args.rank, args.world_size = world_info_from_env()
+    device_id = init_distributed_device(args)
+    print("device_id: ", device_id)
+    random_seed(args.seed)
+    ptbs = args.world_size * args.batch_size * args.gradient_accumulation_steps
+    print("training batch size:", ptbs)
+    args.run_name = args.run_name.replace("Seer", f"Seer_ptbs{ptbs}_{args.transformer_layers}layers_{args.transformer_heads}heads_hd{args.hidden_dim}")
+    print("run_name:", args.run_name)
+    _save_train_args_snapshot(args)
+    model = _build_seer_agent_from_args(args, device_id)
     if args.finetune_type == "calvin":
         calvin_dataset = get_calvin_dataset(args, model.image_processor, clip, epoch=0, except_lang=args.except_lang)
     elif args.finetune_type == "droid":
@@ -176,21 +217,42 @@ def main(args):
             config=vars(args),
         )
     device_id = args.rank % torch.cuda.device_count()
-    if args.precision == "bf16" or args.precision == "amp_bfloat16" or args.precision == "amp_bf16":
-        model = model.bfloat16()
-    elif args.precision == "fp16":
-        model = model.half()
-    elif args.precision == "fp32":
-        model = model.float()
-        if 'vision_encoder' in args.bf16_module:
-            model.vision_encoder.bfloat16()
-        if "causal_transformer" in args.bf16_module:
-            model.transformer_backbone.bfloat16()
-        if "image_decoder" in args.bf16_module:
-            model.image_decoder.bfloat16()
-            model.image_decoder_obs_pred_projector.bfloat16()
+    model = _apply_precision_policy(model, args)
     model.clip_model.requires_grad_(False)
     model.vision_encoder.requires_grad_(False)
+    seer_distill_teacher_model = None
+    if args.seer_distill_teacher_ckpt is not None:
+        if bool(args.use_lrnode_latent_update):
+            raise ValueError(
+                "Seer-only distillation control must keep --use_lrnode_latent_update 0. "
+                "Use distill_node.sh for LR-NODE adapter distillation."
+            )
+        if not os.path.isfile(args.seer_distill_teacher_ckpt):
+            raise FileNotFoundError(f"Missing Seer distillation teacher checkpoint: {args.seer_distill_teacher_ckpt}")
+        seer_distill_teacher_model = _build_seer_agent_from_args(
+            args,
+            device_id,
+            use_lrnode_latent_update=0,
+        )
+        seer_distill_teacher_model = _apply_precision_policy(seer_distill_teacher_model, args)
+        load_status = _load_raw_model_checkpoint(seer_distill_teacher_model, args.seer_distill_teacher_ckpt)
+        seer_distill_teacher_model.clip_model.requires_grad_(False)
+        seer_distill_teacher_model.vision_encoder.requires_grad_(False)
+        seer_distill_teacher_model.requires_grad_(False)
+        seer_distill_teacher_model = seer_distill_teacher_model.to(device_id)
+        seer_distill_teacher_model._init_model_type()
+        if bool(args.seer_distill_teacher_eval_mode):
+            seer_distill_teacher_model.eval()
+        if args.rank == 0:
+            print(
+                "[SEER DISTILL TEACHER] "
+                f"ckpt={args.seer_distill_teacher_ckpt} "
+                f"action_weight={args.seer_distill_action_weight} "
+                f"latent_weight={args.seer_distill_latent_weight} "
+                f"eval_mode={bool(args.seer_distill_teacher_eval_mode)} "
+                f"missing={len(load_status['missing'])} "
+                f"unexpected={len(load_status['unexpected'])}"
+            )
     lrnode_protocol_status = _apply_lrnode_train_protocol(model, args)
     total_params, trainable_params = count_parameters(model)
     print("total_params: {} M".format(total_params/1024/1024))
@@ -316,6 +378,7 @@ def main(args):
         train_one_epoch_calvin(
             args=args,
             model=ddp_model,
+            seer_distill_teacher_model=seer_distill_teacher_model,
             epoch=epoch,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,

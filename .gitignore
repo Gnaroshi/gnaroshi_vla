@@ -1,0 +1,50 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Tool and package caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+.venvs/
+env/
+venv/
+
+# Generated outputs
+outputs/
+wandb/
+lightning_logs/
+runs/
+logs/
+tmp/
+temp/
+
+# Data and heavy artifacts
+data/
+datasets/
+LIBERO_DATASETS/
+checkpoints/
+ckpts/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Per-run checkpoint payloads. Keep README/schema files.
+results/*/*/*/*/
+results/*/*/*/*/checkpoints/
+
+# Keep these tracked if this workspace later commits them.
+!results/README.md
+!architectures/**/env/*.yml
+!architectures/**/env/*.yaml
+!architectures/**/env/*.txt
+!configs/**
+!scripts/**
+!AGENTS.md
+!architectures/**/AGENTS.md

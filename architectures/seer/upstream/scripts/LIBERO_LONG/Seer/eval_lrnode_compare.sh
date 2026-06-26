@@ -20,7 +20,7 @@ set -euo pipefail
 #   OURS_NAME="lrnode_v3" \
 #   bash scripts/LIBERO_LONG/Seer/eval_lrnode_compare.sh
 
-export PYTHONPATH=/home/mingyujung/private/LIBERO:$PYTHONPATH
+export PYTHONPATH="/home/mingyujung/private/LIBERO:${PYTHONPATH:-}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 
@@ -66,7 +66,7 @@ if [[ -z "${BASELINE_CKPT:-}" ]]; then
         echo "[ERROR] Run scratch.sh first or set BASELINE_CKPT=/path/to/baseline.pth." >&2
         exit 1
     fi
-    BASELINE_CKPT_ID="${BASELINE_CKPT_ID:-37}"
+    BASELINE_CKPT_ID="${BASELINE_CKPT_ID:-33}"
     BASELINE_CKPT="${BASELINE_CKPT_ROOT}/${BASELINE_RUN_NAME}/${BASELINE_CKPT_ID}.pth"
 else
     BASELINE_RUN_NAME="${BASELINE_RUN_NAME:-$(basename "$(dirname "${BASELINE_CKPT}")")}"
@@ -80,7 +80,7 @@ BASELINE_CKPT_TAG="$(safe_tag "${BASELINE_CKPT_TAG:-${BASELINE_NAME}_ckpt_${BASE
 # baseline-only sweeps can run before scratch_node.sh exists.
 RUN_BASELINE="${RUN_BASELINE:-1}"
 RUN_OURS_FULL="${RUN_OURS_FULL:-1}"
-LRNODE_QUERY_INTERVALS_STR="${LRNODE_QUERY_INTERVALS_STR:-2 3 4 5 6 8}"
+LRNODE_QUERY_INTERVALS_STR="${LRNODE_QUERY_INTERVALS_STR-2 3 4 5 6 8}"
 LRNODE_QUERY_INTERVALS=()
 if [[ -n "${LRNODE_QUERY_INTERVALS_STR}" ]]; then
     read -r -a LRNODE_QUERY_INTERVALS <<< "${LRNODE_QUERY_INTERVALS_STR}"
@@ -132,7 +132,7 @@ result_root="${RESULT_ROOT:-${default_result_root}}"
 
 node=1
 node_num="${NODE_NUM:-4}"
-master_port="${MASTER_PORT:-10342}"
+master_port="${MASTER_PORT:-12452}"
 
 EVAL_CONTROL_HZ="${EVAL_CONTROL_HZ:-20}"
 
@@ -152,10 +152,13 @@ LRNODE_TRACE="${LRNODE_TRACE:-0}"
 LRNODE_TRAIN_PROTOCOL="${LRNODE_TRAIN_PROTOCOL:-joint}"
 LRNODE_FREEZE_SEER_FOR_ADAPTER="${LRNODE_FREEZE_SEER_FOR_ADAPTER:-0}"
 LRNODE_ASSERT_ONLY_LRNODE_TRAINABLE="${LRNODE_ASSERT_ONLY_LRNODE_TRAINABLE:-0}"
+LRNODE_EVAL_BASE_CKPT="${LRNODE_EVAL_BASE_CKPT:-}"
 
 # Keep detailed metrics by default. Disable only when disk usage is a concern.
 LRNODE_EVAL_STEP_LOG="${LRNODE_EVAL_STEP_LOG:-1}"
 LRNODE_EVAL_SHADOW_FULL_FORWARD="${LRNODE_EVAL_SHADOW_FULL_FORWARD:-0}"
+LRNODE_EVAL_REFRESH_POLICY="${LRNODE_EVAL_REFRESH_POLICY:-periodic}"
+LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE="${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE:-1}"
 
 common_eval_args=(
     --traj_cons
@@ -206,7 +209,15 @@ run_eval() {
     effective_query_hz=$(awk -v hz="${EVAL_CONTROL_HZ}" -v k="${query_interval}" 'BEGIN { printf "%.2f", hz / k }')
     local effective_query_hz_tag="${effective_query_hz//./p}"
 
-    local log_dir="${result_root}/${label}_K${query_interval}_${effective_query_hz_tag}hz"
+    local refresh_tag=""
+    if [[ "${LRNODE_EVAL_REFRESH_POLICY}" != "periodic" ]]; then
+        refresh_tag="_$(safe_tag "${LRNODE_EVAL_REFRESH_POLICY}")"
+        if [[ "${LRNODE_EVAL_REFRESH_POLICY}" == "fixed_budget" ]]; then
+            refresh_tag="${refresh_tag}_B${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE}"
+        fi
+    fi
+
+    local log_dir="${result_root}/${label}${refresh_tag}_K${query_interval}_${effective_query_hz_tag}hz"
     local logfile="${log_dir}/${ckpt_tag}.log"
     mkdir -p "${log_dir}"
 
@@ -237,14 +248,28 @@ run_eval() {
         --lrnode_trace "${LRNODE_TRACE}"
         --lrnode_eval_step_log "${LRNODE_EVAL_STEP_LOG}"
         --lrnode_eval_shadow_full_forward "${LRNODE_EVAL_SHADOW_FULL_FORWARD}"
+        --lrnode_eval_refresh_policy "${LRNODE_EVAL_REFRESH_POLICY}"
+        --lrnode_eval_max_full_forwards_per_episode "${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE}"
     )
+    local base_ckpt_args=()
+    if [[ "${use_lrnode}" -eq 1 && -n "${LRNODE_EVAL_BASE_CKPT}" ]]; then
+        if [[ ! -f "${LRNODE_EVAL_BASE_CKPT}" ]]; then
+            echo "[ERROR] Missing LR-NODE eval base checkpoint: ${LRNODE_EVAL_BASE_CKPT}" >&2
+            exit 1
+        fi
+        base_ckpt_args=(--finetune_from_pretrained_ckpt "${LRNODE_EVAL_BASE_CKPT}")
+    fi
 
     echo "------------------------------------------------------------"
     echo "[RUN] label=${label}"
     echo "[RUN] run_name=${run_name}"
     echo "[RUN] ckpt=${ckpt_path}"
+    if [[ "${#base_ckpt_args[@]}" -gt 0 ]]; then
+        echo "[RUN] eval_base_ckpt=${LRNODE_EVAL_BASE_CKPT}"
+    fi
     echo "[RUN] ckpt_tag=${ckpt_tag}"
     echo "[RUN] use_lrnode=${use_lrnode}, skip_full=${skip_full}, K=${query_interval}, full_query_hz=${effective_query_hz}"
+    echo "[RUN] refresh_policy=${LRNODE_EVAL_REFRESH_POLICY}, max_full_per_episode=${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE}"
     echo "[RUN] video SAVE_VIDEO=${SAVE_VIDEO}, success=${SAVE_VIDEO_SUCC}, fail=${SAVE_VIDEO_FAIL}, all_ranks=${SAVE_VIDEO_ALL_RANKS}, stride=${VIDEO_STRIDE}"
     echo "[RUN] log_dir=${log_dir}"
     echo "------------------------------------------------------------"
@@ -257,6 +282,7 @@ run_eval() {
         "${common_eval_args[@]}" \
         --run_name "${run_name}" \
         "${lrnode_args[@]}" \
+        "${base_ckpt_args[@]}" \
         --resume_from_checkpoint "${ckpt_path}" | tee "${logfile}"
 
     for required in \
@@ -310,6 +336,9 @@ LRNODE_QUERY_INTERVALS_STR=${LRNODE_QUERY_INTERVALS_STR}
 LRNODE_TRAIN_PROTOCOL=${LRNODE_TRAIN_PROTOCOL}
 LRNODE_FREEZE_SEER_FOR_ADAPTER=${LRNODE_FREEZE_SEER_FOR_ADAPTER}
 LRNODE_ASSERT_ONLY_LRNODE_TRAINABLE=${LRNODE_ASSERT_ONLY_LRNODE_TRAINABLE}
+LRNODE_EVAL_BASE_CKPT=${LRNODE_EVAL_BASE_CKPT}
+LRNODE_EVAL_REFRESH_POLICY=${LRNODE_EVAL_REFRESH_POLICY}
+LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE=${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE}
 SAVE_VIDEO=${SAVE_VIDEO}
 SAVE_VIDEO_SUCC=${SAVE_VIDEO_SUCC}
 SAVE_VIDEO_FAIL=${SAVE_VIDEO_FAIL}
@@ -419,7 +448,11 @@ for path in sorted(root.glob("*/analysis/eval_summary.json")):
         "lrnode_enabled": lr.get("enabled"),
         "skip_full_forward": lr.get("eval_skip_full_forward"),
         "query_interval": lr.get("query_interval"),
+        "eval_refresh_policy": lr.get("eval_refresh_policy", "periodic"),
+        "max_full_forwards_per_episode": lr.get("max_full_forwards_per_episode", 1),
+        "nominal_full_query_hz": lr.get("nominal_full_query_hz"),
         "effective_full_query_hz": lr.get("effective_full_query_hz"),
+        "effective_lrnode_update_hz": lr.get("effective_lrnode_update_hz"),
         "full_forward_calls": qr.get("num_full_forward_calls"),
         "lrnode_update_calls": qr.get("num_lrnode_update_calls"),
         "full_query_reduction_pct": round(float(qr.get("full_query_reduction_ratio", 0.0)) * 100.0, 3),
