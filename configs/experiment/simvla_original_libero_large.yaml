@@ -5,11 +5,10 @@ env: simvla_libero
 node: simvla_4gpu
 action: simvla_train_large
 result_subdir: results/simvla/original/simvla_libero_large
-upstream_workdir: architectures/simvla/SimVLA
+upstream_workdir: architectures/simvla/upstream
 dataset_root: /home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO
 dataset_subdir: datasets
 model_size: large
 default_batch_size: 64
 default_learning_coef: 0.1
 notes: Upstream/original SimVLA LIBERO large action-transformer training.
-

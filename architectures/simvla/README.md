@@ -5,12 +5,11 @@ wrappers.
 
 ## Directories
 
-- `SimVLA/`: upstream clone of `https://github.com/LUOyk1999/SimVLA.git`.
-- `ours/`: future SimVLA-specific method code.
+- `upstream/`: upstream clone of `https://github.com/LUOyk1999/SimVLA.git`.
 - `adapters/`: future integration glue between upstream SimVLA and our methods.
 - `configs/`: SimVLA-local notes and overlays.
 - `env/`: SimVLA environment documentation and export files.
-- `scripts/`: launch, dataset-link, and validation scripts managed by
+- `wrappers/`: launch, dataset-link, and validation scripts managed by
   `gnaroshi_vla`.
 
 ## Environment
@@ -42,34 +41,34 @@ The actual subset directories are under the `datasets/` child:
 .../LIBERO/datasets/libero_90
 ```
 
-SimVLA expects those subsets directly below `SimVLA/datasets/metas/`. Use:
+SimVLA expects those subsets directly below `upstream/datasets/metas/`. Use:
 
 ```bash
-bash architectures/simvla/scripts/prepare_libero_links.sh
-python architectures/simvla/scripts/check_libero_dataset.py
+bash architectures/simvla/wrappers/prepare_libero_links.sh
+python architectures/simvla/wrappers/check_libero_dataset.py
 ```
 
-Do not replace `SimVLA/datasets/` itself because it is also a Python package.
-Only create or update subset symlinks under `SimVLA/datasets/metas/`.
+Do not replace `upstream/datasets/` itself because it is also a Python package.
+Only create or update subset symlinks under `upstream/datasets/metas/`.
 
 ## Training
 
 Small model:
 
 ```bash
-bash architectures/simvla/scripts/train_libero.sh --model-size small
+bash architectures/simvla/wrappers/train_libero.sh --model-size small
 ```
 
 Dry-run without starting `accelerate`:
 
 ```bash
-bash architectures/simvla/scripts/train_libero.sh --model-size small --dry-run
+bash architectures/simvla/wrappers/train_libero.sh --model-size small --dry-run
 ```
 
 Large model:
 
 ```bash
-bash architectures/simvla/scripts/train_libero.sh --model-size large
+bash architectures/simvla/wrappers/train_libero.sh --model-size large
 ```
 
 The wrapper stores outputs under:
@@ -78,6 +77,6 @@ The wrapper stores outputs under:
 results/simvla/original/simvla_libero_<small|large>/<timestamp>_<run_id>/
 ```
 
-It keeps upstream source unchanged and launches `SimVLA/train_smolvlm.py`
+It keeps upstream source unchanged and launches `upstream/train_smolvlm.py`
 directly with explicit metadata, normalization, output, GPU, and model
 arguments.

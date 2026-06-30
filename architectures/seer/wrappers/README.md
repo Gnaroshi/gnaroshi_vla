@@ -1,4 +1,4 @@
-# Seer Workspace Scripts
+# Seer Wrappers
 
 Put Seer helper scripts managed by `gnaroshi_vla` here. Upstream scripts copied from
 `seer_node3` are preserved under `../upstream/scripts/`.

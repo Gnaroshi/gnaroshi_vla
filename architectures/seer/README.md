@@ -5,11 +5,10 @@ Seer is the first architecture integrated into `gnaroshi_vla`.
 ## Directories
 
 - `upstream/`: copied Seer source from `/home/mingyujung/private/seer/seer_node3`.
-- `ours/`: our Seer-specific method code and extraction targets.
-- `adapters/`: wrappers and integration points between upstream Seer and our method.
+- `adapters/`: architecture-specific integration points between upstream Seer and methods.
 - `configs/`: Seer-local config notes and overlays.
 - `env/`: Seer environment documentation and export files.
-- `scripts/`: Seer helper scripts managed by `gnaroshi_vla`.
+- `wrappers/`: Seer launch wrappers managed by `gnaroshi_vla`.
 
 ## Environment
 
@@ -28,7 +27,7 @@ The current `seer_node3` code already contains LR-NODE modifications mixed into
 Seer training, evaluation, model, and script files. Because the source is not a
 valid git repository and no clean upstream baseline is available locally, the
 initial integration preserves this working state in `upstream/` and documents
-mixed files in `MODIFIED_UPSTREAM_FILES.md`.
+mixed files in `docs/architectures/seer/modified_upstream_files.md`.
 
-Future refactors should move method-owned code into `ours/` and use `adapters/`
-for upstream integration.
+Future refactors should move method-owned code into `methods/<method>/` and use
+`adapters/<method>/` for upstream integration.

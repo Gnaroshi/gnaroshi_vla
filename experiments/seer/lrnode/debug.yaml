@@ -1,9 +1,8 @@
 architecture: seer
-method: ours
+method: lrnode
 env: seer_libero
-experiment: seer_ours_debug
+experiment: seer_lrnode_debug
 action: sanity
 notes: >
   Debug experiment record for the current LR-NODE method. This does not launch
   training by default.
-

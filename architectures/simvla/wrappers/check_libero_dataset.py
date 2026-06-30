@@ -64,7 +64,7 @@ def resolve_meta_path(simvla_dir: Path, raw_path: str) -> Path:
 def main() -> int:
     script_dir = Path(__file__).resolve().parent
     arch_dir = script_dir.parent
-    default_simvla = arch_dir / "SimVLA"
+    default_simvla = arch_dir / "upstream"
     default_libero = Path("/home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO")
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -140,4 +140,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

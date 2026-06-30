@@ -16,10 +16,10 @@ from pathlib import Path
 def parse_key_values(argv: list[str]) -> dict[str, str]:
     values = {
         "architecture": "seer",
-        "method": "ours",
+        "method": "lrnode",
         "env": "seer_libero",
         "node": "lrnode",
-        "experiment": "seer_ours_debug",
+        "experiment": "seer_lrnode_debug",
     }
     for item in argv:
         if "=" in item:
@@ -37,12 +37,7 @@ def require_path(path: Path, label: str) -> bool:
 
 
 def architecture_upstream_path(root: Path, architecture: str) -> Path:
-    default = root / "architectures" / architecture / "upstream"
-    if default.exists():
-        return default
-    if architecture == "simvla":
-        return root / "architectures" / "simvla" / "SimVLA"
-    return default
+    return root / "architectures" / architecture / "upstream"
 
 
 def main() -> int:
@@ -56,8 +51,8 @@ def main() -> int:
     upstream = architecture_upstream_path(root, args["architecture"])
     checks = [
         require_path(upstream, "architecture upstream"),
-        require_path(root / "architectures" / args["architecture"] / "ours", "architecture ours"),
         require_path(root / "architectures" / args["architecture"] / "adapters", "architecture adapters"),
+        require_path(root / "architectures" / args["architecture"] / "wrappers", "architecture wrappers"),
         require_path(root / "configs" / "env" / f"{args['env']}.yaml", "env config"),
         require_path(root / "configs" / "method" / f"{args['method']}.yaml", "method config"),
         require_path(root / "results" / "README.md", "results schema"),

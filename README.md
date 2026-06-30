@@ -9,8 +9,8 @@ OpenPI, or VLA-Adapter should live beside Seer under `architectures/`.
 
 The workspace separates four axes:
 
-- Architecture: `seer`, `openpi`, `vla_adapter`, and future VLA repositories.
-- Method: `original`, `ours`, ablations, and method variants.
+- Architecture: `seer`, `simvla`, `openpi`, `vla_adapter`, and future VLA repositories.
+- Method: `original`, `lrnode`, ablations, and future method variants.
 - Environment: architecture-specific environments such as `seer_libero`.
 - Results: consistent run directories with config, env, git, logs, metrics, and notes.
 
@@ -18,6 +18,10 @@ Do not force all architectures into one dependency manager. Each architecture
 keeps its own upstream repository, environment setup, configs, and execution
 style. Top-level configs record which environment should be used, but launch
 scripts must activate that environment before Python starts.
+
+Method implementations live under `methods/<method_name>/`. Architecture
+directories keep only upstream code, environment records, wrappers, and thin
+architecture-specific adapters.
 
 ## Current Architectures
 
@@ -34,12 +38,12 @@ renamed or modified.
 ### SimVLA
 
 - Upstream repository: `https://github.com/LUOyk1999/SimVLA.git`
-- Upstream clone: `architectures/simvla/SimVLA/`
+- Upstream clone: `architectures/simvla/upstream/`
 - Known environment: `conda activate simvla_libero`
 - LIBERO root: `/home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO`
 
 SimVLA is kept as a clean upstream git clone. Dataset symlinks and training
-launchers are managed outside upstream under `architectures/simvla/scripts/`.
+launchers are managed outside upstream under `architectures/simvla/wrappers/`.
 
 ## Layout
 
@@ -49,18 +53,19 @@ gnaroshi_vla/
     registry.yaml
     seer/
       upstream/
-      ours/
       adapters/
       configs/
       env/
-      scripts/
+      wrappers/
     simvla/
-      SimVLA/
-      ours/
+      upstream/
       adapters/
       configs/
       env/
-      scripts/
+      wrappers/
+  methods/
+    lrnode/
+      seer_reference/
   configs/
     architecture/
     method/
@@ -70,6 +75,7 @@ gnaroshi_vla/
   experiments/
   results/
   scripts/
+  docs/
   tools/
 ```
 
@@ -79,9 +85,9 @@ From the workspace root:
 
 ```bash
 conda activate seer_libero
-python scripts/sanity_check.py architecture=seer method=ours env=seer_libero node=lrnode
+python scripts/sanity_check.py architecture=seer method=lrnode env=seer_libero node=lrnode
 python scripts/sanity_check.py architecture=seer method=original env=seer_libero node=lrnode
-bash scripts/run_experiment.sh architecture=seer method=ours env=seer_libero experiment=seer_ours_debug
+bash scripts/run_experiment.sh architecture=seer method=lrnode env=seer_libero experiment=seer_lrnode_debug
 bash scripts/run_experiment.sh architecture=seer method=original env=seer_libero experiment=seer_original_debug
 ```
 
@@ -101,8 +107,8 @@ GPU jobs.
 For SimVLA dataset setup and checks:
 
 ```bash
-bash architectures/simvla/scripts/prepare_libero_links.sh
-python architectures/simvla/scripts/check_libero_dataset.py
+bash architectures/simvla/wrappers/prepare_libero_links.sh
+python architectures/simvla/wrappers/check_libero_dataset.py
 bash scripts/run_experiment.sh architecture=simvla method=original env=simvla_libero \
   node=simvla_4gpu experiment=simvla_original_libero_small action=simvla_check_data
 ```
@@ -125,9 +131,10 @@ The SimVLA wrapper accepts environment overrides such as `CUDA_VISIBLE_DEVICES`,
 3. Add `architectures/<new_arch>/env/` with activation and export files.
 4. Add `configs/architecture/<new_arch>.yaml`.
 5. Add `configs/env/<new_arch_env>.yaml`.
-6. Put our method code in `architectures/<new_arch>/ours/`.
-7. Put wrappers or integration glue in `architectures/<new_arch>/adapters/`.
-8. Document exact run commands and result locations.
+6. Put architecture-specific wrappers in `architectures/<new_arch>/wrappers/`.
+7. Put architecture-specific method glue in `architectures/<new_arch>/adapters/<method>/`.
+8. Put architecture-neutral method code in `methods/<method>/`.
+9. Document exact run commands and result locations.
 
 ## Results
 
@@ -157,4 +164,4 @@ README pointing to external checkpoint storage.
 - Heavy model files: `checkpoints/`, `ckpts/`, `*.pth`, `*.pt`, `*.ckpt`
 - Per-run checkpoint directories under `results/`
 - Upstream nested clone contents unless intentionally converted to a git
-  submodule, for example `architectures/simvla/SimVLA/`
+  submodule, for example `architectures/simvla/upstream/`

@@ -1,7 +1,7 @@
 # Seer Adapter Area
 
-Use this directory for wrappers that connect upstream Seer code with method code
-from `../ours/`.
+Use this directory for architecture-specific glue that connects upstream Seer
+code with method code from `methods/<method>/`.
 
 Current integration points to wrap in a future refactor:
 
@@ -13,4 +13,3 @@ Current integration points to wrap in a future refactor:
 
 Adapters should make method selection explicit and avoid editing upstream files
 unless a documented patch is unavoidable.
-

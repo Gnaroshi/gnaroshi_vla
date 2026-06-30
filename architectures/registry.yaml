@@ -2,12 +2,13 @@ architectures:
   - name: seer
     status: active
     upstream_path: architectures/seer/upstream
-    ours_path: architectures/seer/ours
     adapters_path: architectures/seer/adapters
+    wrappers_path: architectures/seer/wrappers
+    method_adapter_root: architectures/seer/adapters
     default_env: seer_libero
     supported_methods:
       - original
-      - ours
+      - lrnode
     source_baseline_path: /home/mingyujung/private/seer/seer_node3
     source_git_status: unavailable
     notes: >
@@ -18,9 +19,10 @@ architectures:
 
   - name: simvla
     status: active
-    upstream_path: architectures/simvla/SimVLA
-    ours_path: architectures/simvla/ours
+    upstream_path: architectures/simvla/upstream
     adapters_path: architectures/simvla/adapters
+    wrappers_path: architectures/simvla/wrappers
+    method_adapter_root: architectures/simvla/adapters
     default_env: simvla_libero
     supported_methods:
       - original
@@ -29,5 +31,5 @@ architectures:
     dataset_root: /home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO
     notes: >
       Upstream SimVLA is kept as a separate clean git clone under
-      architectures/simvla/SimVLA. gnaroshi_vla-managed wrappers, configs, and
+      architectures/simvla/upstream. gnaroshi_vla-managed wrappers, configs, and
       result conventions live outside the upstream clone.

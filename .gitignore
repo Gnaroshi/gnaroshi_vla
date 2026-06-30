@@ -37,7 +37,7 @@ ckpts/
 
 # Upstream architecture clones kept as separate git repositories unless
 # intentionally converted to git submodules.
-architectures/simvla/SimVLA/
+architectures/simvla/upstream/
 
 # Per-run checkpoint payloads. Keep README/schema files.
 results/*/*/*/*/
@@ -53,4 +53,5 @@ results/*/*/*/*/checkpoints/
 !configs/**
 !scripts/**
 !AGENTS.md
-!architectures/**/AGENTS.md
+!docs/**
+!methods/**

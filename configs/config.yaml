@@ -1,9 +1,9 @@
 defaults:
   - architecture: seer
-  - method: ours
+  - method: lrnode
   - env: seer_libero
   - node: lrnode
-  - experiment: seer_ours_debug
+  - experiment: seer_lrnode_debug
   - _self_
 
 project:

@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARCH_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${ARCH_DIR}/../.." && pwd)"
-SIMVLA_DIR="${SIMVLA_DIR:-${ARCH_DIR}/SimVLA}"
+SIMVLA_DIR="${SIMVLA_DIR:-${ARCH_DIR}/upstream}"
 
 model_size="${SIMVLA_MODEL_SIZE:-small}"
 batch_size="${SIMVLA_BATCH_SIZE:-64}"

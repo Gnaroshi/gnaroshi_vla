@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARCH_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SIMVLA_DIR="${SIMVLA_DIR:-${ARCH_DIR}/SimVLA}"
+SIMVLA_DIR="${SIMVLA_DIR:-${ARCH_DIR}/upstream}"
 DEFAULT_LIBERO_ROOT="/home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO"
 LIBERO_ROOT="${LIBERO_ROOT:-${DEFAULT_LIBERO_ROOT}}"
 
@@ -45,4 +45,3 @@ for subset in "${subsets[@]}"; do
     count="$(find "${target}" -maxdepth 1 -type f -name '*.hdf5' | wc -l)"
     echo "[OK] ${dest} -> ${target} (${count} hdf5 files)"
 done
-

@@ -5,10 +5,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 architecture="seer"
-method="ours"
+method="lrnode"
 env_id="seer_libero"
 node="lrnode"
-experiment="seer_ours_debug"
+experiment="seer_lrnode_debug"
 action="sanity"
 
 for arg in "$@"; do
@@ -91,9 +91,6 @@ else
 fi
 
 upstream_dir="${ROOT_DIR}/architectures/${architecture}/upstream"
-if [[ "${architecture}" == "simvla" ]]; then
-    upstream_dir="${ROOT_DIR}/architectures/simvla/SimVLA"
-fi
 if git -C "${upstream_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     {
         git -C "${upstream_dir}" rev-parse HEAD
@@ -147,14 +144,14 @@ case "${action}" in
             echo "[ERROR] action=simvla_prepare_data is only valid for architecture=simvla" >&2
             exit 2
         fi
-        run_cmd=(bash "${ROOT_DIR}/architectures/simvla/scripts/prepare_libero_links.sh")
+        run_cmd=(bash "${ROOT_DIR}/architectures/simvla/wrappers/prepare_libero_links.sh")
         ;;
     simvla_check_data)
         if [[ "${architecture}" != "simvla" ]]; then
             echo "[ERROR] action=simvla_check_data is only valid for architecture=simvla" >&2
             exit 2
         fi
-        run_cmd=(python "${ROOT_DIR}/architectures/simvla/scripts/check_libero_dataset.py")
+        run_cmd=(python "${ROOT_DIR}/architectures/simvla/wrappers/check_libero_dataset.py")
         ;;
     simvla_train_small|simvla_train_large)
         if [[ "${architecture}" != "simvla" ]]; then
@@ -163,7 +160,7 @@ case "${action}" in
         fi
         model_size="${action#simvla_train_}"
         run_cmd=(
-            bash "${ROOT_DIR}/architectures/simvla/scripts/train_libero.sh"
+            bash "${ROOT_DIR}/architectures/simvla/wrappers/train_libero.sh"
             --model-size "${model_size}"
             --result-dir "${result_dir}"
         )

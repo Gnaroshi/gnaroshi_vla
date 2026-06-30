@@ -1,0 +1,11 @@
+name: lrnode
+architecture_scope: any
+description: LR-NODE based VLA method family.
+method_family: lrnode
+expected_flags:
+  use_lrnode_latent_update: 1
+  lrnode_train_latent_distill: 1
+core_reference_path: methods/lrnode
+seer_reference_path: methods/lrnode/seer_reference
+code_status: mixed_into_current_seer_copy_for_seer
+mixed_files_manifest: docs/architectures/seer/modified_upstream_files.md
