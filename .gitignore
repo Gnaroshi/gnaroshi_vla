@@ -16,6 +16,7 @@ env/
 venv/
 
 # Generated outputs
+codex_outputs/
 outputs/
 wandb/
 lightning_logs/
