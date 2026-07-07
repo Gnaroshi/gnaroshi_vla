@@ -1,0 +1,27 @@
+method:
+  name: dcld
+  variant: simvla_dcld_pm047m
+  description: parameter-matched low-rank SimVLA DCLD
+  condition_key: vlm_features
+  latent_target: simvla_action_transformer_condition
+
+dcld:
+  dynamics_type: low_rank
+  latent_dim: 960
+  rank_dim: 64
+  delta_dim: 128
+  hidden_dim: 128
+  image_size: 64
+  image_feature_dim: 256
+  proprio_feature_dim: 128
+  dynamics:
+    integration: fixed_euler
+    adaptive_solver: false
+    gate_mode: scalar
+    gate_bias: -4.0
+    use_post_layernorm: false
+  losses:
+    condition_mse: 0.05
+    condition_cosine: 0.05
+    action_l1: 0.1
+    smoothness: 0.001

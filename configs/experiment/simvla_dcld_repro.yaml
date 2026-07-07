@@ -1,0 +1,30 @@
+experiment:
+  name: simvla_dcld_repro
+  architecture: simvla
+  method: dcld
+  stage: condition_hook_and_teacher_cache
+
+paths:
+  root: /home/mingyujung/private/gnaroshi_vla
+  simvla_upstream: /home/mingyujung/private/gnaroshi_vla/architectures/simvla/upstream
+  dataset_libero: /home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO
+  hf_home: /home/mingyujung/private/gnaroshi_vla/.cache/huggingface
+  norm_stats: /home/mingyujung/private/gnaroshi_vla/architectures/simvla/upstream/norm_stats/libero_norm.json
+  train_metas: /home/mingyujung/private/gnaroshi_vla/architectures/simvla/upstream/datasets/metas/libero_train.json
+
+simvla:
+  checkpoint: YuankaiLuo/SimVLA-LIBERO
+  action_mode: libero_joint
+  action_steps: 10
+  condition_key: vlm_features
+
+environment:
+  conda_env: simvla_libero
+  cuda_visible_devices: "4,5,6,7"
+  mujoco_gl: egl
+  pyopengl_platform: egl
+
+preconditions:
+  condition_hook_equivalence_required: true
+  teacher_cache_required_for_training: true
+  run_heavy_jobs_by_default: false

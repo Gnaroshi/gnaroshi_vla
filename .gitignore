@@ -1,10 +1,12 @@
 # Python cache
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 
 # Tool and package caches
 .cache/
+.cache
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -56,3 +58,8 @@ results/*/*/*/*/checkpoints/
 !AGENTS.md
 !docs/**
 !methods/**
+
+# Re-apply generated Python cache ignores after broad source unignore rules.
+**/__pycache__/
+*.pyc
+*.pyo

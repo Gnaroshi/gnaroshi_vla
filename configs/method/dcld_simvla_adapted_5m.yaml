@@ -1,0 +1,27 @@
+method:
+  name: dcld
+  variant: simvla_dcld_adapted_5m
+  description: architecture-adapted dense SimVLA DCLD
+  condition_key: vlm_features
+  latent_target: simvla_action_transformer_condition
+
+dcld:
+  dynamics_type: dense
+  latent_dim: 960
+  rank_dim: null
+  delta_dim: 512
+  hidden_dim: 1024
+  image_size: 64
+  image_feature_dim: 256
+  proprio_feature_dim: 128
+  dynamics:
+    integration: fixed_euler
+    adaptive_solver: false
+    gate_mode: dense
+    gate_bias: -4.0
+    use_post_layernorm: false
+  losses:
+    condition_mse: 0.05
+    condition_cosine: 0.05
+    action_l1: 0.1
+    smoothness: 0.001

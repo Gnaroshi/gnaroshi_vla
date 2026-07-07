@@ -1,0 +1,15 @@
+experiment:
+  name: simvla_dcld_hzup20q
+  architecture: simvla
+  method: dcld
+  eval_mode: hzup20q
+
+extends:
+  - configs/method/dcld.yaml
+  - configs/experiment/simvla_dcld_repro.yaml
+
+eval:
+  query_reduction: 0.20
+  higher_update_frequency: true
+  ablation_mode: real_delta
+  measure_latency: true
