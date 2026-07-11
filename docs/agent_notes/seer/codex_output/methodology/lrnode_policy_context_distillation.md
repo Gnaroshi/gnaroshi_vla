@@ -49,11 +49,11 @@ lrnode_context_selected_step = -1
 
 코드 위치:
 
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:306): target mode 선택
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:367): shifted context 생성
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:382): `C_{t+1}` teacher forward
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:407): `z_t^T`, `z_{t+1}^T` 추출
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:415): LR-NODE latent update
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:306`: target mode 선택
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:367`: shifted context 생성
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:382`: `C_{t+1}` teacher forward
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:407`: `z_t^T`, `z_{t+1}^T` 추출
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:415`: LR-NODE latent update
 
 ## 왜 기존 adjacent target보다 낫나
 

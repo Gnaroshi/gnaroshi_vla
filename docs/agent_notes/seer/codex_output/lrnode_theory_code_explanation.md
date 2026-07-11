@@ -47,10 +47,10 @@ a_t_hat = H_action(z_t_hat)
 
 코드 위치:
 
-- [models/seer_model.py](/home/mingyujung/private/seer/seer_node3/models/seer_model.py:601)
-- [models/seer_model.py](/home/mingyujung/private/seer/seer_node3/models/seer_model.py:606)
-- [models/seer_model.py](/home/mingyujung/private/seer/seer_node3/models/seer_model.py:608)
-- [models/seer_model.py](/home/mingyujung/private/seer/seer_node3/models/seer_model.py:609)
+- `$SEER_WORKSPACE_ROOT/models/seer_model.py:601`
+- `$SEER_WORKSPACE_ROOT/models/seer_model.py:606`
+- `$SEER_WORKSPACE_ROOT/models/seer_model.py:608`
+- `$SEER_WORKSPACE_ROOT/models/seer_model.py:609`
 
 Seer의 action은 transformer output 전체에서 바로 나오는 것이 아니라, action prediction token 위치의 hidden state를 action decoder가 읽어서 나온다.
 
@@ -92,9 +92,9 @@ a_{t+1} ~= H_action(z_{t+1})
 
 코드 위치:
 
-- [models/seer_model.py](/home/mingyujung/private/seer/seer_node3/models/seer_model.py:270)
-- [models/seer_model.py](/home/mingyujung/private/seer/seer_node3/models/seer_model.py:374)
-- [models/seer_model.py](/home/mingyujung/private/seer/seer_node3/models/seer_model.py:392)
+- `$SEER_WORKSPACE_ROOT/models/seer_model.py:270`
+- `$SEER_WORKSPACE_ROOT/models/seer_model.py:374`
+- `$SEER_WORKSPACE_ROOT/models/seer_model.py:392`
 
 기존 action head는 다음 세 모듈이다.
 
@@ -142,10 +142,10 @@ min_theta ||H_fixed(Phi_theta(z_t, u_t)) - H_fixed(z_{t+1})||
 
 코드 위치:
 
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:6)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:16)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:38)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:64)
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:6`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:16`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:38`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:64`
 
 LR-NODE skip step에서 full Seer를 생략하면, current image를 ViT와 transformer에 넣지 않는다. 그래도 로봇과 scene은 변한다. 따라서 latent update에는 "무엇이 변했는지"에 대한 cheap observation signal이 필요하다.
 
@@ -286,11 +286,11 @@ u_delta = self.out_norm(u_delta)
 
 코드 위치:
 
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:91)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:111)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:117)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:124)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:177)
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:91`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:111`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:117`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:124`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:177`
 
 `ControlledLatentNODE`는 이름 그대로 controlled neural ODE를 latent space에 적용한 것이다. 다만 MVP에서는 adaptive ODE solver를 쓰지 않고 fixed Euler 1-step만 쓴다.
 
@@ -343,10 +343,10 @@ z_next = z_prev + delta_z
 
 코드 위치:
 
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:124)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:130)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:197)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:200)
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:124`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:130`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:197`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:200`
 
 gate는 update 크기를 조절하는 scalar다.
 
@@ -430,10 +430,10 @@ gate MLP: 얼마나 믿고 움직일지
 
 코드 위치:
 
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:136)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:148)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:185)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:187)
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:136`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:148`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:185`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:187`
 
 `dt`는 Euler update의 step size다.
 
@@ -468,9 +468,9 @@ emb(x) = [x, sin(x * [1,2,4,8]), cos(x * [1,2,4,8])]
 
 코드 위치:
 
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:113)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:166)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:194)
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:113`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:166`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:194`
 
 Seer는 `action_pred_steps=3`일 때 3개의 future action token latent를 만든다.
 
@@ -500,8 +500,8 @@ z_dyn = LayerNorm(z_prev) + Emb(action_token_id)
 
 코드 위치:
 
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:154)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:177)
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:154`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:177`
 
 LR-NODE가 지원해야 하는 latent shape는 여러 가지다.
 
@@ -532,9 +532,9 @@ u_delta.unsqueeze(-2).expand(..., action_pred_steps, motion_dim)
 
 코드 위치:
 
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:131)
-- [models/lrnode_modules.py](/home/mingyujung/private/seer/seer_node3/models/lrnode_modules.py:204)
-- [utils/arguments_utils.py](/home/mingyujung/private/seer/seer_node3/utils/arguments_utils.py:247)
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:131`
+- `$SEER_WORKSPACE_ROOT/models/lrnode_modules.py:204`
+- `$SEER_WORKSPACE_ROOT/utils/arguments_utils.py:247`
 
 현재 `ControlledLatentNODE`에는 update 뒤 LayerNorm이 있다.
 
@@ -561,10 +561,10 @@ lrnode_use_post_layernorm = 0
 
 코드 위치:
 
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:315)
-- [models/seer_model.py](/home/mingyujung/private/seer/seer_node3/models/seer_model.py:690)
-- [models/seer_model.py](/home/mingyujung/private/seer/seer_node3/models/seer_model.py:697)
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:413)
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:315`
+- `$SEER_WORKSPACE_ROOT/models/seer_model.py:690`
+- `$SEER_WORKSPACE_ROOT/models/seer_model.py:697`
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:413`
 
 현재 기본 구현은 `lrnode_teacher_target_mode=shifted_context`이다. 핵심은 "같은 forward 안의 인접 latent"가 아니라, policy가 실제 평가 step에서 받는 정상 입력 context를 한 step shift한 뒤 teacher latent를 다시 probe한다는 점이다.
 
@@ -677,10 +677,10 @@ L_action = ||H(z_pred) - H(z_teacher)||_1
 
 코드 위치:
 
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:413)
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:423)
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:437)
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:477)
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:413`
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:423`
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:437`
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:477`
 
 전체 loss:
 
@@ -794,11 +794,11 @@ action_l1_pred < action_l1_hold
 
 코드 위치:
 
-- [train.py](/home/mingyujung/private/seer/seer_node3/train.py:41)
-- [train.py](/home/mingyujung/private/seer/seer_node3/train.py:45)
-- [train.py](/home/mingyujung/private/seer/seer_node3/train.py:62)
-- [train.py](/home/mingyujung/private/seer/seer_node3/train.py:77)
-- [train.py](/home/mingyujung/private/seer/seer_node3/train.py:194)
+- `$SEER_WORKSPACE_ROOT/train.py:41`
+- `$SEER_WORKSPACE_ROOT/train.py:45`
+- `$SEER_WORKSPACE_ROOT/train.py:62`
+- `$SEER_WORKSPACE_ROOT/train.py:77`
+- `$SEER_WORKSPACE_ROOT/train.py:194`
 
 먼저 용어를 분리해야 한다. 이 프로젝트에서 헷갈리기 쉬운 축은 세 개다.
 
@@ -954,11 +954,11 @@ lrnode_detach_teacher_latent = 1
 
 코드 위치:
 
-- [utils/eval_utils_libero.py](/home/mingyujung/private/seer/seer_node3/utils/eval_utils_libero.py:236)
-- [utils/eval_utils_libero.py](/home/mingyujung/private/seer/seer_node3/utils/eval_utils_libero.py:244)
-- [utils/eval_utils_libero.py](/home/mingyujung/private/seer/seer_node3/utils/eval_utils_libero.py:255)
-- [utils/eval_utils_libero.py](/home/mingyujung/private/seer/seer_node3/utils/eval_utils_libero.py:576)
-- [utils/eval_utils_libero.py](/home/mingyujung/private/seer/seer_node3/utils/eval_utils_libero.py:662)
+- `$SEER_WORKSPACE_ROOT/utils/eval_utils_libero.py:236`
+- `$SEER_WORKSPACE_ROOT/utils/eval_utils_libero.py:244`
+- `$SEER_WORKSPACE_ROOT/utils/eval_utils_libero.py:255`
+- `$SEER_WORKSPACE_ROOT/utils/eval_utils_libero.py:576`
+- `$SEER_WORKSPACE_ROOT/utils/eval_utils_libero.py:662`
 
 eval loop는 매 timestep마다 둘 중 하나를 선택한다.
 
@@ -1056,9 +1056,9 @@ K=1이 다르면 가능한 원인은 다음이다.
 
 코드 위치:
 
-- [utils/arguments_utils.py](/home/mingyujung/private/seer/seer_node3/utils/arguments_utils.py:211)
-- [utils/arguments_utils.py](/home/mingyujung/private/seer/seer_node3/utils/arguments_utils.py:212)
-- [utils/arguments_utils.py](/home/mingyujung/private/seer/seer_node3/utils/arguments_utils.py:213)
+- `$SEER_WORKSPACE_ROOT/utils/arguments_utils.py:211`
+- `$SEER_WORKSPACE_ROOT/utils/arguments_utils.py:212`
+- `$SEER_WORKSPACE_ROOT/utils/arguments_utils.py:213`
 
 기본값:
 
@@ -1112,12 +1112,12 @@ lrnode_eval_skip_full_forward = 0
 
 코드 위치:
 
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:507)
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:580)
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:603)
-- [utils/train_utils.py](/home/mingyujung/private/seer/seer_node3/utils/train_utils.py:616)
-- [utils/eval_utils_libero.py](/home/mingyujung/private/seer/seer_node3/utils/eval_utils_libero.py:300)
-- [utils/eval_utils_libero.py](/home/mingyujung/private/seer/seer_node3/utils/eval_utils_libero.py:604)
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:507`
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:580`
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:603`
+- `$SEER_WORKSPACE_ROOT/utils/train_utils.py:616`
+- `$SEER_WORKSPACE_ROOT/utils/eval_utils_libero.py:300`
+- `$SEER_WORKSPACE_ROOT/utils/eval_utils_libero.py:604`
 
 LR-NODE는 success rate만 보면 왜 망했는지 알기 어렵다. 다음 failure mode가 가능하다.
 

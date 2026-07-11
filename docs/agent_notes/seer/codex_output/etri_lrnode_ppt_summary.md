@@ -3,15 +3,15 @@
 Archive note: 아래 Ours pre-protocol 결과는 2026-06-16에 archive로 이동했다.
 
 ```text
-/home/mingyujung/private/seer/seer_node3/archived_experiment_results_20260616/pre_protocol_lrnode
+$SEER_WORKSPACE_ROOT/archived_experiment_results_20260616/pre_protocol_lrnode
 ```
 
 ## 비교 대상
 
 - Baseline Seer:
-  `/home/mingyujung/private/seer/seer_main/eval/sd1_libero_10_100pc_original_settings_20260304`
+  `$SEER_BASELINE_ROOT/eval/sd1_libero_10_100pc_original_settings_20260304`
 - Ours:
-  `/home/mingyujung/private/seer/seer_node3/scratch_eval_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4_K2`
+  `$SEER_WORKSPACE_ROOT/scratch_eval_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4_K2`
 
 ## 결과 비교
 

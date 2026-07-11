@@ -1,8 +1,8 @@
-source_path: /home/mingyujung/private/seer/seer_node3
+source_path: $SEER_WORKSPACE_ROOT
 integrated_path: architectures/seer/upstream
 git_available: false
 reason: >
-  /home/mingyujung/private/seer/seer_node3 contains an empty .git directory,
+  $SEER_WORKSPACE_ROOT contains an empty .git directory,
   but git status, git remote -v, and git rev-parse HEAD all report that it is
   not a git repository.
 integration_policy: >

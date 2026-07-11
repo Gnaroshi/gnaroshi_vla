@@ -18,13 +18,13 @@
 새로 실행하는 학습/평가 결과는 모두 아래 root로 분리한다.
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616
 ```
 
 기존 pre-protocol LR-NODE 결과는 삭제하지 않고 아래 archive로 이동했다.
 
 ```text
-/home/mingyujung/private/seer/seer_node3/archived_experiment_results_20260616/pre_protocol_lrnode
+$SEER_WORKSPACE_ROOT/archived_experiment_results_20260616/pre_protocol_lrnode
 ```
 
 ## 2. Scratch Baseline

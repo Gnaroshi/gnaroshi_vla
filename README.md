@@ -27,7 +27,7 @@ architecture-specific adapters.
 
 ### Seer
 
-- Source baseline: `/home/mingyujung/private/seer/seer_node3`
+- Source baseline: `$SEER_WORKSPACE_ROOT`
 - Integrated copy: `architectures/seer/upstream/`
 - Known working environment: `conda activate seer_libero`
 - Method currently mixed into the Seer copy: LR-NODE
@@ -40,7 +40,7 @@ renamed or modified.
 - Upstream repository: `https://github.com/LUOyk1999/SimVLA.git`
 - Upstream clone: `architectures/simvla/upstream/`
 - Known environment: `conda activate simvla_libero`
-- LIBERO root: `/home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO`
+- LIBERO root: `$LIBERO_ROOT`
 
 SimVLA is kept as a clean upstream git clone. Dataset symlinks and training
 launchers are managed outside upstream under `architectures/simvla/wrappers/`.
@@ -124,6 +124,11 @@ The SimVLA wrapper accepts environment overrides such as `CUDA_VISIBLE_DEVICES`,
 `SIMVLA_BATCH_SIZE`, `SIMVLA_NUM_PROCESSES`, `SIMVLA_MAIN_PROCESS_PORT`, and
 `SIMVLA_ITERS`.
 
+Machine-specific paths are intentionally omitted from public documentation. See
+[`docs/public-paths.md`](docs/public-paths.md) for the placeholder variables used
+in historical experiment notes. Runtime YAML may still contain local values and
+must be migrated only with experiment-owner review.
+
 ## Adding a Future Architecture
 
 1. Create `architectures/<new_arch>/`.
@@ -165,3 +170,10 @@ README pointing to external checkpoint storage.
 - Per-run checkpoint directories under `results/`
 - Upstream nested clone contents unless intentionally converted to a git
   submodule, for example `architectures/simvla/upstream/`
+
+## Licensing And Attribution
+
+Copied third-party code keeps its original license files in place. See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). This repository does not
+currently declare a root license for workspace-owned code; no reuse grant should
+be inferred until the owner makes that decision.

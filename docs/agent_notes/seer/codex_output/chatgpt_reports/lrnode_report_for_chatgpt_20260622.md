@@ -1,7 +1,7 @@
 # ChatGPT용 LR-NODE 현재 구현/실험 결과 보고서
 
 작성일: 2026-06-22
-저장소 경로: `/home/mingyujung/private/seer/seer_node3`
+저장소 경로: `$SEER_WORKSPACE_ROOT`
 대상 연구: LR-NODE, Latent-Reactive Neural ODE for Seer/VLA efficient control
 
 ## 0. ChatGPT에게 먼저 알려야 할 핵심 요약

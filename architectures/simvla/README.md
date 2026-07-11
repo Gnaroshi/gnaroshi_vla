@@ -28,7 +28,7 @@ environment snapshot is stored under `env/`.
 Use the official LIBERO HDF5 dataset at:
 
 ```text
-/home/mingyujung/shared/nvme1/mingyujung/datasets/robotics/LIBERO
+$LIBERO_ROOT
 ```
 
 The actual subset directories are under the `datasets/` child:

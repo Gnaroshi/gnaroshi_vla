@@ -5,7 +5,7 @@
 새 학습/평가 결과는 기존 결과와 섞이지 않게 아래 root로 분리한다.
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616
 ```
 
 ## 1. Training Output

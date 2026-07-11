@@ -5,7 +5,7 @@
 보관 참고: 이 문서의 pre-protocol LR-NODE checkpoint/eval 결과는 아래 위치로 이동했다. 본문 표의 일부 경로는 이동 전 원래 경로를 기록한 것이다.
 
 ```text
-/home/mingyujung/private/seer/seer_node3/archived_experiment_results_20260616/pre_protocol_lrnode
+$SEER_WORKSPACE_ROOT/archived_experiment_results_20260616/pre_protocol_lrnode
 ```
 
 Protocol note: 아래 수치는 2026-06-17 `shifted_context` teacher target 수정 이전 결과다. 이 결과는 LR-NODE skip/eval/logging/video infrastructure가 동작한다는 구현 확인용으로만 사용하고, 새 방법론 성능 주장은 `runs_lrnode_protocol_20260616/` 아래 새 학습/평가 결과로 다시 작성해야 한다.
@@ -17,9 +17,9 @@ Protocol note: 아래 수치는 2026-06-17 `shifted_context` teacher target 수�
 | 항목 | 값 |
 |---|---|
 | Baseline | Seer original, ckpt 37 |
-| Baseline path | `/home/mingyujung/private/seer/seer_main/checkpoints/sd1_libero_10_100pc_original_settings/37.pth` |
+| Baseline path | `$SEER_BASELINE_ROOT/checkpoints/sd1_libero_10_100pc_original_settings/37.pth` |
 | Ours | `lrnode_student_v2_lw05_aw01_g4`, ckpt 35 |
-| Ours path | `/home/mingyujung/private/seer/seer_node3/scratch_checkpoints_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4/35.pth` |
+| Ours path | `$SEER_WORKSPACE_ROOT/scratch_checkpoints_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4/35.pth` |
 | Benchmark | LIBERO-10, 10 tasks x 20 episodes |
 | Action rate | 20 Hz |
 | Video | success/fail 모두 저장, 각 run 200개 |
