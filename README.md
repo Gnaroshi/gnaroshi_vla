@@ -5,6 +5,10 @@ experiments. It is intentionally architecture-neutral because Seer is only the
 first architecture being integrated. Future architectures such as SimVLA,
 OpenPI, or VLA-Adapter should live beside Seer under `architectures/`.
 
+**Status:** Active public research workspace. Lightweight sanity checks are supported; experiment claims require retained artifacts and owner-reviewed runs.
+
+Upstream architecture code and datasets remain external or isolated under architecture-specific boundaries. This repository must not contain private credentials, datasets, model checkpoints, machine-specific paths in public prose, or unrelated website and publishing code.
+
 ## Design
 
 The workspace separates four axes:
@@ -176,4 +180,9 @@ README pointing to external checkpoint storage.
 Copied third-party code keeps its original license files in place. See
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). This repository does not
 currently declare a root license for workspace-owned code; no reuse grant should
-be inferred until the owner makes that decision.
+be inferred until the owner makes that decision. See [`docs/license-decision.md`](docs/license-decision.md).
+
+## Related Repositories
+
+- [`Gnaroshi/gnaroshi.github.io`](https://github.com/Gnaroshi/gnaroshi.github.io): public research profile and project presentation
+- [`Gnaroshi/gnaroshi`](https://github.com/Gnaroshi/gnaroshi): GitHub profile index
