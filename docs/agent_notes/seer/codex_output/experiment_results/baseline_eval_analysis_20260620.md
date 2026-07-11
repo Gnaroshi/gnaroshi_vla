@@ -15,19 +15,19 @@ sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040
 Checkpoint root 경로:
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040
 ```
 
 최신 eval result root:
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/eval/baseline_sweep_sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040_20260618_132356
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/eval/baseline_sweep_sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040_20260618_132356
 ```
 
 동일 SR 재현 확인용 이전 eval root:
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/eval/baseline_sweep_sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040_20260617_095300
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/eval/baseline_sweep_sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040_20260617_095300
 ```
 
 Eval 설정:
@@ -93,13 +93,13 @@ Primary baseline으로는 ckpt 33을 권장한다.
 Primary checkpoint 경로:
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/33.pth
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/33.pth
 ```
 
 Tie backup checkpoint 경로:
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/39.pth
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/39.pth
 ```
 
 ## 4. Task별 결과

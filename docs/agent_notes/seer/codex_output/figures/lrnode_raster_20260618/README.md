@@ -11,5 +11,5 @@
 원본 생성 이미지는 아래 경로에 남아 있다.
 
 ```text
-/home/mingyujung/.codex/generated_images/019ed8f7-1c7d-75a2-ba20-81843097fca9/
+$CODEX_GENERATED_IMAGES/
 ```

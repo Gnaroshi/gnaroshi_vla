@@ -7,7 +7,7 @@
 ## 보관 root
 
 ```text
-/home/mingyujung/private/seer/seer_node3/archived_experiment_results_20260616/pre_protocol_lrnode
+$SEER_WORKSPACE_ROOT/archived_experiment_results_20260616/pre_protocol_lrnode
 ```
 
 ## 이동한 항목

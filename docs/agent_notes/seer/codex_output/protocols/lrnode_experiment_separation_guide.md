@@ -3,7 +3,7 @@
 보관 참고: 이 문서 작성 후 pre-protocol LR-NODE 결과는 2026-06-16에 아래 archive로 이동했습니다.
 
 ```text
-/home/mingyujung/private/seer/seer_node3/archived_experiment_results_20260616/pre_protocol_lrnode
+$SEER_WORKSPACE_ROOT/archived_experiment_results_20260616/pre_protocol_lrnode
 ```
 
 요청한 분리 규칙을 반영해서 다음 규칙이 적용됐습니다.
@@ -97,5 +97,5 @@ bash scripts/LIBERO_LONG/Seer/eval_lrnode_scratch_joint_compare.sh
 이 문서에 언급된 pre-protocol LR-NODE 결과는 2026-06-16에 아래 archive로 이동했다.
 
 ```text
-/home/mingyujung/private/seer/seer_node3/archived_experiment_results_20260616/pre_protocol_lrnode
+$SEER_WORKSPACE_ROOT/archived_experiment_results_20260616/pre_protocol_lrnode
 ```

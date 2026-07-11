@@ -287,7 +287,7 @@ dummy frozen encoder를 사용하지만, Seer transformer/action head/image deco
 실행:
 
 ```text
-/home/mingyujung/miniconda3/envs/seer_libero/bin/python scripts/debug/check_lrnode_parity.py
+$SEER_PYTHON scripts/debug/check_lrnode_parity.py
 ```
 
 결과:
@@ -356,7 +356,7 @@ baseline scratch 학습 결과는 유지되어 있다.
 통과:
 
 ```text
-/home/mingyujung/miniconda3/envs/seer_libero/bin/python -m py_compile \
+$SEER_PYTHON -m py_compile \
   scripts/debug/check_lrnode_parity.py \
   utils/train_utils.py \
   models/seer_model.py \

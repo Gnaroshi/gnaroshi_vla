@@ -56,7 +56,7 @@ lrnode_assert_only_lrnode_trainable=1
 - 확인된 값:
 
 ```text
-finetune_from_pretrained_ckpt=/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch//sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/33.pth
+finetune_from_pretrained_ckpt=$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/train/scratch//sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/33.pth
 ```
 
 ## 2. 지금 바로 해야 할 평가

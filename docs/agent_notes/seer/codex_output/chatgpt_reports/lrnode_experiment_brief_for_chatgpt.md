@@ -5,7 +5,7 @@
 보관 참고: 이 문서에서 언급하는 pre-protocol LR-NODE 결과는 2026-06-16에 아래 archive로 이동했다.
 
 ```text
-/home/mingyujung/private/seer/seer_node3/archived_experiment_results_20260616/pre_protocol_lrnode
+$SEER_WORKSPACE_ROOT/archived_experiment_results_20260616/pre_protocol_lrnode
 ```
 
 ## 1. 연구/구현 목표
@@ -33,9 +33,9 @@ LR-NODE, Latent-Reactive NODE는 기존 Seer의 action head를 교체하는 모�
 이전에는 아래 두 eval 폴더를 비교했다.
 
 - Baseline:
-  `/home/mingyujung/private/seer/seer_main/eval/sd1_libero_10_100pc_original_settings_20260304`
+  `$SEER_BASELINE_ROOT/eval/sd1_libero_10_100pc_original_settings_20260304`
 - Ours:
-  `/home/mingyujung/private/seer/seer_node3/scratch_eval_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4_K2`
+  `$SEER_WORKSPACE_ROOT/scratch_eval_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4_K2`
 
 결과:
 
@@ -139,12 +139,12 @@ bash scripts/LIBERO_LONG/Seer/eval_lrnode_compare.sh
 Baseline 설정:
   name: seer_original
   run_name: sd1_libero_10_100pc_original_settings
-  ckpt: /home/mingyujung/private/seer/seer_main/checkpoints/sd1_libero_10_100pc_original_settings/37.pth
+  ckpt: $SEER_BASELINE_ROOT/checkpoints/sd1_libero_10_100pc_original_settings/37.pth
 
 Ours 설정:
   method: lrnode_student_v2_lw05_aw01_g4
   run_name: sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4
-  ckpt: /home/mingyujung/private/seer/seer_node3/scratch_checkpoints_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4/35.pth
+  ckpt: $SEER_WORKSPACE_ROOT/scratch_checkpoints_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4/35.pth
 
 K sweep 설정:
   baseline full: K=1
@@ -163,7 +163,7 @@ Video 설정:
 현재 result root:
 
 ```text
-/home/mingyujung/private/seer/seer_node3/scratch_eval_lrnode/lrnode_compare_lrnode_student_v2_lw05_aw01_g4_ckpt35_vs_seer_original_ckpt37_20260615_001039
+$SEER_WORKSPACE_ROOT/scratch_eval_lrnode/lrnode_compare_lrnode_student_v2_lw05_aw01_g4_ckpt35_vs_seer_original_ckpt37_20260615_001039
 ```
 
 현재 확인 시점 상태:

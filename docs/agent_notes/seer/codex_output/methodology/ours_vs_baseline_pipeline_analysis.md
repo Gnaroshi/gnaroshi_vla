@@ -5,7 +5,7 @@
 보관 참고: 이 문서가 분석한 pre-protocol LR-NODE 결과는 2026-06-16에 아래 위치로 이동했다. 문서 본문에는 당시 원래 경로가 일부 남아 있을 수 있다.
 
 ```text
-/home/mingyujung/private/seer/seer_node3/archived_experiment_results_20260616/pre_protocol_lrnode
+$SEER_WORKSPACE_ROOT/archived_experiment_results_20260616/pre_protocol_lrnode
 ```
 
 ## 1. 분석 기준
@@ -17,7 +17,7 @@
   scripts/LIBERO_LONG/Seer/eval_lrnode_compare.sh
 
 결과 root:
-  /home/mingyujung/private/seer/seer_node3/scratch_eval_lrnode/lrnode_compare_lrnode_student_v2_lw05_aw01_g4_ckpt35_vs_seer_original_ckpt37_20260615_001039
+  $SEER_WORKSPACE_ROOT/scratch_eval_lrnode/lrnode_compare_lrnode_student_v2_lw05_aw01_g4_ckpt35_vs_seer_original_ckpt37_20260615_001039
 ```
 
 비교 대상:
@@ -26,10 +26,10 @@
 |---|---|
 | Baseline name | `seer_original` |
 | Baseline run | `sd1_libero_10_100pc_original_settings` |
-| Baseline ckpt | `/home/mingyujung/private/seer/seer_main/checkpoints/sd1_libero_10_100pc_original_settings/37.pth` |
+| Baseline ckpt | `$SEER_BASELINE_ROOT/checkpoints/sd1_libero_10_100pc_original_settings/37.pth` |
 | Ours method | `lrnode_student_v2_lw05_aw01_g4` |
 | Ours run | `sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4` |
-| Ours ckpt | `/home/mingyujung/private/seer/seer_node3/scratch_checkpoints_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4/35.pth` |
+| Ours ckpt | `$SEER_WORKSPACE_ROOT/scratch_checkpoints_lrnode/sd1_scratch_libero_10_converted_seer_lrnode_student_v2_lw05_aw01_g4/35.pth` |
 
 공통 eval 설정:
 

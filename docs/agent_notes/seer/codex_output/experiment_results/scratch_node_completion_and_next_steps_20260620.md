@@ -23,14 +23,14 @@ LRNODE_TEACHER_TARGET_MODE=shifted_context
 LRNODE_CONTEXT_SELECTED_STEP=-1
 LRNODE_EXPERIMENT_TAG=20260619_113053
 LRNODE_RUN_NAME=sd1_scratch_node_ts_lrnode_scratch_ts_v1_lw05_aw01_g4_20260619_113053
-LRNODE_SAVE_CHECKPOINT_PATH=/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch_node/
+LRNODE_SAVE_CHECKPOINT_PATH=$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/train/scratch_node/
 LRNODE_DATASET=libero_10_converted
 ```
 
 Checkpoint directory 경로:
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch_node/sd1_scratch_node_ts_lrnode_scratch_ts_v1_lw05_aw01_g4_20260619_113053
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/train/scratch_node/sd1_scratch_node_ts_lrnode_scratch_ts_v1_lw05_aw01_g4_20260619_113053
 ```
 
 확인된 checkpoint:
@@ -241,13 +241,13 @@ codex_output/baseline_eval_analysis_20260620.md
 Primary baseline ckpt 경로:
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/33.pth
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/33.pth
 ```
 
 Backup baseline ckpt 경로:
 
 ```text
-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/39.pth
+$SEER_WORKSPACE_ROOT/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/39.pth
 ```
 
 ## 6. distill_node.sh 실험 분석

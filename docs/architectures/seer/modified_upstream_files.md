@@ -1,6 +1,6 @@
 # Modified Upstream Files
 
-Initial status: the source directory `/home/mingyujung/private/seer/seer_node3`
+Initial status: the source directory `$SEER_WORKSPACE_ROOT`
 is not a valid git repository, so there is no local clean upstream baseline or
 diff available. The copied `upstream/` tree therefore preserves the current
 known-working state.

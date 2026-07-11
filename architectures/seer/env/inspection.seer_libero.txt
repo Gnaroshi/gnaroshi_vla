@@ -8,16 +8,16 @@ generated_at: 2026-06-26
 #
 # * -> active
 # + -> frozen
-base                 *   /home/mingyujung/miniconda3
-baku_libero              /home/mingyujung/miniconda3/envs/baku_libero
-pfig                     /home/mingyujung/miniconda3/envs/pfig
-seer_libero              /home/mingyujung/miniconda3/envs/seer_libero
-seer_libero-plus         /home/mingyujung/miniconda3/envs/seer_libero-plus
-simvla_libero            /home/mingyujung/miniconda3/envs/simvla_libero
+base                 *   $HOME/miniconda3
+baku_libero              $HOME/miniconda3/envs/baku_libero
+pfig                     $HOME/miniconda3/envs/pfig
+seer_libero              $HOME/miniconda3/envs/seer_libero
+seer_libero-plus         $HOME/miniconda3/envs/seer_libero-plus
+simvla_libero            $HOME/miniconda3/envs/simvla_libero
 
 
 ## which python
-/home/mingyujung/miniconda3/envs/seer_libero/bin/python
+$SEER_PYTHON
 
 
 ## python --version
@@ -25,7 +25,7 @@ Python 3.10.19
 
 
 ## sys.executable
-/home/mingyujung/miniconda3/envs/seer_libero/bin/python
+$SEER_PYTHON
 
 
 ## torch/cuda
