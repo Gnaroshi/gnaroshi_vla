@@ -19,7 +19,6 @@ venv/
 
 # Agent-generated documentation and outputs
 codex_outputs/
-docs/
 AGENTS.md
 **/AGENTS.md
 WORKSPACE_FILE_MANIFEST.txt

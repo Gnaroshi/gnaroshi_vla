@@ -8,16 +8,16 @@ set -euo pipefail
 #   - an existing Seer baseline checkpoint is loaded
 #   - every non-LR-NODE module is frozen
 #   - only lrnode_delta_encoder + lrnode_dynamics are trained
-#
-# New protocol runs are intentionally saved under runs_lrnode_protocol_20260616
-# so they do not mix with older adapter_checkpoints_* experiments.
 
-protocol_root="${LRNODE_PROTOCOL_ROOT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UPSTREAM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${UPSTREAM_DIR}/../../.." && pwd)"
+protocol_root="${LRNODE_PROTOCOL_ROOT:-${REPO_ROOT}/results/seer/lrnode/default}"
 save_checkpoint_path="${SAVE_CHECKPOINT_PATH:-${protocol_root}/train/distill_node/}"
 dataset="${DATASET:-libero_10_converted}"
-root_dir="${ROOT_DIR:-/home/mingyujung/private/seer/seer_node3/LIBERO_DATASETS/${dataset}}"
-vit_checkpoint_path="${VIT_CHECKPOINT_PATH:-checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
-libero_path="${LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
+root_dir="${ROOT_DIR:-${UPSTREAM_DIR}/LIBERO_DATASETS/${dataset}}"
+vit_checkpoint_path="${VIT_CHECKPOINT_PATH:-${UPSTREAM_DIR}/checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
+libero_path="${LIBERO_PATH:-}"
 calvin_dataset_path="${CALVIN_DATASET_PATH:-calvin/dataset/task_ABC_D}"
 
 baseline_env="${BASELINE_ENV:-${protocol_root}/train/_latest/scratch.env}"
@@ -43,8 +43,21 @@ which_server="${WHICH_SERVER:-sd1}"
 method_tag="${METHOD_TAG:-lrnode_distill_from_scratch_baseline_ckpt${BASELINE_CKPT_ID}_lronly_v1_lw05_aw01_g4}"
 experiment_tag="${EXPERIMENT_TAG:-$(date +%Y%m%d_%H%M%S)}"
 run_name="${RUN_NAME:-${which_server}_distill_node_${method_tag}_${experiment_tag}}"
+num_epochs="${NUM_EPOCHS:-40}"
+# train.py uses the strict condition `epoch > start_save_checkpoint`.
+# A value of 25 therefore saves 26.pth through the final 39.pth.
+start_save_checkpoint="${START_SAVE_CHECKPOINT:-25}"
+if [[ ! "${num_epochs}" =~ ^[0-9]+$ || ! "${start_save_checkpoint}" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] NUM_EPOCHS and START_SAVE_CHECKPOINT must be non-negative integers." >&2
+    exit 1
+fi
+if (( start_save_checkpoint >= num_epochs - 1 )); then
+    echo "[ERROR] No checkpoint would be saved: NUM_EPOCHS=${num_epochs}, START_SAVE_CHECKPOINT=${start_save_checkpoint}." >&2
+    exit 1
+fi
 export EXPERIMENT_TAG="${experiment_tag}"
 export RUN_NAME="${run_name}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 latest_dir="${protocol_root}/train/_latest"
 
 echo "[TRAIN INFO] script=distill_node.sh"
@@ -53,10 +66,26 @@ echo "[TRAIN INFO] save_checkpoint_path=${save_checkpoint_path}"
 echo "[TRAIN INFO] experiment_tag=${EXPERIMENT_TAG}"
 echo "[TRAIN INFO] run_name=${RUN_NAME}"
 echo "[TRAIN INFO] baseline_ckpt=${BASELINE_CKPT}"
+echo "[TRAIN INFO] checkpoint_epochs=$((start_save_checkpoint + 1))-$((num_epochs - 1))"
+echo "[TRAIN INFO] live_loss=console_tqdm, wandb, protocol tee log"
 echo "[TRAIN INFO] latest_pointer_after_success=${latest_dir}/distill_node.env"
 
 if [[ ! -f "${BASELINE_CKPT}" ]]; then
     echo "[ERROR] Missing baseline checkpoint: ${BASELINE_CKPT}" >&2
+    exit 1
+fi
+if [[ ! -d "${root_dir}/${dataset}" ]]; then
+    echo "[ERROR] Missing converted dataset: ${root_dir}/${dataset}" >&2
+    echo "[ERROR] Set ROOT_DIR to the parent directory containing ${dataset}/." >&2
+    exit 1
+fi
+if [[ ! -f "${vit_checkpoint_path}" ]]; then
+    echo "[ERROR] Missing ViT checkpoint: ${vit_checkpoint_path}" >&2
+    echo "[ERROR] Set VIT_CHECKPOINT_PATH explicitly." >&2
+    exit 1
+fi
+if [[ -z "${libero_path}" || ! -d "${libero_path}" ]]; then
+    echo "[ERROR] Set LIBERO_PATH to a valid LIBERO repository path." >&2
     exit 1
 fi
 
@@ -104,7 +133,7 @@ torchrun --nnodes=${node} --nproc_per_node=${node_num} --master_port=${master_po
     --workers 4 \
     --lr_scheduler cosine \
     --save_every_iter 100000 \
-    --num_epochs "${NUM_EPOCHS:-40}" \
+    --num_epochs "${num_epochs}" \
     --seed "${SEED:-42}" \
     --batch_size 16 \
     --precision fp32 \
@@ -126,7 +155,7 @@ torchrun --nnodes=${node} --nproc_per_node=${node_num} --master_port=${master_po
     --future_steps 3 \
     --window_size 10 \
     --save_checkpoint_seq 1 \
-    --start_save_checkpoint "${START_SAVE_CHECKPOINT:-0}" \
+    --start_save_checkpoint "${start_save_checkpoint}" \
     --gripper_width \
     --warmup_epochs "${WARMUP_EPOCHS:-2}" \
     --libero_path "${libero_path}" \
@@ -151,6 +180,9 @@ LRNODE_DATASET=${dataset}
 LRNODE_BASELINE_CKPT=${BASELINE_CKPT}
 LRNODE_BASELINE_RUN_NAME=${BASELINE_RUN_NAME}
 LRNODE_BASELINE_CKPT_ID=${BASELINE_CKPT_ID}
+LRNODE_NUM_EPOCHS=${num_epochs}
+LRNODE_START_SAVE_CHECKPOINT=${start_save_checkpoint}
+LRNODE_FIRST_SAVED_CHECKPOINT=$((start_save_checkpoint + 1))
 EOF
 cp "${latest_dir}/distill_node.env" "${latest_dir}/finetune_node.env"
 echo "[TRAIN INFO] wrote latest pointer: ${latest_dir}/distill_node.env"

@@ -294,6 +294,42 @@ def get_parser(is_eval=False):
     parser.add_argument("--lrnode_eval_step_log", type=int, default=0)
     parser.add_argument("--lrnode_eval_shadow_full_forward", type=int, default=0)
     parser.add_argument(
+        "--lrnode_eval_profile_full_action_head",
+        type=int,
+        default=0,
+        help=(
+            "When 1, profile the existing Seer action head inside full-forward calls. "
+            "This adds CUDA synchronization and should be used for latency studies."
+        ),
+    )
+    parser.add_argument(
+        "--lrnode_eval_ablation_mode",
+        type=str,
+        default="stepwise",
+        choices=["stepwise", "hold_action", "hold_latent", "seer_token_chunk", "no_delta"],
+        help=(
+            "Eval-only intervention ablation for skipped LR-NODE steps. 'stepwise' is the existing "
+            "delta-conditioned fixed-Euler latent update path."
+        ),
+    )
+    parser.add_argument(
+        "--lrnode_no_delta_mode",
+        type=str,
+        default="zero",
+        choices=["zero", "learned_constant", "previous"],
+        help="No-delta ablation variant. Only 'zero' is implemented.",
+    )
+    parser.add_argument(
+        "--lrnode_chunk_token_policy",
+        type=str,
+        default="skip_only",
+        choices=["skip_only"],
+        help=(
+            "Seer action-token chunk ablation policy. 'skip_only' executes the normal full-step "
+            "action at refresh steps and cached Seer action tokens only on skipped steps."
+        ),
+    )
+    parser.add_argument(
         "--lrnode_eval_refresh_policy",
         type=str,
         default="periodic",
@@ -320,8 +356,11 @@ def get_parser(is_eval=False):
     # pretrain, finetune, evaluate
     parser.add_argument('--phase', required=True, help='pretrain, finetune, evaluate')
     # libero 
-    # parser.add_argument("--libero_path", default="/ailab/user/tianyang/Code/LIBERO")
-    parser.add_argument("--libero_path", default="/home/mingyujung/private/LIBERO")
+    parser.add_argument(
+        "--libero_path",
+        default=os.environ.get("LIBERO_PATH", ""),
+        help="Path to the LIBERO repository. Defaults to the LIBERO_PATH environment variable.",
+    )
     parser.add_argument("--libero_img_size", default=128, type=int)
     parser.add_argument("--libero_eval_max_steps", default=600, type=int)
     parser.add_argument("--gripper_width", default=False, action="store_true")

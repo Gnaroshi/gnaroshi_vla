@@ -11,7 +11,10 @@ set -euo pipefail
 #   2) LR-NODE distill full-forward K=1
 #   3) LR-NODE distill skip-forward K sweep
 
-protocol_root="${LRNODE_PROTOCOL_ROOT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UPSTREAM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${UPSTREAM_DIR}/../../.." && pwd)"
+protocol_root="${LRNODE_PROTOCOL_ROOT:-${REPO_ROOT}/results/seer/lrnode/default}"
 latest_baseline="${protocol_root}/train/_latest/scratch.env"
 latest_distill="${protocol_root}/train/_latest/distill_node.env"
 latest_finetune_compat="${protocol_root}/train/_latest/finetune_node.env"
