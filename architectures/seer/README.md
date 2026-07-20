@@ -4,7 +4,7 @@ Seer is the first architecture integrated into `gnaroshi_vla`.
 
 ## Directories
 
-- `upstream/`: copied Seer source from `/home/mingyujung/private/seer/seer_node3`.
+- `upstream/`: copied Seer source from `$SEER_WORKSPACE_ROOT`.
 - `adapters/`: architecture-specific integration points between upstream Seer and methods.
 - `configs/`: Seer-local config notes and overlays.
 - `env/`: Seer environment documentation and export files.

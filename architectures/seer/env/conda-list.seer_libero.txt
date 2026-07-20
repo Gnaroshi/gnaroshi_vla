@@ -1,4 +1,4 @@
-# packages in environment at /home/mingyujung/miniconda3/envs/seer_libero:
+# packages in environment at $HOME/miniconda3/envs/seer_libero:
 #
 # Name                       Version           Build            Channel
 _libgcc_mutex                0.1               main
