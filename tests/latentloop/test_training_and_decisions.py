@@ -19,6 +19,7 @@ from architectures.simvla.adapters.latentloop.checkpoint import (
     trainable_parameter_names,
 )
 from architectures.simvla.adapters.latentloop.condition_adapter import build_latentloop_adapter
+from architectures.simvla.adapters.latentloop.offline_evaluator import _efficiency_snapshot
 from architectures.simvla.adapters.latentloop.result_aggregator import aggregate
 from architectures.simvla.adapters.latentloop.trainer import (
     _capture_rng_state,
@@ -108,6 +109,24 @@ def test_training_rng_state_round_trip(monkeypatch: MonkeyPatch) -> None:
     _restore_rng_state(state, device)
     actual = (random.random(), float(np.random.rand()), float(torch.rand(())))
     assert actual == expected
+
+
+def test_offline_efficiency_uses_run_timer(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "architectures.simvla.adapters.latentloop.offline_evaluator.time.perf_counter",
+        lambda: 12.5,
+    )
+    metrics = _efficiency_snapshot(
+        run_started_at=10.0,
+        processed_records=5,
+        device=torch.device("cpu"),
+    )
+    assert metrics == {
+        "elapsed_seconds": 2.5,
+        "records_per_second": 2.0,
+        "peak_cuda_allocated_bytes": 0,
+        "peak_cuda_reserved_bytes": 0,
+    }
 
 
 def test_predeclared_gate_rules() -> None:

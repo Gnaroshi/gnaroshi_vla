@@ -75,6 +75,25 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _efficiency_snapshot(
+    *,
+    run_started_at: float,
+    processed_records: int,
+    device: torch.device,
+) -> dict[str, float | int]:
+    elapsed_seconds = time.perf_counter() - run_started_at
+    return {
+        "elapsed_seconds": elapsed_seconds,
+        "records_per_second": processed_records / max(elapsed_seconds, 1e-9),
+        "peak_cuda_allocated_bytes": (
+            int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
+        ),
+        "peak_cuda_reserved_bytes": (
+            int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else 0
+        ),
+    }
+
+
 def _action_errors(prediction: Tensor, target: Tensor, lengths: Tensor) -> dict[str, Tensor]:
     difference = prediction - target
     horizon = prediction.shape[1]
@@ -164,7 +183,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     progress_path = output / "eval_progress.jsonl"
-    started = time.time()
+    run_started_at = time.perf_counter()
     processed_records = 0
     progress_bar = tqdm(
         loader,
@@ -193,7 +212,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
         row_predictions: dict[str, tuple[Tensor | None, Tensor]] = {}
         _synchronize(device)
-        started = time.perf_counter()
+        row_started_at = time.perf_counter()
         with torch.no_grad():
             hold_action = action_adapter.decode_action_from_condition(
                 batch["full_condition"],
@@ -203,12 +222,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
         _synchronize(device)
         row_latency["hold_condition"].append(
-            1000.0 * (time.perf_counter() - started) / batch["proprio"].shape[0]
+            1000.0 * (time.perf_counter() - row_started_at) / batch["proprio"].shape[0]
         )
         row_predictions["hold_condition"] = (batch["full_condition"], hold_action)
         for variant, (adapter, _) in adapters.items():
             _synchronize(device)
-            started = time.perf_counter()
+            row_started_at = time.perf_counter()
             with torch.no_grad():
                 observation = adapter.encode_observation(
                     batch["raw_rgb"],
@@ -265,7 +284,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
             _synchronize(device)
             row_latency[variant].append(
-                1000.0 * (time.perf_counter() - started) / batch["proprio"].shape[0]
+                1000.0 * (time.perf_counter() - row_started_at) / batch["proprio"].shape[0]
             )
             row_predictions[variant] = (condition, action)
         for row_name, (condition, action) in row_predictions.items():
@@ -310,19 +329,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     }
                 )
         processed_records += int(batch["proprio"].shape[0])
-        elapsed = time.time() - started
         event = {
             "batch": batch_index,
             "batches": len(loader),
             "processed_records": processed_records,
             "heldout_records": len(holdout),
-            "elapsed_seconds": elapsed,
-            "records_per_second": processed_records / max(elapsed, 1e-9),
-            "peak_cuda_allocated_bytes": (
-                int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
-            ),
-            "peak_cuda_reserved_bytes": (
-                int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else 0
+            **_efficiency_snapshot(
+                run_started_at=run_started_at,
+                processed_records=processed_records,
+                device=device,
             ),
         }
         if (
@@ -336,7 +351,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             rps=f"{event['records_per_second']:.2f}",
         )
     progress_bar.close()
-    elapsed_seconds = time.time() - started
     metrics: dict[str, Any] = {}
     for row_name, values in row_values.items():
         parameter_count = 0
@@ -389,16 +403,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_same_noise_reload_max_abs_diff": max(teacher_reload_diffs, default=None),
         "rows": metrics,
         "gate": gate,
-        "efficiency": {
-            "elapsed_seconds": elapsed_seconds,
-            "records_per_second": len(holdout) / max(elapsed_seconds, 1e-9),
-            "peak_cuda_allocated_bytes": (
-                int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
-            ),
-            "peak_cuda_reserved_bytes": (
-                int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else 0
-            ),
-        },
+        "efficiency": _efficiency_snapshot(
+            run_started_at=run_started_at,
+            processed_records=len(holdout),
+            device=device,
+        ),
     }
     _write_json(output / "offline_metrics.json", result)
     _write_json(output / "offline_gate.json", gate)
