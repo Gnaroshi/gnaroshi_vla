@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -328,6 +329,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     total_episodes = len(rows) * len(task_ids) * args.num_trials
     completed = 0
     started = time.time()
+    progress_bar = tqdm(
+        total=total_episodes,
+        desc=f"LatentLoop {args.matrix} R{args.execution_horizon}",
+        dynamic_ncols=True,
+        mininterval=args.tqdm_mininterval,
+        disable=args.disable_tqdm,
+    )
     for row in rows:
         adapter = loaded_adapters[row.checkpoint_path][0] if row.checkpoint_path else None
         for task_id in task_ids:
@@ -453,6 +461,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     }
                     episode_rows.append(episode_row)
                     completed += 1
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(
+                        row=row.name,
+                        task=task_id,
+                        episode=episode,
+                        success=int(success),
+                    )
                     _append_jsonl(
                         progress_path,
                         {
@@ -468,6 +483,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
             finally:
                 env.close()
+    progress_bar.close()
     with episode_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(episode_rows[0]))
         writer.writeheader()
@@ -647,6 +663,8 @@ def main() -> int:
     parser.add_argument("--video-episodes", type=_parse_episode_list, default=(0, 1))
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--video-stride", type=int, default=2)
+    parser.add_argument("--tqdm-mininterval", type=float, default=1.0)
+    parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     result = run(args)
