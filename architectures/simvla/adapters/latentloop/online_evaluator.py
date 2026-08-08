@@ -29,6 +29,9 @@ from architectures.simvla.adapters.latentloop.checkpoint import (  # noqa: E402
     freeze_module,
     load_adapter_checkpoint,
 )
+from architectures.simvla.adapters.latentloop.k1_parity_revalidator import (  # noqa: E402
+    analyze_k1_parity,
+)
 from architectures.simvla.adapters.latentloop.simvla_policy import (  # noqa: E402
     RealSimVLALatentLoopPolicy,
 )
@@ -62,6 +65,28 @@ ADAPTER_MODES = {
     "nonrecurrent_condition",
     "action_chunk_correction",
 }
+
+
+def _resolve_task_ids(
+    *,
+    suite_tasks: int,
+    task_order: str,
+    max_tasks: int,
+    explicit_task_ids: tuple[int, ...],
+) -> list[int]:
+    if explicit_task_ids:
+        task_ids = list(explicit_task_ids)
+        if len(set(task_ids)) != len(task_ids):
+            raise ValueError("--task-ids must not contain duplicates")
+        if any(task_id < 0 or task_id >= suite_tasks for task_id in task_ids):
+            raise ValueError(f"--task-ids must be in [0,{suite_tasks - 1}]")
+        return task_ids
+    ordered = (
+        list(range(suite_tasks - 1, -1, -1))
+        if task_order == "official_reverse"
+        else list(range(suite_tasks))
+    )
+    return ordered[:max_tasks]
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -276,16 +301,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         norm_stats_path=args.norm_stats,
     )
     _write_json(output / "source_lock.json", source_lock)
-    _write_json(
-        output / "eval_config.json",
-        {
-            **vars(args),
-            "rows": [row.__dict__ for row in rows],
-            "environment_action_gap_by_row": {
-                row.name: row.full_query_interval * args.execution_horizon for row in rows
-            },
-        },
-    )
     os.environ.setdefault("LIBERO_ROOT", str(LIBERO_ROOT))
     device = torch.device(args.device)
     model = SmolVLMVLA.from_pretrained(args.checkpoint).to(device)
@@ -299,11 +314,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             freeze_module(adapter)
             loaded_adapters[row.checkpoint_path] = (adapter, payload)
     suite = benchmark.get_benchmark_dict()[args.suite]()
-    task_ids = (
-        list(range(suite.n_tasks - 1, -1, -1))
-        if args.task_order == "official_reverse"
-        else list(range(suite.n_tasks))
-    )[: args.max_tasks]
+    task_ids = _resolve_task_ids(
+        suite_tasks=suite.n_tasks,
+        task_order=args.task_order,
+        max_tasks=args.max_tasks,
+        explicit_task_ids=args.task_ids,
+    )
+    _write_json(
+        output / "eval_config.json",
+        {
+            **vars(args),
+            "resolved_task_ids": task_ids,
+            "rows": [row.__dict__ for row in rows],
+            "environment_action_gap_by_row": {
+                row.name: row.full_query_interval * args.execution_horizon for row in rows
+            },
+        },
+    )
     episode_csv = output / "episode_metrics.csv"
     query_trace_path = output / "query_trace.jsonl"
     progress_path = output / "eval_progress.jsonl"
@@ -323,6 +350,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for row in rows
     }
     k1_chunks: dict[str, dict[tuple[int, int, int], Tensor]] = {
+        row.name: {} for row in rows if row.full_query_interval == 1
+    }
+    k1_query_records: dict[str, dict[tuple[int, int, int], dict[str, Any]]] = {
         row.name: {} for row in rows if row.full_query_interval == 1
     }
     video_root = output / "videos"
@@ -411,17 +441,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     for name, value in diagnostics.items():
                         row_action_diagnostics[row.name][name].append(float(value))
                     for record in policy.latentloop_query_trace:
+                        enriched_record = {
+                            **record,
+                            "row": row.name,
+                            "task_id": task_id,
+                            "episode": episode,
+                            "execution_horizon": args.execution_horizon,
+                            "full_query_interval": row.full_query_interval,
+                        }
                         _append_jsonl(
                             query_trace_path,
-                            {
-                                **record,
-                                "row": row.name,
-                                "task_id": task_id,
-                                "episode": episode,
-                                "execution_horizon": args.execution_horizon,
-                                "full_query_interval": row.full_query_interval,
-                            },
+                            enriched_record,
                         )
+                        if row.name in k1_query_records:
+                            k1_query_records[row.name][
+                                (task_id, episode, int(record["policy_query_index"]))
+                            ] = enriched_record
                     for tracking in policy.latentloop_tracking_trace:
                         age = int(tracking["query_age"])
                         for name, value in tracking.items():
@@ -564,6 +599,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 seed=args.bootstrap_seed,
             )
     k1_parity: dict[str, Any] | None = None
+    raw_k1_parity: dict[str, Any] | None = None
     if "adapter_loaded_full_k1" in outcomes:
         baseline_chunks = k1_chunks["full_k1"]
         adapter_chunks = k1_chunks["adapter_loaded_full_k1"]
@@ -576,7 +612,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             default=None,
         )
         adapter_counters = row_counters["adapter_loaded_full_k1"]
-        k1_parity = {
+        raw_k1_parity = {
             "paired_action_chunks": len(common),
             "missing_chunk_keys": len(set(baseline_chunks) ^ set(adapter_chunks)),
             "max_abs_action_chunk_diff": max_diff,
@@ -590,21 +626,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "observation_encoder_calls": int(adapter_counters["num_observation_encoder_calls"]),
             "action_encoder_calls": int(adapter_counters["num_executed_action_encoder_calls"]),
         }
-        k1_parity["K1_PARITY_PASS"] = bool(
-            k1_parity["exact_action_chunk_equality"]
-            and k1_parity["identical_paired_outcomes"]
-            and k1_parity["updater_calls"] == 0
-            and k1_parity["observation_encoder_calls"] == 0
-            and k1_parity["action_encoder_calls"] == 0
+        raw_k1_parity["K1_PARITY_PASS"] = bool(
+            raw_k1_parity["exact_action_chunk_equality"]
+            and raw_k1_parity["identical_paired_outcomes"]
+            and raw_k1_parity["updater_calls"] == 0
+            and raw_k1_parity["observation_encoder_calls"] == 0
+            and raw_k1_parity["action_encoder_calls"] == 0
+        )
+        k1_parity = analyze_k1_parity(
+            raw_summary={
+                "matrix": "k1_parity",
+                "rows": summaries,
+                "k1_parity": raw_k1_parity,
+            },
+            outcomes=outcomes,
+            traces=k1_query_records,
         )
     result = {
         "matrix": args.matrix,
         "suite": args.suite,
+        "task_ids": task_ids,
         "episodes_per_row": len(task_ids) * args.num_trials,
         "rows": summaries,
         "paired_vs_full": paired,
         "paired_between_rows": paired_between_rows,
         "k1_parity": k1_parity,
+        "raw_k1_parity": raw_k1_parity,
         "episode_metrics_csv": str(episode_csv),
         "query_trace_jsonl": str(query_trace_path),
     }
@@ -647,6 +694,7 @@ def main() -> int:
     parser.add_argument("--execution-horizon", type=int, choices=(1, 2, 5), required=True)
     parser.add_argument("--num-trials", type=int, default=10)
     parser.add_argument("--max-tasks", type=int, default=10)
+    parser.add_argument("--task-ids", type=_parse_episode_list, default=())
     parser.add_argument("--max-env-actions", type=int, default=900)
     parser.add_argument("--num-wait-steps", type=int, default=10)
     parser.add_argument("--flow-steps", type=int, default=10)

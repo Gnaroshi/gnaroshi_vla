@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from pytest import MonkeyPatch
 import torch
 from torch import nn
@@ -20,6 +21,7 @@ from architectures.simvla.adapters.latentloop.checkpoint import (
 )
 from architectures.simvla.adapters.latentloop.condition_adapter import build_latentloop_adapter
 from architectures.simvla.adapters.latentloop.offline_evaluator import _efficiency_snapshot
+from architectures.simvla.adapters.latentloop.online_evaluator import _resolve_task_ids
 from architectures.simvla.adapters.latentloop.result_aggregator import aggregate
 from architectures.simvla.adapters.latentloop.trainer import (
     _capture_rng_state,
@@ -127,6 +129,35 @@ def test_offline_efficiency_uses_run_timer(monkeypatch: MonkeyPatch) -> None:
         "peak_cuda_allocated_bytes": 0,
         "peak_cuda_reserved_bytes": 0,
     }
+
+
+def test_online_task_shards_are_explicit_and_validated() -> None:
+    assert _resolve_task_ids(
+        suite_tasks=10,
+        task_order="official_reverse",
+        max_tasks=3,
+        explicit_task_ids=(),
+    ) == [9, 8, 7]
+    assert _resolve_task_ids(
+        suite_tasks=10,
+        task_order="official_reverse",
+        max_tasks=10,
+        explicit_task_ids=(3, 1),
+    ) == [3, 1]
+    with pytest.raises(ValueError, match="duplicates"):
+        _resolve_task_ids(
+            suite_tasks=10,
+            task_order="official_reverse",
+            max_tasks=10,
+            explicit_task_ids=(3, 3),
+        )
+    with pytest.raises(ValueError, match="must be in"):
+        _resolve_task_ids(
+            suite_tasks=10,
+            task_order="official_reverse",
+            max_tasks=10,
+            explicit_task_ids=(10,),
+        )
 
 
 def test_predeclared_gate_rules() -> None:
