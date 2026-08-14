@@ -96,18 +96,20 @@ def temporal_ensemble_probability(
 def load_artifact_profile(
     manifest_path: Path,
     teacher_id: int,
-    adapter_id: int,
+    adapter_id: int | None,
 ) -> dict[str, Any]:
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     teacher = manifest.get("teachers", {}).get(str(teacher_id))
     if teacher is None:
         raise KeyError(f"Teacher {teacher_id} is not defined in {manifest_path}")
-    adapter = teacher.get("adapters", {}).get(str(adapter_id))
-    if adapter is None:
-        raise KeyError(
-            f"Adapter {adapter_id} for teacher {teacher_id} is not defined in {manifest_path}"
-        )
+    adapter = None
+    if adapter_id is not None:
+        adapter = teacher.get("adapters", {}).get(str(adapter_id))
+        if adapter is None:
+            raise KeyError(
+                f"Adapter {adapter_id} for teacher {teacher_id} is not defined in {manifest_path}"
+            )
     return {
         "schema_version": manifest.get("schema_version"),
         "task": manifest.get("task"),
@@ -116,7 +118,7 @@ def load_artifact_profile(
         "teacher": teacher,
         "adapter": adapter,
         "teacher_id": int(teacher_id),
-        "adapter_id": int(adapter_id),
+        "adapter_id": int(adapter_id) if adapter_id is not None else None,
     }
 
 
@@ -124,10 +126,12 @@ class LatentLoopSeerController:
     def __init__(
         self,
         *,
-        adapter_checkpoint: str,
+        deployment_method: str,
+        deployment_control_freq: float,
+        adapter_checkpoint: str | None,
         artifact_manifest: str,
         teacher_id: int,
-        adapter_id: int,
+        adapter_id: int | None,
         deployment_profile: str,
     ):
         parser = get_parser(is_eval=True)
@@ -136,12 +140,16 @@ class LatentLoopSeerController:
         args.device_id = init_distributed_device(args)
         self.args = args
         self.device_id = args.device_id
-        self.adapter_checkpoint = Path(adapter_checkpoint).expanduser().resolve()
+        self.deployment_method = str(deployment_method).strip().lower()
+        self.target_control_hz = float(deployment_control_freq)
+        self.adapter_checkpoint = (
+            Path(adapter_checkpoint).expanduser().resolve() if adapter_checkpoint else None
+        )
         self.manifest_path = Path(artifact_manifest).expanduser().resolve()
         self.teacher_checkpoint = Path(args.resume_from_checkpoint).expanduser().resolve()
         self.vit_checkpoint = Path(args.vit_checkpoint_path).expanduser().resolve()
         self.teacher_id = int(teacher_id)
-        self.adapter_id = int(adapter_id)
+        self.adapter_id = int(adapter_id) if adapter_id is not None else None
         self.deployment_profile = self._safe_profile(deployment_profile)
         self.query_interval = int(args.lrnode_query_interval)
         self.use_ensembling = bool(args.eval_libero_ensembling)
@@ -181,17 +189,39 @@ class LatentLoopSeerController:
     def _validate_cli_contract(self) -> None:
         required_files = {
             "teacher checkpoint": self.teacher_checkpoint,
-            "adapter checkpoint": self.adapter_checkpoint,
             "ViT checkpoint": self.vit_checkpoint,
             "artifact manifest": self.manifest_path,
         }
+        if self.deployment_method == "latentloop" and self.adapter_checkpoint is not None:
+            required_files["adapter checkpoint"] = self.adapter_checkpoint
         missing = [f"{name}: {path}" for name, path in required_files.items() if not path.is_file()]
         if missing:
             raise FileNotFoundError("Missing deployment artifacts:\n" + "\n".join(missing))
-        if not bool(self.args.use_lrnode_latent_update):
-            raise ValueError("LatentLoop deploy requires --use_lrnode_latent_update 1")
-        if not bool(self.args.lrnode_eval_skip_full_forward):
-            raise ValueError("LatentLoop deploy requires --lrnode_eval_skip_full_forward 1")
+        if self.deployment_method not in {"baseline", "latentloop"}:
+            raise ValueError(
+                "deployment_method must be 'baseline' or 'latentloop', got "
+                f"{self.deployment_method!r}"
+            )
+        if not np.isfinite(self.target_control_hz) or self.target_control_hz <= 0:
+            raise ValueError(
+                f"deployment_control_freq must be positive, got {self.target_control_hz}"
+            )
+        if self.deployment_method == "baseline":
+            if self.adapter_checkpoint is not None or self.adapter_id is not None:
+                raise ValueError("Baseline deploy must not load a LatentLoop adapter")
+            if bool(self.args.use_lrnode_latent_update):
+                raise ValueError("Baseline deploy requires --use_lrnode_latent_update 0")
+            if bool(self.args.lrnode_eval_skip_full_forward):
+                raise ValueError("Baseline deploy requires --lrnode_eval_skip_full_forward 0")
+            if self.query_interval != 1:
+                raise ValueError("Baseline deploy requires lrnode_query_interval=1")
+        else:
+            if self.adapter_checkpoint is None or self.adapter_id is None:
+                raise ValueError("LatentLoop deploy requires a teacher-specific adapter")
+            if not bool(self.args.use_lrnode_latent_update):
+                raise ValueError("LatentLoop deploy requires --use_lrnode_latent_update 1")
+            if not bool(self.args.lrnode_eval_skip_full_forward):
+                raise ValueError("LatentLoop deploy requires --lrnode_eval_skip_full_forward 1")
         if self.query_interval < 1:
             raise ValueError(f"lrnode_query_interval must be positive, got {self.query_interval}")
         if self.args.phase != "evaluate":
@@ -227,6 +257,8 @@ class LatentLoopSeerController:
         return actual_hash
 
     def _verify_architecture_contract(self) -> None:
+        if self.deployment_method == "baseline":
+            return
         expected = self.artifact_profile["latentloop_architecture"]
         actual = {
             "hidden_dim": int(self.args.lrnode_hidden_dim),
@@ -245,17 +277,19 @@ class LatentLoopSeerController:
             )
 
     def _verify_artifacts(self) -> dict[str, str]:
-        return {
+        verified = {
             "teacher": self._verify_one_artifact(
                 self.teacher_checkpoint, self.artifact_profile["teacher"], "teacher"
-            ),
-            "adapter": self._verify_one_artifact(
-                self.adapter_checkpoint, self.artifact_profile["adapter"], "adapter"
             ),
             "vit": self._verify_one_artifact(
                 self.vit_checkpoint, self.artifact_profile["vit"], "ViT"
             ),
         }
+        if self.deployment_method == "latentloop":
+            verified["adapter"] = self._verify_one_artifact(
+                self.adapter_checkpoint, self.artifact_profile["adapter"], "adapter"
+            )
+        return verified
 
     @staticmethod
     def random_seed(seed: int, rank: int = 0) -> None:
@@ -352,32 +386,36 @@ class LatentLoopSeerController:
             )
         self.teacher_rebuilt_keys = sorted(teacher_result.missing_keys)
 
-        adapter_payload = torch.load(self.adapter_checkpoint, map_location="cpu")
-        adapter_epoch = int(adapter_payload.get("epoch", -1))
-        expected_adapter_epoch = int(self.artifact_profile["adapter"]["checkpoint_epoch"])
-        if adapter_epoch != expected_adapter_epoch:
-            raise ValueError(
-                f"Adapter epoch mismatch: manifest={expected_adapter_epoch}, checkpoint={adapter_epoch}"
+        if self.deployment_method == "latentloop":
+            adapter_payload = torch.load(self.adapter_checkpoint, map_location="cpu")
+            adapter_epoch = int(adapter_payload.get("epoch", -1))
+            expected_adapter_epoch = int(
+                self.artifact_profile["adapter"]["checkpoint_epoch"]
             )
-        adapter_state_raw = adapter_payload.get("model_state_dict")
-        if not isinstance(adapter_state_raw, Mapping):
-            raise TypeError("Adapter checkpoint has no model_state_dict mapping")
-        adapter_state = remove_ddp_prefix(adapter_state_raw)
-        expected_adapter_keys = {
-            key for key in self.inference_model.state_dict() if key.startswith("lrnode_")
-        }
-        actual_adapter_keys = set(adapter_state)
-        if actual_adapter_keys != expected_adapter_keys:
-            raise RuntimeError(
-                "Adapter state must contain exactly the LatentLoop parameters: "
-                f"missing={sorted(expected_adapter_keys - actual_adapter_keys)}, "
-                f"unexpected={sorted(actual_adapter_keys - expected_adapter_keys)}"
-            )
-        self.inference_model.load_state_dict(adapter_state, strict=False)
+            if adapter_epoch != expected_adapter_epoch:
+                raise ValueError(
+                    "Adapter epoch mismatch: "
+                    f"manifest={expected_adapter_epoch}, checkpoint={adapter_epoch}"
+                )
+            adapter_state_raw = adapter_payload.get("model_state_dict")
+            if not isinstance(adapter_state_raw, Mapping):
+                raise TypeError("Adapter checkpoint has no model_state_dict mapping")
+            adapter_state = remove_ddp_prefix(adapter_state_raw)
+            expected_adapter_keys = {
+                key for key in self.inference_model.state_dict() if key.startswith("lrnode_")
+            }
+            actual_adapter_keys = set(adapter_state)
+            if actual_adapter_keys != expected_adapter_keys:
+                raise RuntimeError(
+                    "Adapter state must contain exactly the LatentLoop parameters: "
+                    f"missing={sorted(expected_adapter_keys - actual_adapter_keys)}, "
+                    f"unexpected={sorted(actual_adapter_keys - expected_adapter_keys)}"
+                )
+            self.inference_model.load_state_dict(adapter_state, strict=False)
         self.inference_model.eval()
 
         print(
-            "[LatentLoop deploy] loaded "
+            f"[{self.deployment_method} deploy] loaded "
             f"teacher={self.teacher_id} adapter={self.adapter_id} "
             f"K={self.query_interval} profile={self.deployment_profile}"
         )
@@ -410,6 +448,7 @@ class LatentLoopSeerController:
         self.full_forward_latency_sum_ms = 0.0
         self.latentloop_latency_sum_ms = 0.0
         self.policy_latency_sum_ms = 0.0
+        self.control_command_monotonic_s: list[float] = []
         self.rollout_index += 1
         self._rollout_complete = False
         if self.use_ensembling:
@@ -429,6 +468,12 @@ class LatentLoopSeerController:
 
         self.write_runtime_summary()
         self._rollout_complete = True
+
+    def record_control_command(self, completed_monotonic_s: float) -> None:
+        """Record when a robot command completes for achieved-rate accounting."""
+
+        if self.rollout_index > 0 and not self._rollout_complete:
+            self.control_command_monotonic_s.append(float(completed_monotonic_s))
 
     @staticmethod
     def _cuda_sync() -> None:
@@ -669,7 +714,7 @@ class LatentLoopSeerController:
                 num_step,
             ) = self._prepare_context(image_x, gripper_x, text_x, state_x)
 
-            use_latentloop = should_use_latentloop(
+            use_latentloop = self.deployment_method == "latentloop" and should_use_latentloop(
                 int(timestep), self.query_interval, self.cached_latent is not None
             )
             if use_latentloop:
@@ -695,6 +740,7 @@ class LatentLoopSeerController:
         record.update(
             {
                 "timestep": int(timestep),
+                "deployment_method": self.deployment_method,
                 "query_interval": self.query_interval,
                 "policy_ms": policy_ms,
                 "temporal_ensemble_enabled": int(self.use_ensembling),
@@ -727,6 +773,9 @@ class LatentLoopSeerController:
 
     def runtime_summary(self) -> dict[str, Any]:
         total_steps = self.full_forward_calls + self.latentloop_update_calls
+        command_times = np.asarray(self.control_command_monotonic_s, dtype=np.float64)
+        periods_ms = np.diff(command_times) * 1000.0
+        target_period_ms = 1000.0 / self.target_control_hz
         return {
             **self.deployment_metadata(),
             "rollout_index": self.rollout_index,
@@ -752,39 +801,71 @@ class LatentLoopSeerController:
             "average_policy_ms": (
                 self.policy_latency_sum_ms / total_steps if total_steps else 0.0
             ),
+            "target_control_hz": self.target_control_hz,
+            "target_control_period_ms": target_period_ms,
+            "measured_control_period_count": int(periods_ms.size),
+            "average_control_period_ms": (
+                float(periods_ms.mean()) if periods_ms.size else 0.0
+            ),
+            "p95_control_period_ms": (
+                float(np.percentile(periods_ms, 95)) if periods_ms.size else 0.0
+            ),
+            "maximum_control_period_ms": (
+                float(periods_ms.max()) if periods_ms.size else 0.0
+            ),
+            "achieved_control_hz": (
+                float(1000.0 / periods_ms.mean())
+                if periods_ms.size and periods_ms.mean() > 0
+                else 0.0
+            ),
+            "strict_deadline_miss_count": (
+                int(np.count_nonzero(periods_ms > target_period_ms))
+                if periods_ms.size
+                else 0
+            ),
+            "strict_deadline_miss_rate": (
+                float(np.mean(periods_ms > target_period_ms)) if periods_ms.size else 0.0
+            ),
         }
 
     def write_runtime_summary(self) -> None:
         if self.session_dir is None:
             return
-        path = self.session_dir / f"latentloop_runtime_rollout_{self.rollout_index:03d}.json"
+        path = self.session_dir / f"deployment_runtime_rollout_{self.rollout_index:03d}.json"
         with path.open("w", encoding="utf-8") as handle:
             json.dump(self.runtime_summary(), handle, indent=2, sort_keys=True)
 
     def deployment_metadata(self) -> dict[str, Any]:
         return {
-            "method": "LatentLoop",
+            "method": "LatentLoop" if self.deployment_method == "latentloop" else "Seer baseline",
+            "deployment_method": self.deployment_method,
             "deployment_profile": self.deployment_profile,
             "teacher_id": self.teacher_id,
             "adapter_id": self.adapter_id,
             "query_interval": self.query_interval,
             "teacher_checkpoint": str(self.teacher_checkpoint),
-            "adapter_checkpoint": str(self.adapter_checkpoint),
+            "adapter_checkpoint": (
+                str(self.adapter_checkpoint) if self.adapter_checkpoint is not None else None
+            ),
             "vit_checkpoint": str(self.vit_checkpoint),
             "artifact_manifest": str(self.manifest_path),
             "artifact_sha256": dict(self.artifact_hashes),
-            "latentloop_architecture": dict(
-                self.artifact_profile["latentloop_architecture"]
+            "latentloop_architecture": (
+                dict(self.artifact_profile["latentloop_architecture"])
+                if self.deployment_method == "latentloop"
+                else None
             ),
             "teacher_rebuilt_key_count": len(self.teacher_rebuilt_keys),
             "action_pred_steps": self.action_pred_steps,
             "sequence_length": self.history_len,
             "temporal_ensemble_enabled": bool(self.use_ensembling),
             "temporal_ensemble_temperature": self.ensembling_temp,
+            "target_control_hz": self.target_control_hz,
+            "target_control_period_ms": 1000.0 / self.target_control_hz,
         }
 
     def run_synthetic_preflight(self, instruction: str) -> dict[str, Any]:
-        """Exercise one complete K=4 cycle without opening physical hardware."""
+        """Exercise one complete scheduling cycle without opening physical hardware."""
 
         records = []
         for timestep in range(self.query_interval + 1):
@@ -821,7 +902,10 @@ class LatentLoopSeerController:
             records.append(record)
 
         expected_modes = [
-            "full" if timestep % self.query_interval == 0 else "latentloop"
+            "latentloop"
+            if self.deployment_method == "latentloop"
+            and timestep % self.query_interval != 0
+            else "full"
             for timestep in range(self.query_interval + 1)
         ]
         actual_modes = [record["mode"] for record in records]

@@ -1,4 +1,4 @@
-"""LatentLoop deployment GUI built on the preserved 3DFlow-Seer GUI."""
+"""Seer baseline and LatentLoop deployment GUI on the preserved real GUI."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import tkinter as tk
 from pathlib import Path
 
@@ -24,6 +25,19 @@ from architectures.seer.adapters.latentloop_real_deploy.hardware import (
 legacy_gui = load_legacy_gui()
 
 
+class TimedUR5eDeployEnv(UR5eDeployEnv):
+    """Record actual robot-command cadence without changing preserved sources."""
+
+    def __init__(self, cfg, command_callback):
+        super().__init__(cfg)
+        self._command_callback = command_callback
+
+    def step(self, target_pose, target_gripper):
+        result = super().step(target_pose, target_gripper)
+        self._command_callback(time.perf_counter())
+        return result
+
+
 def parse_latentloop_gui_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
@@ -32,10 +46,14 @@ def parse_latentloop_gui_args():
         default="no",
     )
     parser.add_argument("--gui-refresh-ms", type=int, default=150)
-    parser.add_argument("--latentloop-adapter-checkpoint", required=True)
+    parser.add_argument(
+        "--deployment-method", choices=("baseline", "latentloop"), required=True
+    )
+    parser.add_argument("--deployment-control-freq", type=float, required=True)
+    parser.add_argument("--latentloop-adapter-checkpoint")
     parser.add_argument("--latentloop-artifact-manifest", required=True)
     parser.add_argument("--latentloop-teacher-id", type=int, required=True)
-    parser.add_argument("--latentloop-adapter-id", type=int, required=True)
+    parser.add_argument("--latentloop-adapter-id", type=int)
     parser.add_argument("--latentloop-deployment-profile", required=True)
     parser.add_argument("--latentloop-preflight-only", action="store_true")
     gui_args, seer_args = parser.parse_known_args()
@@ -56,8 +74,11 @@ class LatentLoopDeployGuiApp(legacy_gui.DeployGuiApp):
         manifest_path = Path(self.session_manifest_file)
         with manifest_path.open("r", encoding="utf-8") as handle:
             manifest = json.load(handle)
-        manifest["latentloop"] = self.controller.deployment_metadata()
-        manifest["runtime_summary_file_pattern"] = "latentloop_runtime_rollout_*.json"
+        metadata = self.controller.deployment_metadata()
+        manifest["seer_deployment"] = metadata
+        if metadata["deployment_method"] == "latentloop":
+            manifest["latentloop"] = metadata
+        manifest["runtime_summary_file_pattern"] = "deployment_runtime_rollout_*.json"
         manifest["policy_step_log_pattern"] = "policy_steps_rollout_*.jsonl"
         with manifest_path.open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, sort_keys=True)
@@ -69,13 +90,17 @@ class LatentLoopDeployGuiApp(legacy_gui.DeployGuiApp):
         self.metrics_var.set(
             self.metrics_var.get()
             + "\n\n"
-            + "LatentLoop profile\n"
+            + "Deployment profile\n"
             + metadata["deployment_profile"]
             + "\n\n"
-            + f"Teacher / adapter / K\n{metadata['teacher_id']} / "
-            + f"{metadata['adapter_id']} / {metadata['query_interval']}"
+            + f"Method / target control rate\n{metadata['method']} / "
+            + f"{metadata['target_control_hz']:g} Hz"
             + "\n\n"
-            + f"Adapter checkpoint\n{metadata['adapter_checkpoint']}"
+            + f"Teacher / adapter / K\n{metadata['teacher_id']} / "
+            + f"{metadata['adapter_id'] if metadata['adapter_id'] is not None else 'none'} / "
+            + f"{metadata['query_interval']}"
+            + "\n\n"
+            + f"Adapter checkpoint\n{metadata['adapter_checkpoint'] or 'not loaded'}"
         )
 
     def save_results(self):
@@ -96,6 +121,8 @@ class LatentLoopDeployGuiApp(legacy_gui.DeployGuiApp):
 def main():
     gui_args = parse_latentloop_gui_args()
     controller = LatentLoopSeerController(
+        deployment_method=gui_args.deployment_method,
+        deployment_control_freq=gui_args.deployment_control_freq,
         adapter_checkpoint=gui_args.latentloop_adapter_checkpoint,
         artifact_manifest=gui_args.latentloop_artifact_manifest,
         teacher_id=gui_args.latentloop_teacher_id,
@@ -120,8 +147,13 @@ def main():
         return
 
     cfg = DeployConfig()
+    if abs(float(cfg.control_freq) - controller.target_control_hz) > 1e-9:
+        raise ValueError(
+            "SEER_CONTROL_FREQ and --deployment-control-freq disagree: "
+            f"{cfg.control_freq} vs {controller.target_control_hz}"
+        )
     legacy_gui.configure_camera_c(cfg, gui_args.camera_c)
-    env = UR5eDeployEnv(cfg)
+    env = TimedUR5eDeployEnv(cfg, controller.record_control_command)
     _save_camera_serial_cache(
         _camera_serials_file(cfg),
         env.deploy_camera_serials,

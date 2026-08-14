@@ -1,7 +1,8 @@
-# LatentLoop real-world deployment
+# Seer and LatentLoop real-world deployment
 
-This path deploys the basketball LatentLoop adapters without changing the
-known-working 3DFlow-Seer GUI, camera, UR5e, or Robotiq implementation.
+This path deploys either the basketball Seer baseline or its paired LatentLoop
+adapter without changing the known-working 3DFlow-Seer GUI, camera, UR5e, or
+Robotiq implementation.
 
 ## Fixed protocol
 
@@ -10,16 +11,19 @@ known-working 3DFlow-Seer GUI, camera, UR5e, or Robotiq implementation.
   teacher
 - Alternative valid pairs: teacher `34.pth` + its adapter `39.pth`, and teacher
   `35.pth` + its adapter `39.pth`
-- Query interval: `K=4`
+- Baseline mode: the selected teacher only, full Seer every step (`K=1`)
+- LatentLoop mode: the same teacher plus its paired adapter (`K=4`)
 - Schedule: full Seer at steps `0, 4, 8, ...`; LatentLoop at the intervening
   steps using fresh exterior image, wrist image, and proprioception
 - Action decoder and temporal ensemble: the existing Seer implementation
-- Controller: `10 Hz`, `max_rel_pos=0.02`, `max_rel_orn=0.05`
+- Default target control rate: `15 Hz` (`66.67 ms` period)
+- Optional target control rate: `40 Hz` (`25 ms` period)
+- Robot action limits: `max_rel_pos=0.02`, `max_rel_orn=0.05`
 - Model environment on the inference computer: the existing `conda activate seer`
 
-Teacher and adapter files are a strict pair. The deployment loader verifies the
-filename, checkpoint epoch, file size, SHA-256 digest, adapter parameter keys,
-and LatentLoop architecture before opening the robot or cameras.
+Teacher and adapter files are a strict pair. Baseline mode verifies only the
+teacher and shared ViT; LatentLoop mode additionally verifies the paired adapter
+and architecture before opening the robot or cameras.
 
 ## Repository layout
 
@@ -29,8 +33,11 @@ and LatentLoop architecture before opening the robot or cameras.
   of the real deployment source from `/home/jbr/3DFlow-Seer`
 - `architectures/seer/upstream/scripts/REAL/deploy_ll_gui.sh`: self-contained
   deployment configuration and launcher
-- `artifacts/seer/real_world/basketball/`: local checkpoint destination
-- `real_deploy_results/`: deployment logs and result summaries
+- `artifacts/seer/real_world/basketball/baseline/`: teacher checkpoints
+- `artifacts/seer/real_world/basketball/latentloop/`: teacher-specific adapters
+- `artifacts/seer/real_world/basketball/shared/`: shared ViT checkpoint
+- `real_deploy_results/baseline/`: baseline logs and results
+- `real_deploy_results/latentloop/`: LatentLoop logs and results
 
 The artifact directory ignores every file except its README, manifest, and
 `.gitignore`. Consequently, teacher, adapter, and ViT checkpoints cannot be
@@ -42,13 +49,13 @@ Copy the following files into
 `~/gnaroshi_vla/artifacts/seer/real_world/basketball/` on the inference computer:
 
 ```text
-mae_pretrain_vit_base.pth
-teacher_34.pth
-teacher_34_adapter_39.pth
-teacher_35.pth
-teacher_35_adapter_39.pth
-teacher_37.pth
-teacher_37_adapter_39.pth
+shared/mae_pretrain_vit_base.pth
+baseline/teacher_34.pth
+baseline/teacher_35.pth
+baseline/teacher_37.pth
+latentloop/teacher_34/teacher_34_adapter_39.pth
+latentloop/teacher_35/teacher_35_adapter_39.pth
+latentloop/teacher_37/teacher_37_adapter_39.pth
 ```
 
 The expected sizes and SHA-256 values are tracked in
@@ -66,8 +73,19 @@ cd ~/gnaroshi_vla/architectures/seer/upstream
 conda activate seer
 ```
 
-Run a model-only preflight first. It loads and verifies the ViT, teacher, and
-adapter but does not initialize the UR5e, gripper, cameras, or Tk GUI:
+Near the top of `deploy_ll_gui.sh`, select exactly one method and one target
+control rate by commenting one assignment and uncommenting the other:
+
+```bash
+# deployment_method="baseline"
+deployment_method="latentloop"
+
+control_freq=15
+# control_freq=40
+```
+
+Run a model-only preflight first. It verifies and loads the selected artifacts
+but does not initialize the UR5e, gripper, cameras, or Tk GUI:
 
 ```bash
 bash scripts/REAL/deploy_ll_gui.sh --preflight
@@ -80,13 +98,19 @@ bash scripts/REAL/deploy_ll_gui.sh
 ```
 
 No external experiment environment variables are required. To deploy another
-validated pair, edit only `teacher_id` near the top of `deploy_ll_gui.sh`; the
-manifest rejects a teacher/adapter mismatch.
+validated pair, edit only `teacher_id`; the manifest rejects a teacher/adapter
+mismatch.
+
+`control_freq` is a target period for the complete loop consisting of camera and
+robot-state acquisition, policy inference, robot command, and any remaining
+sleep. Setting `40` requests a `25 ms` period but cannot guarantee 40 Hz when
+that complete work takes longer. Runtime summaries therefore record the target
+rate, measured inter-policy period, achieved rate, and strict deadline misses.
 
 ## Logged evidence
 
 Every launch writes the following under
-`real_deploy_results/launch_logs/<profile>/<timestamp>/`:
+`real_deploy_results/<baseline|latentloop>/launch_logs/<profile>/<timestamp>/`:
 
 - complete launch configuration
 - exact launcher snapshot and shell command
@@ -94,9 +118,10 @@ Every launch writes the following under
 - checkpoint/manifest SHA-256 values
 - complete console output and exit code
 
-Each GUI session additionally records the teacher/adapter/K metadata, result
-JSON, rollout media, per-step full-vs-LatentLoop mode and latency, and per-rollout
-runtime summaries. Warm-up inference is excluded from rollout statistics.
+Each GUI session is also stored under the selected method and profile. It records
+teacher/adapter/K/control-rate metadata, result JSON, rollout media, per-step
+full-vs-LatentLoop mode and latency, plus measured control cadence. Warm-up
+inference is excluded from rollout statistics.
 
 ## Hugging Face consideration
 
