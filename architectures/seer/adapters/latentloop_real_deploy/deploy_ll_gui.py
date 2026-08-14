@@ -103,9 +103,19 @@ def main():
         deployment_profile=gui_args.latentloop_deployment_profile,
     )
     if gui_args.latentloop_preflight_only:
+        synthetic = controller.run_synthetic_preflight(
+            os.environ["SEER_LANGUAGE_INSTRUCTION"]
+        )
         print(
             "[LatentLoop preflight][OK] "
-            + json.dumps(controller.deployment_metadata(), indent=2, sort_keys=True)
+            + json.dumps(
+                {
+                    "deployment": controller.deployment_metadata(),
+                    "synthetic_k_cycle": synthetic,
+                },
+                indent=2,
+                sort_keys=True,
+            )
         )
         return
 

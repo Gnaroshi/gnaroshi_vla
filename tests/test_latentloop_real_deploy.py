@@ -122,3 +122,31 @@ def test_completed_rollout_warmup_is_not_written_into_previous_summary():
     assert controller.rollout_index == 2
     assert controller._rollout_complete is False
     assert controller.step_records == []
+
+
+def test_synthetic_preflight_requires_complete_k4_cycle():
+    controller = object.__new__(LatentLoopSeerController)
+    controller.query_interval = 4
+    controller.full_forward_calls = 2
+    controller.latentloop_update_calls = 3
+    seen = []
+
+    def fake_forward(_observation, include_info, timestep, record_step):
+        assert include_info is True
+        assert record_step is False
+        seen.append(timestep)
+        mode = "full" if timestep % 4 == 0 else "latentloop"
+        return np.zeros(3), np.zeros(3), -1.0, {
+            "mode": mode,
+            "cache_age": 0 if mode == "full" else timestep,
+        }
+
+    resets = []
+    controller.forward = fake_forward
+    controller.reset = lambda write_previous: resets.append(write_previous)
+
+    result = controller.run_synthetic_preflight("test instruction")
+    assert seen == [0, 1, 2, 3, 4]
+    assert result["modes"] == ["full", "latentloop", "latentloop", "latentloop", "full"]
+    assert result["all_actions_finite"] is True
+    assert resets == [False]

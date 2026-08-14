@@ -782,3 +782,61 @@ class LatentLoopSeerController:
             "temporal_ensemble_enabled": bool(self.use_ensembling),
             "temporal_ensemble_temperature": self.ensembling_temp,
         }
+
+    def run_synthetic_preflight(self, instruction: str) -> dict[str, Any]:
+        """Exercise one complete K=4 cycle without opening physical hardware."""
+
+        records = []
+        for timestep in range(self.query_interval + 1):
+            primary = np.full((480, 640, 3), timestep * 3, dtype=np.uint8)
+            wrist = np.full((480, 640, 3), timestep * 5, dtype=np.uint8)
+            pose6d = np.zeros(6, dtype=np.float32)
+            pose6d[0] = timestep * 1e-3
+            observation = {
+                "color_image": [primary, wrist],
+                "language_instruction": instruction,
+                "robot_state": {
+                    "pose6d": pose6d,
+                    "gripper_open_state": np.array([1.0], dtype=np.float32),
+                    "gripper_position": np.array([0.0], dtype=np.float32),
+                },
+            }
+            target_pos, target_euler, target_gripper, record = self.forward(
+                observation,
+                include_info=True,
+                timestep=timestep,
+                record_step=False,
+            )
+            action = np.concatenate(
+                [
+                    np.asarray(target_pos).reshape(-1),
+                    np.asarray(target_euler).reshape(-1),
+                    np.asarray([target_gripper]).reshape(-1),
+                ]
+            )
+            if action.shape != (7,) or not np.isfinite(action).all():
+                raise RuntimeError(
+                    f"Synthetic preflight produced invalid action at step {timestep}: {action}"
+                )
+            records.append(record)
+
+        expected_modes = [
+            "full" if timestep % self.query_interval == 0 else "latentloop"
+            for timestep in range(self.query_interval + 1)
+        ]
+        actual_modes = [record["mode"] for record in records]
+        if actual_modes != expected_modes:
+            raise RuntimeError(
+                f"Synthetic preflight schedule mismatch: expected={expected_modes}, "
+                f"actual={actual_modes}"
+            )
+        result = {
+            "steps": len(records),
+            "modes": actual_modes,
+            "cache_ages": [record["cache_age"] for record in records],
+            "full_forward_calls": self.full_forward_calls,
+            "latentloop_update_calls": self.latentloop_update_calls,
+            "all_actions_finite": True,
+        }
+        self.reset(write_previous=False)
+        return result
