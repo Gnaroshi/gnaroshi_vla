@@ -60,6 +60,17 @@ def remove_ddp_prefix(state: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def is_allowed_teacher_missing_key(key: str) -> bool:
+    """Allow only state intentionally rebuilt outside the real-world checkpoint."""
+
+    return (
+        key in {"attention_mask", "image_decoder_position_embedding"}
+        or key.startswith("vision_encoder.")
+        or key.startswith("clip_model.")
+        or key.startswith("lrnode_")
+    )
+
+
 def temporal_ensemble_probability(
     action_sequence: torch.Tensor,
     timestep: int,
@@ -329,14 +340,17 @@ class LatentLoopSeerController:
             raise TypeError("Teacher checkpoint has no model_state_dict mapping")
         teacher_state = remove_ddp_prefix(teacher_state_raw)
         teacher_result = self.inference_model.load_state_dict(teacher_state, strict=False)
-        non_latentloop_missing = [
-            key for key in teacher_result.missing_keys if not key.startswith("lrnode_")
+        disallowed_missing = [
+            key
+            for key in teacher_result.missing_keys
+            if not is_allowed_teacher_missing_key(key)
         ]
-        if non_latentloop_missing or teacher_result.unexpected_keys:
+        if disallowed_missing or teacher_result.unexpected_keys:
             raise RuntimeError(
                 "Teacher checkpoint is incompatible with the deployment model: "
-                f"missing={non_latentloop_missing}, unexpected={teacher_result.unexpected_keys}"
+                f"missing={disallowed_missing}, unexpected={teacher_result.unexpected_keys}"
             )
+        self.teacher_rebuilt_keys = sorted(teacher_result.missing_keys)
 
         adapter_payload = torch.load(self.adapter_checkpoint, map_location="cpu")
         adapter_epoch = int(adapter_payload.get("epoch", -1))
@@ -762,6 +776,7 @@ class LatentLoopSeerController:
             "latentloop_architecture": dict(
                 self.artifact_profile["latentloop_architecture"]
             ),
+            "teacher_rebuilt_key_count": len(self.teacher_rebuilt_keys),
             "action_pred_steps": self.action_pred_steps,
             "sequence_length": self.history_len,
             "temporal_ensemble_enabled": bool(self.use_ensembling),

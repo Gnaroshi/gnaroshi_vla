@@ -6,6 +6,7 @@ import torch
 
 from architectures.seer.adapters.latentloop_real_deploy.controller import (
     LatentLoopSeerController,
+    is_allowed_teacher_missing_key,
     load_artifact_profile,
     remove_ddp_prefix,
     should_use_latentloop,
@@ -18,6 +19,25 @@ def test_remove_ddp_prefix_for_single_gpu_inference():
     assert remove_ddp_prefix({"module.lrnode_x": tensor}) == {"lrnode_x": tensor}
     with pytest.raises(ValueError, match="collision"):
         remove_ddp_prefix({"module.x": tensor, "x": tensor})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "attention_mask",
+        "image_decoder_position_embedding",
+        "vision_encoder.blocks.0.attn.qkv.weight",
+        "clip_model.token_embedding.weight",
+        "lrnode_dynamics.gate_bias",
+    ],
+)
+def test_real_teacher_rebuilt_state_allowlist(key):
+    assert is_allowed_teacher_missing_key(key)
+
+
+def test_real_teacher_missing_trainable_state_is_rejected():
+    assert not is_allowed_teacher_missing_key("action_decoder.0.weight")
+    assert not is_allowed_teacher_missing_key("transformer_backbone.h.0.attn.c_attn.weight")
 
 
 @pytest.mark.parametrize(
