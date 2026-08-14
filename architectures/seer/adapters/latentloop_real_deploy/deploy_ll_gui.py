@@ -134,7 +134,7 @@ def main():
             os.environ["SEER_LANGUAGE_INSTRUCTION"]
         )
         print(
-            "[LatentLoop preflight][OK] "
+            "[Seer deploy preflight][OK] "
             + json.dumps(
                 {
                     "deployment": controller.deployment_metadata(),

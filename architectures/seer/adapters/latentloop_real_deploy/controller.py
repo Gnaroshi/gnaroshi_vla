@@ -1,4 +1,4 @@
-"""Real-world Seer controller with periodic LatentLoop latent updates."""
+"""Real-world controller for full Seer and periodic LatentLoop inference."""
 
 from __future__ import annotations
 
