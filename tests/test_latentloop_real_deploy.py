@@ -7,9 +7,17 @@ import torch
 from architectures.seer.adapters.latentloop_real_deploy.controller import (
     LatentLoopSeerController,
     load_artifact_profile,
+    remove_ddp_prefix,
     should_use_latentloop,
     temporal_ensemble_probability,
 )
+
+
+def test_remove_ddp_prefix_for_single_gpu_inference():
+    tensor = torch.tensor([1.0])
+    assert remove_ddp_prefix({"module.lrnode_x": tensor}) == {"lrnode_x": tensor}
+    with pytest.raises(ValueError, match="collision"):
+        remove_ddp_prefix({"module.x": tensor, "x": tensor})
 
 
 @pytest.mark.parametrize(

@@ -17,7 +17,6 @@ import clip
 import numpy as np
 import torch
 from PIL import Image as PILImage
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -47,6 +46,18 @@ def should_use_latentloop(timestep: int, query_interval: int, has_cache: bool) -
     if query_interval < 1:
         raise ValueError(f"query_interval must be positive, got {query_interval}")
     return bool(has_cache and timestep % query_interval != 0)
+
+
+def remove_ddp_prefix(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize training checkpoints for the single-GPU inference model."""
+
+    normalized = {}
+    for key, value in state.items():
+        normalized_key = key.removeprefix("module.")
+        if normalized_key in normalized:
+            raise ValueError(f"Checkpoint key collision after DDP prefix removal: {key}")
+        normalized[normalized_key] = value
+    return normalized
 
 
 def temporal_ensemble_probability(
@@ -302,7 +313,9 @@ class LatentLoopSeerController:
         self.model = self.model.to(self.device_id)
         self.model._init_model_type()
         self.model.profile_full_action_head = bool(args.lrnode_eval_profile_full_action_head)
-        self.ddp_model = DDP(self.model, device_ids=[self.device_id], find_unused_parameters=False)
+        # Deployment is single-process inference. Wrapping a fully frozen model in
+        # DDP is unnecessary and is rejected by the inference host's PyTorch 2.2.
+        self.inference_model = self.model
 
         teacher_payload = torch.load(self.teacher_checkpoint, map_location="cpu")
         teacher_epoch = int(teacher_payload.get("epoch", -1))
@@ -311,12 +324,13 @@ class LatentLoopSeerController:
             raise ValueError(
                 f"Teacher epoch mismatch: manifest={expected_teacher_epoch}, checkpoint={teacher_epoch}"
             )
-        teacher_state = teacher_payload.get("model_state_dict")
-        if not isinstance(teacher_state, Mapping):
+        teacher_state_raw = teacher_payload.get("model_state_dict")
+        if not isinstance(teacher_state_raw, Mapping):
             raise TypeError("Teacher checkpoint has no model_state_dict mapping")
-        teacher_result = self.ddp_model.load_state_dict(teacher_state, strict=False)
+        teacher_state = remove_ddp_prefix(teacher_state_raw)
+        teacher_result = self.inference_model.load_state_dict(teacher_state, strict=False)
         non_latentloop_missing = [
-            key for key in teacher_result.missing_keys if not key.startswith("module.lrnode_")
+            key for key in teacher_result.missing_keys if not key.startswith("lrnode_")
         ]
         if non_latentloop_missing or teacher_result.unexpected_keys:
             raise RuntimeError(
@@ -331,11 +345,12 @@ class LatentLoopSeerController:
             raise ValueError(
                 f"Adapter epoch mismatch: manifest={expected_adapter_epoch}, checkpoint={adapter_epoch}"
             )
-        adapter_state = adapter_payload.get("model_state_dict")
-        if not isinstance(adapter_state, Mapping):
+        adapter_state_raw = adapter_payload.get("model_state_dict")
+        if not isinstance(adapter_state_raw, Mapping):
             raise TypeError("Adapter checkpoint has no model_state_dict mapping")
+        adapter_state = remove_ddp_prefix(adapter_state_raw)
         expected_adapter_keys = {
-            key for key in self.ddp_model.state_dict() if key.startswith("module.lrnode_")
+            key for key in self.inference_model.state_dict() if key.startswith("lrnode_")
         }
         actual_adapter_keys = set(adapter_state)
         if actual_adapter_keys != expected_adapter_keys:
@@ -344,8 +359,8 @@ class LatentLoopSeerController:
                 f"missing={sorted(expected_adapter_keys - actual_adapter_keys)}, "
                 f"unexpected={sorted(actual_adapter_keys - expected_adapter_keys)}"
             )
-        self.ddp_model.load_state_dict(adapter_state, strict=False)
-        self.ddp_model.eval()
+        self.inference_model.load_state_dict(adapter_state, strict=False)
+        self.inference_model.eval()
 
         print(
             "[LatentLoop deploy] loaded "
@@ -489,7 +504,7 @@ class LatentLoopSeerController:
     ):
         self._cuda_sync()
         started = time.perf_counter()
-        outputs = self.ddp_model(
+        outputs = self.inference_model(
             image_primary=input_primary,
             image_wrist=input_wrist,
             state=input_state,
