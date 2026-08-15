@@ -34,7 +34,11 @@ from architectures.simvla.adapters.latentloop.action_adapter import (  # noqa: E
     explicit_action_noise,
 )
 from architectures.simvla.adapters.latentloop.determinism import (  # noqa: E402
+    configure_strict_determinism,
     episode_env_seed,
+    evaluation_episode_seed,
+    resolve_seed_plan,
+    seed_all,
 )
 from architectures.simvla.adapters.latentloop.source_lock import (  # noqa: E402
     collect_source_lock,
@@ -220,6 +224,8 @@ def _worker_config(
     task_ids: Sequence[int],
     protocol: dict[str, Any],
     source_lock: dict[str, Any],
+    seed_plan: dict[str, Any],
+    strict_runtime: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema": "simvla_query_cache_worker_v1",
@@ -237,6 +243,10 @@ def _worker_config(
         "max_policy_queries": int(args.max_policy_queries),
         "seed": int(args.seed),
         "action_noise_seed_base": int(args.action_noise_seed_base),
+        "experiment_seed": args.experiment_seed,
+        "effective_seed_plan": seed_plan,
+        "render_backend": args.render_backend,
+        "strict_runtime": strict_runtime,
         "records_per_shard": int(args.records_per_shard),
         "protocol": protocol,
     }
@@ -385,6 +395,25 @@ def generate_cache(args: argparse.Namespace) -> dict[str, Any]:
     from libero.libero import benchmark
 
     started = time.time()
+    seed_plan = resolve_seed_plan(
+        experiment_seed=args.experiment_seed,
+        environment_seed_base=args.seed,
+        action_noise_seed_base=args.action_noise_seed_base,
+        bootstrap_seed=args.seed,
+    )
+    if args.experiment_seed is not None:
+        strict_runtime = configure_strict_determinism(
+            seed_plan.process_seed,
+            render_backend=args.render_backend,
+        )
+    else:
+        seed_all(seed_plan.process_seed)
+        strict_runtime = {
+            "protocol": "legacy_cache_runtime_v1",
+            "seed": seed_plan.process_seed,
+            "render_backend": args.render_backend,
+            "strict": False,
+        }
     source_lock = collect_source_lock(
         checkpoint=args.checkpoint,
         norm_stats_path=args.norm_stats,
@@ -399,7 +428,16 @@ def generate_cache(args: argparse.Namespace) -> dict[str, Any]:
         "task_order": args.task_order,
         "control_hz": float(args.control_hz),
         "cache_semantics": "rollout_generated_query_to_next_query",
-        "env_seed_semantics": "sha256(base_seed,task_id,trial_id)",
+        "experiment_seed": args.experiment_seed,
+        "effective_seed_plan": seed_plan.__dict__,
+        "render_backend": args.render_backend,
+        "environment_lifecycle": "fresh_environment_per_episode",
+        "environment_seed_timing": "before_constructor_and_immediately_before_reset",
+        "env_seed_semantics": (
+            "evaluation_episode_seed(environment_seed_base,suite,task_id,trial_id)"
+            if args.experiment_seed is not None
+            else "sha256(base_seed,task_id,trial_id)"
+        ),
     }
     os.environ.setdefault("LIBERO_ROOT", str(LIBERO_ROOT))
     suite = benchmark.get_benchmark_dict()[args.suite]()
@@ -423,6 +461,8 @@ def generate_cache(args: argparse.Namespace) -> dict[str, Any]:
         task_ids=task_ids,
         protocol=protocol,
         source_lock=source_lock,
+        seed_plan=seed_plan.__dict__,
+        strict_runtime=strict_runtime,
     )
     config_fingerprint = hashlib.sha256(
         json.dumps(config, sort_keys=True).encode("utf-8")
@@ -498,12 +538,23 @@ def generate_cache(args: argparse.Namespace) -> dict[str, Any]:
                 continue
             task = suite.get_task(task_id)
             init_states = suite.get_task_init_states(task_id)
-            env, prompt = get_libero_env(task, args.resolution, args.seed)
-            try:
-                for _, _, trial_id in pending_specs:
-                    episode_started = time.time()
-                    episode_id = f"task{task_id:02d}_trial{trial_id:03d}"
-                    env_seed = episode_env_seed(args.seed, task_id, trial_id)
+            for _, _, trial_id in pending_specs:
+                episode_started = time.time()
+                episode_id = f"task{task_id:02d}_trial{trial_id:03d}"
+                env_seed = (
+                    evaluation_episode_seed(
+                        seed_plan.environment_seed_base,
+                        args.suite,
+                        task_id,
+                        trial_id,
+                    )
+                    if args.experiment_seed is not None
+                    else episode_env_seed(args.seed, task_id, trial_id)
+                )
+                seed_all(env_seed)
+                env, prompt = get_libero_env(task, args.resolution, env_seed)
+                try:
+                    seed_all(env_seed)
                     env.seed(env_seed)
                     env.reset()
                     obs = env.set_init_state(init_states[trial_id % len(init_states)])
@@ -543,7 +594,7 @@ def generate_cache(args: argparse.Namespace) -> dict[str, Any]:
                             episode_id=episode_id,
                             query_index=query_index,
                             env_timestep=env_timestep,
-                            seed_base=args.action_noise_seed_base,
+                            seed_base=seed_plan.action_noise_seed_base,
                             flow_steps=args.flow_steps,
                         )
                         if pending is not None:
@@ -565,6 +616,8 @@ def generate_cache(args: argparse.Namespace) -> dict[str, Any]:
                                         "task_bddl": f"{task.problem_folder}/{task.bddl_file}",
                                         "init_state_index": trial_id % len(init_states),
                                         "env_seed": env_seed,
+                                        "experiment_seed": args.experiment_seed,
+                                        "render_backend": args.render_backend,
                                         "current_action_noise_seed": previous["action_noise_seed"],
                                         "next_action_noise_seed": snapshot["action_noise_seed"],
                                         "worker_index": args.worker_index,
@@ -648,8 +701,8 @@ def generate_cache(args: argparse.Namespace) -> dict[str, Any]:
                             f"worker cache exceeded --max-cache-gib={args.max_cache_gib}: "
                             f"{completed_cache_bytes / 2**30:.2f} GiB"
                         )
-            finally:
-                env.close()
+                finally:
+                    env.close()
     finally:
         progress.close()
 
@@ -687,6 +740,12 @@ def main() -> int:
     parser.add_argument("--control-hz", type=float, default=20.0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--action-noise-seed-base", type=int, default=20260804)
+    parser.add_argument("--experiment-seed", type=int, default=None)
+    parser.add_argument(
+        "--render-backend",
+        choices=("osmesa", "egl"),
+        default="egl",
+    )
     parser.add_argument("--task-order", choices=("official_reverse", "ascending"), default="official_reverse")
     parser.add_argument("--records-per-shard", type=int, default=128)
     parser.add_argument("--worker-index", type=int, default=0)

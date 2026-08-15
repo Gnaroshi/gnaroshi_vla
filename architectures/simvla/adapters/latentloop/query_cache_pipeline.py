@@ -15,6 +15,10 @@ from typing import Any, Sequence
 
 from tqdm.auto import tqdm
 
+from architectures.simvla.adapters.latentloop.determinism import (
+    required_process_environment,
+    resolve_seed_plan,
+)
 from architectures.simvla.adapters.latentloop.source_lock import collect_source_lock
 from methods.latentloop.training.query_cache_dataset import (
     load_manifest,
@@ -144,6 +148,12 @@ def _phase_config(
     max_policy_queries: int,
     gpus: Sequence[str],
 ) -> dict[str, Any]:
+    seed_plan = resolve_seed_plan(
+        experiment_seed=args.experiment_seed,
+        environment_seed_base=args.seed,
+        action_noise_seed_base=args.action_noise_seed_base,
+        bootstrap_seed=args.seed,
+    )
     return {
         "schema": "simvla_parallel_query_cache_phase_v1",
         "name": name,
@@ -162,6 +172,10 @@ def _phase_config(
         "control_hz": args.control_hz,
         "seed": args.seed,
         "action_noise_seed_base": args.action_noise_seed_base,
+        "experiment_seed": args.experiment_seed,
+        "effective_seed_plan": seed_plan.__dict__,
+        "render_backend": args.render_backend,
+        "environment_lifecycle": "fresh_environment_per_episode",
         "task_order": args.task_order,
         "records_per_shard": args.records_per_shard,
         "gpus": list(gpus),
@@ -216,6 +230,12 @@ def _run_parallel_phase(
     worker_dirs = [parts_root / f"worker{index:02d}" for index in range(len(gpus))]
     logs_root = Path(args.run_root) / "worker_logs" / name
     logs_root.mkdir(parents=True, exist_ok=True)
+    seed_plan = resolve_seed_plan(
+        experiment_seed=args.experiment_seed,
+        environment_seed_base=args.seed,
+        action_noise_seed_base=args.action_noise_seed_base,
+        bootstrap_seed=args.seed,
+    )
     processes: list[subprocess.Popen[str]] = []
     process_logs: dict[subprocess.Popen[str], tuple[Path, Any]] = {}
     for worker_index, (gpu, worker_dir) in enumerate(zip(gpus, worker_dirs)):
@@ -262,6 +282,8 @@ def _run_parallel_phase(
             str(args.seed),
             "--action-noise-seed-base",
             str(args.action_noise_seed_base),
+            "--render-backend",
+            args.render_backend,
             "--task-order",
             args.task_order,
             "--records-per-shard",
@@ -275,6 +297,8 @@ def _run_parallel_phase(
             "--device",
             "cuda",
         ]
+        if args.experiment_seed is not None:
+            command.extend(["--experiment-seed", str(args.experiment_seed)])
         if max_worker_cache_gib > 0:
             command.extend(["--max-cache-gib", str(max_worker_cache_gib)])
         log_handle.write("COMMAND: " + " ".join(command) + "\n")
@@ -282,6 +306,8 @@ def _run_parallel_phase(
         environment = os.environ.copy()
         environment["CUDA_VISIBLE_DEVICES"] = gpu
         environment["PYTHONUNBUFFERED"] = "1"
+        environment.update(required_process_environment(args.render_backend))
+        environment["PYTHONHASHSEED"] = str(seed_plan.process_seed)
         process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -687,6 +713,12 @@ def main() -> int:
     parser.add_argument("--control-hz", type=float, default=20.0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--action-noise-seed-base", type=int, default=20260804)
+    parser.add_argument("--experiment-seed", type=int, default=None)
+    parser.add_argument(
+        "--render-backend",
+        choices=("osmesa", "egl"),
+        default="egl",
+    )
     parser.add_argument("--task-order", choices=("official_reverse", "ascending"), default="official_reverse")
     parser.add_argument("--records-per-shard", type=int, default=128)
     parser.add_argument("--max-production-cache-gib", type=float, default=200.0)
