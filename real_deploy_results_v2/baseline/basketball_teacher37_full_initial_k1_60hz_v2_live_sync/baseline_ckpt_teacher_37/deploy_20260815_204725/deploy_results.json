@@ -1,0 +1,197 @@
+{
+  "metadata": {
+    "session_started_at": "2026-08-15 20:47:25",
+    "last_updated_at": "2026-08-15 20:50:53",
+    "checkpoint": "/home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/baseline/teacher_37.pth",
+    "checkpoint_name": "teacher_37.pth",
+    "checkpoint_run": "baseline",
+    "vit_checkpoint_path": "/home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/shared/mae_pretrain_vit_base.pth",
+    "tasks": [
+      "Pick up the red ball and place it in the basketball hoop"
+    ],
+    "requested_rollouts_per_task": 15,
+    "requested_total_rollouts": 15,
+    "total_rollouts": 3,
+    "success_count": 2,
+    "failure_count": 1,
+    "success_rate": 0.6666666666666666,
+    "success_rate_percent": 66.66666666666666,
+    "rollout_steps": 5000,
+    "control_freq": 60.0,
+    "camera_names": {
+      "exterior": "exterior",
+      "wrist": "wrist",
+      "observer": "observer"
+    },
+    "camera_serials": {
+      "exterior": "243722072499",
+      "wrist": "342222070922",
+      "observer": null
+    },
+    "media_capture_enabled": true,
+    "observer_media_enabled": false,
+    "media_dir": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts",
+    "query_interval": 1,
+    "rollout_policy": "hold_latent",
+    "runtime_settings_by_rollout": {
+      "1": {
+        "control_freq": 60.0,
+        "query_interval": 1,
+        "rollout_policy": "full"
+      },
+      "2": {
+        "control_freq": 60.0,
+        "query_interval": 1,
+        "rollout_policy": "hold_action"
+      },
+      "3": {
+        "control_freq": 60.0,
+        "query_interval": 1,
+        "rollout_policy": "hold_latent"
+      }
+    }
+  },
+  "results": [
+    {
+      "timestamp": "2026-08-15 20:48:29",
+      "task_index": 1,
+      "rollout_index": 1,
+      "instruction": "Pick up the red ball and place it in the basketball hoop",
+      "success": true,
+      "duration": 32.91528940200806,
+      "steps_completed": 201,
+      "total_steps": 5000,
+      "media": {
+        "directory": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_001",
+        "before_deploy_image": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_001/task01_rollout001_front_exterior_serial-243722072499_before_deploy.jpg",
+        "observer_start_image": null,
+        "front_rollout_video": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_001/task01_rollout001_front_exterior_serial-243722072499_rollout.mp4",
+        "wrist_rollout_video": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_001/task01_rollout001_wrist_serial-342222070922_rollout.mp4",
+        "observer_rollout_video": null,
+        "rollout_videos": {
+          "front": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_001/task01_rollout001_front_exterior_serial-243722072499_rollout.mp4",
+          "wrist": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_001/task01_rollout001_wrist_serial-342222070922_rollout.mp4"
+        },
+        "rollout_video_camera_serials": {
+          "front": "243722072499",
+          "wrist": "342222070922"
+        },
+        "rollout_video_backends": {
+          "front": "opencv",
+          "wrist": "opencv"
+        },
+        "observer_video_backend": null,
+        "rollout_video_validation": {
+          "front": {
+            "path": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_001/task01_rollout001_front_exterior_serial-243722072499_rollout.mp4",
+            "exists": true,
+            "size_bytes": 4782184,
+            "ffprobe_ok": false,
+            "error": "ffprobe_not_found"
+          },
+          "wrist": {
+            "path": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_001/task01_rollout001_wrist_serial-342222070922_rollout.mp4",
+            "exists": true,
+            "size_bytes": 2756942,
+            "ffprobe_ok": false,
+            "error": "ffprobe_not_found"
+          }
+        }
+      }
+    },
+    {
+      "timestamp": "2026-08-15 20:49:42",
+      "task_index": 1,
+      "rollout_index": 2,
+      "instruction": "Pick up the red ball and place it in the basketball hoop",
+      "success": false,
+      "duration": 46.769699573516846,
+      "steps_completed": 310,
+      "total_steps": 5000,
+      "media": {
+        "directory": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_002",
+        "before_deploy_image": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_002/task01_rollout002_front_exterior_serial-243722072499_before_deploy.jpg",
+        "observer_start_image": null,
+        "front_rollout_video": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_002/task01_rollout002_front_exterior_serial-243722072499_rollout.mp4",
+        "wrist_rollout_video": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_002/task01_rollout002_wrist_serial-342222070922_rollout.mp4",
+        "observer_rollout_video": null,
+        "rollout_videos": {
+          "front": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_002/task01_rollout002_front_exterior_serial-243722072499_rollout.mp4",
+          "wrist": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_002/task01_rollout002_wrist_serial-342222070922_rollout.mp4"
+        },
+        "rollout_video_camera_serials": {
+          "front": "243722072499",
+          "wrist": "342222070922"
+        },
+        "rollout_video_backends": {
+          "front": "opencv",
+          "wrist": "opencv"
+        },
+        "observer_video_backend": null,
+        "rollout_video_validation": {
+          "front": {
+            "path": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_002/task01_rollout002_front_exterior_serial-243722072499_rollout.mp4",
+            "exists": true,
+            "size_bytes": 6497317,
+            "ffprobe_ok": false,
+            "error": "ffprobe_not_found"
+          },
+          "wrist": {
+            "path": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_002/task01_rollout002_wrist_serial-342222070922_rollout.mp4",
+            "exists": true,
+            "size_bytes": 4712006,
+            "ffprobe_ok": false,
+            "error": "ffprobe_not_found"
+          }
+        }
+      }
+    },
+    {
+      "timestamp": "2026-08-15 20:50:36",
+      "task_index": 1,
+      "rollout_index": 3,
+      "instruction": "Pick up the red ball and place it in the basketball hoop",
+      "success": true,
+      "duration": 37.246178150177,
+      "steps_completed": 242,
+      "total_steps": 5000,
+      "media": {
+        "directory": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_003",
+        "before_deploy_image": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_003/task01_rollout003_front_exterior_serial-243722072499_before_deploy.jpg",
+        "observer_start_image": null,
+        "front_rollout_video": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_003/task01_rollout003_front_exterior_serial-243722072499_rollout.mp4",
+        "wrist_rollout_video": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_003/task01_rollout003_wrist_serial-342222070922_rollout.mp4",
+        "observer_rollout_video": null,
+        "rollout_videos": {
+          "front": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_003/task01_rollout003_front_exterior_serial-243722072499_rollout.mp4",
+          "wrist": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_003/task01_rollout003_wrist_serial-342222070922_rollout.mp4"
+        },
+        "rollout_video_camera_serials": {
+          "front": "243722072499",
+          "wrist": "342222070922"
+        },
+        "rollout_video_backends": {
+          "front": "opencv",
+          "wrist": "opencv"
+        },
+        "observer_video_backend": null,
+        "rollout_video_validation": {
+          "front": {
+            "path": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_003/task01_rollout003_front_exterior_serial-243722072499_rollout.mp4",
+            "exists": true,
+            "size_bytes": 5066557,
+            "ffprobe_ok": false,
+            "error": "ffprobe_not_found"
+          },
+          "wrist": {
+            "path": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts/task_01/rollout_003/task01_rollout003_wrist_serial-342222070922_rollout.mp4",
+            "exists": true,
+            "size_bytes": 3339327,
+            "ffprobe_ok": false,
+            "error": "ffprobe_not_found"
+          }
+        }
+      }
+    }
+  ]
+}

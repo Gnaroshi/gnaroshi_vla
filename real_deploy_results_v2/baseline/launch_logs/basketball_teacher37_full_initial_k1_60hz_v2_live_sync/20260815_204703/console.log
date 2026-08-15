@@ -1,0 +1,16 @@
+no pytorch3d
+[baseline deploy] loaded teacher=37 adapter=None policy=full K=1 profile=basketball_teacher37_full_initial_k1_60hz_v2_live_sync
+[deploy-gui] Camera C logging disabled. Front/wrist rollout videos will still be saved.
+[deploy] detected RealSense devices:
+[deploy]   name=Intel RealSense D435I serial=342222070922
+[deploy]   name=Intel RealSense D435I serial=243722072499
+[deploy]   name=Intel RealSense D435I serial=244222074195
+[deploy] camera view 'exterior' -> RealSense serial 243722072499
+[deploy] camera view 'wrist' -> RealSense serial 342222070922
+[deploy] saved deploy camera serial cache to /home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/deploy_camera_serials.json: {'exterior': '243722072499', 'wrist': '342222070922'}
+[deploy] moving robot to home pose before rollout
+[deploy] moving robot to home pose before rollout
+[deploy] moving robot to home pose before rollout
+[deploy] moving robot to home pose before rollout
+[deploy] moving robot to home pose before rollout
+[deploy] moving robot to home pose before rollout

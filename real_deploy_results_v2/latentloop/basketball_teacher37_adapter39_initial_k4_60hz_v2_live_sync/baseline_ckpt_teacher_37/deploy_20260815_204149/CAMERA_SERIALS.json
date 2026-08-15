@@ -1,0 +1,13 @@
+{
+  "updated_at": "2026-08-15 20:46:46",
+  "deploy_cameras": {
+    "exterior": "243722072499",
+    "wrist": "342222070922"
+  },
+  "all_session_cameras": {
+    "exterior": "243722072499",
+    "wrist": "342222070922",
+    "observer": null
+  },
+  "notes": "This file is a per-deploy-session copy. The global camera serial cache may also exist at real_deploy_results/deploy_camera_serials.json."
+}
