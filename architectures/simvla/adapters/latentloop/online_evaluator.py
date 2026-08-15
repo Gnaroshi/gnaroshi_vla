@@ -217,9 +217,41 @@ def _query_contract(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "policy_input_hash",
         "raw_rgb_hash",
         "proprio_hash",
+        "sim_state_hash",
+        "sim_state_field_hashes",
         "action_chunk_shape",
     )
     return [{field: record.get(field) for field in fields} for record in records]
+
+
+def _sim_state_contract(env: Any) -> dict[str, Any]:
+    """Copy MuJoCo integration state fields that can affect future rollout."""
+
+    data = env.sim.data
+    state: dict[str, Any] = {"time": np.asarray(float(data.time), dtype=np.float64)}
+    for name in (
+        "qpos",
+        "qvel",
+        "act",
+        "qacc_warmstart",
+        "ctrl",
+        "qfrc_applied",
+        "xfrc_applied",
+        "mocap_pos",
+        "mocap_quat",
+        "userdata",
+        "eq_active",
+        "plugin_state",
+    ):
+        value = getattr(data, name, None)
+        if value is not None:
+            state[name] = np.array(value, copy=True)
+    return state
+
+
+def _sim_state_hashes(env: Any) -> tuple[str, dict[str, str]]:
+    state = _sim_state_contract(env)
+    return exact_hash(state), {name: exact_hash(value) for name, value in state.items()}
 
 
 def _load_gate(path: str) -> dict[str, Any]:
@@ -579,9 +611,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     env.reset()
                     obs = env.set_init_state(init_states[episode % len(init_states)])
                     initial_observation_hash = exact_hash(build_env_obs(obs))
+                    initial_sim_state_hash, initial_sim_state_field_hashes = (
+                        _sim_state_hashes(env)
+                    )
                     for _ in range(args.num_wait_steps):
                         obs, _, _, _ = env.step([0.0] * 6 + [-1.0])
                     post_wait_observation_hash = exact_hash(build_env_obs(obs))
+                    post_wait_sim_state_hash, post_wait_sim_state_field_hashes = (
+                        _sim_state_hashes(env)
+                    )
                     policy = RealSimVLALatentLoopPolicy(
                         model=model,
                         processor=processor,
@@ -617,8 +655,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             frames.append(video_frame_from_obs(obs))
                         image0, image1, proprio = build_env_obs(obs)
                         query_before = policy.query_index
+                        query_sim_state_hash, query_sim_state_field_hashes = (
+                            _sim_state_hashes(env)
+                        )
                         step_output = policy.act(image0, image1, proprio, prompt)
-                        chunk_boundaries.append(policy.query_index != query_before)
+                        query_started = policy.query_index != query_before
+                        chunk_boundaries.append(query_started)
+                        if query_started:
+                            policy.latentloop_query_trace[-1].update(
+                                {
+                                    "sim_state_hash": query_sim_state_hash,
+                                    "sim_state_field_hashes": query_sim_state_field_hashes,
+                                }
+                            )
                         started_env = time.perf_counter()
                         obs, _, done, _ = env.step(step_output.action.tolist())
                         env_step_latencies.append(1000.0 * (time.perf_counter() - started_env))
@@ -627,6 +676,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             break
                     success = bool(done)
                     terminal_observation_hash = exact_hash(build_env_obs(obs))
+                    terminal_sim_state_hash, terminal_sim_state_field_hashes = (
+                        _sim_state_hashes(env)
+                    )
                     outcomes[row.name][(task_id, episode)] = success
                     for name, value in policy.metrics.counters.items():
                         row_counters[row.name][name] += int(value)
@@ -657,8 +709,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "environment_actions": len(actions),
                         "policy_queries": len(deterministic_queries),
                         "initial_observation_hash": initial_observation_hash,
+                        "initial_sim_state_hash": initial_sim_state_hash,
+                        "initial_sim_state_field_hashes": initial_sim_state_field_hashes,
                         "post_wait_observation_hash": post_wait_observation_hash,
+                        "post_wait_sim_state_hash": post_wait_sim_state_hash,
+                        "post_wait_sim_state_field_hashes": post_wait_sim_state_field_hashes,
                         "terminal_observation_hash": terminal_observation_hash,
+                        "terminal_sim_state_hash": terminal_sim_state_hash,
+                        "terminal_sim_state_field_hashes": terminal_sim_state_field_hashes,
                         "query_trace_hash": query_trace_hash,
                         "action_sequence_hash": action_sequence_hash,
                         "video_frame_sequence_hash": video_frame_sequence_hash,
@@ -721,8 +779,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "full_query_interval": row.full_query_interval,
                         "environment_action_gap": args.execution_horizon * row.full_query_interval,
                         "initial_observation_hash": initial_observation_hash,
+                        "initial_sim_state_hash": initial_sim_state_hash,
                         "post_wait_observation_hash": post_wait_observation_hash,
+                        "post_wait_sim_state_hash": post_wait_sim_state_hash,
                         "terminal_observation_hash": terminal_observation_hash,
+                        "terminal_sim_state_hash": terminal_sim_state_hash,
                         "query_trace_hash": query_trace_hash,
                         "action_sequence_hash": action_sequence_hash,
                         "episode_trace_hash": deterministic_episode["episode_trace_hash"],

@@ -20,7 +20,11 @@ from architectures.simvla.adapters.latentloop.determinism import (
     resolve_seed_plan,
     seed_all,
 )
-from architectures.simvla.adapters.latentloop.online_evaluator import EvalRow, planned_rows
+from architectures.simvla.adapters.latentloop.online_evaluator import (
+    EvalRow,
+    _sim_state_hashes,
+    planned_rows,
+)
 from architectures.simvla.adapters.latentloop.repeat_verifier import verify_repeat
 
 
@@ -68,6 +72,30 @@ def test_exact_hash_is_mapping_order_independent_and_byte_exact() -> None:
     changed = tensor.clone()
     changed[0, 1] = torch.nextafter(changed[0, 1], torch.tensor(float("inf")))
     assert exact_hash(tensor) != exact_hash(changed)
+
+
+def test_sim_state_hashes_cover_hidden_physics_state() -> None:
+    class Data:
+        time = 1.25
+        qpos = np.array([1.0, 2.0], dtype=np.float64)
+        qvel = np.array([3.0], dtype=np.float64)
+        act = np.empty((0,), dtype=np.float64)
+        qacc_warmstart = np.array([4.0], dtype=np.float64)
+        ctrl = np.array([5.0], dtype=np.float64)
+        qfrc_applied = np.array([0.0], dtype=np.float64)
+        xfrc_applied = np.zeros((1, 6), dtype=np.float64)
+        mocap_pos = np.zeros((0, 3), dtype=np.float64)
+        mocap_quat = np.zeros((0, 4), dtype=np.float64)
+        userdata = np.empty((0,), dtype=np.float64)
+
+    env = SimpleNamespace(sim=SimpleNamespace(data=Data()))
+    first, fields = _sim_state_hashes(env)
+    assert {"time", "qpos", "qvel", "qacc_warmstart", "ctrl"} <= set(fields)
+    env.sim.data.qacc_warmstart[0] = np.nextafter(4.0, float("inf"))
+    second, changed_fields = _sim_state_hashes(env)
+    assert first != second
+    assert fields["qpos"] == changed_fields["qpos"]
+    assert fields["qacc_warmstart"] != changed_fields["qacc_warmstart"]
 
 
 def test_strict_runtime_fails_closed_then_enables_backend(monkeypatch: pytest.MonkeyPatch) -> None:
