@@ -11,6 +11,7 @@ from typing import Any
 
 from methods.latentloop.eval import distribution_summary
 
+from .determinism import canonical_json_hash, exact_hash
 from .online_evaluator import _paired_summary
 from .source_lock import require_empty_output, sha256_file
 
@@ -51,11 +52,13 @@ CONFIG_INVARIANTS = (
     "client_resize_size",
     "image_size",
     "resolution",
+    "experiment_seed",
     "seed",
     "action_noise_seed_base",
     "bootstrap_seed",
     "task_order",
     "teacher_tracking",
+    "effective_seed_plan",
     "rows",
     "environment_action_gap_by_row",
 )
@@ -148,8 +151,11 @@ def merge_task_shards(
     seen_tasks: set[int] = set()
     reference_config: dict[str, Any] | None = None
     reference_source: dict[str, Any] | None = None
+    reference_determinism: dict[str, Any] | None = None
     csv_fields: list[str] | None = None
     merged_episode_rows: list[dict[str, str]] = []
+    merged_deterministic_rows: list[dict[str, Any]] = []
+    merged_task_assets: dict[str, Any] = {}
 
     for raw_path in shard_dirs:
         path = Path(raw_path).expanduser().resolve()
@@ -159,6 +165,8 @@ def merge_task_shards(
             "episode_metrics.csv",
             "query_trace.jsonl",
             "source_lock.json",
+            "determinism_manifest.json",
+            "deterministic_results.json",
         )
         missing = [name for name in required if not (path / name).is_file()]
         if missing:
@@ -166,6 +174,8 @@ def merge_task_shards(
         summary = _read_json(path / "online_summary.json")
         config = _read_json(path / "eval_config.json")
         source = _read_json(path / "source_lock.json")
+        determinism = _read_json(path / "determinism_manifest.json")
+        deterministic_results = _read_json(path / "deterministic_results.json")
         task_ids = tuple(int(value) for value in config.get("resolved_task_ids", []))
         if not task_ids:
             raise ValueError(f"shard {path} has no resolved_task_ids")
@@ -184,16 +194,41 @@ def merge_task_shards(
         expected_episodes = len(task_ids) * int(config.get("num_trials", 0))
         if int(summary.get("episodes_per_row", -1)) != expected_episodes:
             raise ValueError(f"unexpected episodes_per_row in {path}")
+        expected_csv_rows = len(PROTOCOL_A_ROWS) * expected_episodes
 
         config_axis = _invariant(config, CONFIG_INVARIANTS)
         source_axis = _invariant(source, SOURCE_INVARIANTS)
         if reference_config is None:
             reference_config = config_axis
             reference_source = source_axis
+            reference_determinism = determinism
         elif config_axis != reference_config:
             raise ValueError(f"configuration axis mismatch in {path}")
         elif source_axis != reference_source:
             raise ValueError(f"source axis mismatch in {path}")
+        else:
+            assert reference_determinism is not None
+            if determinism.get("runtime_sha256") != reference_determinism.get("runtime_sha256"):
+                raise ValueError(f"deterministic runtime mismatch in {path}")
+            current_run = dict(determinism.get("run_contract", {}))
+            reference_run = dict(reference_determinism.get("run_contract", {}))
+            current_semantic = dict(current_run.get("semantic_config", {}))
+            reference_semantic = dict(reference_run.get("semantic_config", {}))
+            current_semantic.pop("task_ids", None)
+            reference_semantic.pop("task_ids", None)
+            if current_semantic != reference_semantic:
+                raise ValueError(f"deterministic semantic axis mismatch in {path}")
+            if current_run.get("seed_plan") != reference_run.get("seed_plan"):
+                raise ValueError(f"deterministic seed plan mismatch in {path}")
+
+        deterministic_rows = list(deterministic_results.get("episodes", []))
+        if len(deterministic_rows) != expected_csv_rows:
+            raise ValueError(f"deterministic episode count mismatch in {path}")
+        merged_deterministic_rows.extend(deterministic_rows)
+        for key, value in determinism.get("run_contract", {}).get("task_assets", {}).items():
+            if key in merged_task_assets:
+                raise ValueError(f"deterministic task asset overlaps across shards: {key}")
+            merged_task_assets[key] = value
 
         with (path / "episode_metrics.csv").open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -204,7 +239,6 @@ def merge_task_shards(
             elif list(reader.fieldnames) != csv_fields:
                 raise ValueError(f"episode CSV fields differ in {path}")
             shard_episode_rows = list(reader)
-        expected_csv_rows = len(PROTOCOL_A_ROWS) * expected_episodes
         if len(shard_episode_rows) != expected_csv_rows:
             raise ValueError(
                 f"shard {path} has {len(shard_episode_rows)} episode rows; "
@@ -222,6 +256,7 @@ def merge_task_shards(
                 "summary": summary,
                 "config": config,
                 "source": source,
+                "determinism": determinism,
             }
         )
 
@@ -234,6 +269,7 @@ def merge_task_shards(
     assert csv_fields is not None
     assert reference_config is not None
     assert reference_source is not None
+    assert reference_determinism is not None
 
     expected_pairs = {
         (row, task_id, episode)
@@ -247,10 +283,26 @@ def merge_task_shards(
     }
     if len(actual_pairs) != len(merged_episode_rows) or actual_pairs != expected_pairs:
         raise ValueError("merged episode rows are not an exact row/task/trial matrix")
+    deterministic_pairs = {
+        (record["row"], int(record["task_id"]), int(record["episode"]))
+        for record in merged_deterministic_rows
+    }
+    if (
+        len(deterministic_pairs) != len(merged_deterministic_rows)
+        or deterministic_pairs != expected_pairs
+    ):
+        raise ValueError("merged deterministic rows are not an exact row/task/trial matrix")
 
     output = require_empty_output(output_dir)
     episode_csv = output / "episode_metrics.csv"
     merged_episode_rows.sort(
+        key=lambda record: (
+            PROTOCOL_A_ROWS.index(record["row"]),
+            expected_task_ids.index(int(record["task_id"])),
+            int(record["episode"]),
+        )
+    )
+    merged_deterministic_rows.sort(
         key=lambda record: (
             PROTOCOL_A_ROWS.index(record["row"]),
             expected_task_ids.index(int(record["task_id"])),
@@ -336,8 +388,13 @@ def merge_task_shards(
         }
 
     full_outcomes = outcomes["full_k1"]
+    effective_bootstrap_seed = int(
+        reference_config.get("effective_seed_plan", {}).get(
+            "bootstrap_seed", reference_config["bootstrap_seed"]
+        )
+    )
     paired_vs_full = {
-        row: _paired_summary(full_outcomes, outcomes[row], seed=int(reference_config["bootstrap_seed"]))
+        row: _paired_summary(full_outcomes, outcomes[row], seed=effective_bootstrap_seed)
         for row in PROTOCOL_A_ROWS
         if row != "full_k1"
     }
@@ -347,7 +404,7 @@ def merge_task_shards(
             baseline: _paired_summary(
                 outcomes[baseline],
                 outcomes[candidate],
-                seed=int(reference_config["bootstrap_seed"]),
+                seed=effective_bootstrap_seed,
             )
             for baseline in PROTOCOL_A_ROWS
             if baseline != candidate
@@ -369,6 +426,37 @@ def merge_task_shards(
     query_manifest_path = output / "query_trace_shards.json"
     _write_json(query_manifest_path, query_manifest)
 
+    merged_run_contract = dict(reference_determinism["run_contract"])
+    merged_semantic_config = dict(merged_run_contract["semantic_config"])
+    merged_semantic_config["task_ids"] = list(expected_task_ids)
+    merged_run_contract["semantic_config"] = merged_semantic_config
+    merged_run_contract["task_assets"] = {
+        str(task_id): merged_task_assets[str(task_id)] for task_id in expected_task_ids
+    }
+    merged_run_contract_sha256 = canonical_json_hash(merged_run_contract)
+    merged_determinism_manifest = {
+        **reference_determinism,
+        "run_contract": merged_run_contract,
+        "run_contract_sha256": merged_run_contract_sha256,
+        "merge": {
+            "type": "deterministic_disjoint_task_union_v1",
+            "shard_run_contract_sha256": [
+                shard["determinism"]["run_contract_sha256"] for shard in shards
+            ],
+        },
+    }
+    _write_json(output / "determinism_manifest.json", merged_determinism_manifest)
+    merged_deterministic_results = {
+        "protocol": merged_determinism_manifest["protocol"],
+        "runtime_sha256": merged_determinism_manifest["runtime_sha256"],
+        "run_contract_sha256": merged_run_contract_sha256,
+        "episodes": merged_deterministic_rows,
+        "trajectory_sha256": exact_hash(merged_deterministic_rows),
+        "exact_scope": merged_determinism_manifest["scope"]["exact"],
+        "excluded_scope": merged_determinism_manifest["scope"]["excluded"],
+    }
+    _write_json(output / "deterministic_results.json", merged_deterministic_results)
+
     summary = {
         "matrix": "protocol_a_screening",
         "suite": reference_config["suite"],
@@ -381,6 +469,12 @@ def merge_task_shards(
         "episode_metrics_csv": str(episode_csv),
         "query_trace_jsonl": None,
         "query_trace_shards_json": str(query_manifest_path),
+        "determinism": {
+            "protocol": merged_determinism_manifest["protocol"],
+            "runtime_sha256": merged_determinism_manifest["runtime_sha256"],
+            "run_contract_sha256": merged_run_contract_sha256,
+            "trajectory_sha256": merged_deterministic_results["trajectory_sha256"],
+        },
         "merge_notes": {
             "task_shards_are_disjoint": True,
             "task_union_complete": True,
@@ -415,6 +509,12 @@ def merge_task_shards(
                 "online_summary_sha256": sha256_file(shard["path"] / "online_summary.json"),
                 "episode_metrics_sha256": sha256_file(shard["path"] / "episode_metrics.csv"),
                 "source_lock_sha256": sha256_file(shard["path"] / "source_lock.json"),
+                "determinism_manifest_sha256": sha256_file(
+                    shard["path"] / "determinism_manifest.json"
+                ),
+                "deterministic_results_sha256": sha256_file(
+                    shard["path"] / "deterministic_results.json"
+                ),
             }
             for shard in shards
         ],

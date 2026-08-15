@@ -33,6 +33,9 @@ from architectures.simvla.adapters.latentloop.action_adapter import (  # noqa: E
     executed_subchunk,
     explicit_action_noise,
 )
+from architectures.simvla.adapters.latentloop.determinism import (  # noqa: E402
+    episode_env_seed,
+)
 from architectures.simvla.adapters.latentloop.source_lock import (  # noqa: E402
     collect_source_lock,
     require_empty_output,
@@ -93,13 +96,6 @@ def partition_episode_specs(
         for trial_id in range(num_trials):
             all_specs.append((len(all_specs), int(task_id), trial_id))
     return [spec for spec in all_specs if spec[0] % num_workers == worker_index]
-
-
-def episode_env_seed(base_seed: int, task_id: int, trial_id: int) -> int:
-    """Return a worker-order-independent environment seed for one episode."""
-
-    payload = f"{base_seed}|{task_id}|{trial_id}".encode("ascii")
-    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**31 - 1)
 
 
 def _cache_bytes(cache_dir: Path) -> int:

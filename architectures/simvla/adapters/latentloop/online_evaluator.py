@@ -29,8 +29,21 @@ from architectures.simvla.adapters.latentloop.checkpoint import (  # noqa: E402
     freeze_module,
     load_adapter_checkpoint,
 )
+from architectures.simvla.adapters.latentloop.determinism import (  # noqa: E402
+    build_determinism_manifest,
+    collect_runtime_identity,
+    compare_manifest_contracts,
+    configure_strict_determinism,
+    evaluation_episode_seed,
+    exact_hash,
+    resolve_seed_plan,
+    seed_all,
+)
 from architectures.simvla.adapters.latentloop.k1_parity_revalidator import (  # noqa: E402
     analyze_k1_parity,
+)
+from architectures.simvla.adapters.latentloop.repeat_verifier import (  # noqa: E402
+    verify_repeat,
 )
 from architectures.simvla.adapters.latentloop.simvla_policy import (  # noqa: E402
     RealSimVLALatentLoopPolicy,
@@ -38,6 +51,8 @@ from architectures.simvla.adapters.latentloop.simvla_policy import (  # noqa: E4
 from architectures.simvla.adapters.latentloop.source_lock import (  # noqa: E402
     collect_source_lock,
     require_empty_output,
+    resolve_huggingface_checkpoint,
+    sha256_file,
 )
 from architectures.simvla.wrappers.dcld_eval.rollout_runner import (  # noqa: E402
     build_env_obs,
@@ -103,6 +118,108 @@ def _required_path(path: str, label: str) -> str:
     if not resolved.is_file():
         raise FileNotFoundError(f"{label} checkpoint not found: {resolved}")
     return str(resolved)
+
+
+def _source_identity(source_lock: dict[str, Any]) -> dict[str, Any]:
+    checkpoint = source_lock.get("checkpoint", {})
+    processor_checkpoint = source_lock.get("processor_checkpoint", {})
+    for label, identity in (
+        ("policy checkpoint", checkpoint),
+        ("processor checkpoint", processor_checkpoint),
+    ):
+        if not identity.get("revision"):
+            raise RuntimeError(f"strict determinism could not resolve {label} revision")
+    tracked_sources = (
+        Path(__file__),
+        Path(__file__).with_name("determinism.py"),
+        Path(__file__).with_name("simvla_policy.py"),
+        Path(__file__).with_name("action_adapter.py"),
+        Path(__file__).with_name("condition_adapter.py"),
+        ROOT / "architectures" / "simvla" / "adapters" / "dcld" / "simvla_action_adapter.py",
+        ROOT / "architectures" / "simvla" / "adapters" / "dcld" / "simvla_condition_adapter.py",
+        ROOT / "architectures" / "simvla" / "wrappers" / "dcld_eval" / "rollout_runner.py",
+        UPSTREAM / "models" / "modeling_smolvlm_vla.py",
+        UPSTREAM / "models" / "processing_smolvlm_vla.py",
+        UPSTREAM / "models" / "transformer_smolvlm.py",
+    )
+    return {
+        "root_commit": source_lock.get("root_commit"),
+        "simvla_upstream_commit": source_lock.get("simvla_upstream_commit"),
+        "checkpoint": {
+            key: checkpoint.get(key)
+            for key in (
+                "identifier",
+                "revision",
+                "weights_size_bytes",
+                "hf_blob_key_sha256",
+            )
+        },
+        "processor_checkpoint": {
+            key: processor_checkpoint.get(key)
+            for key in (
+                "identifier",
+                "revision",
+                "weights_size_bytes",
+                "hf_blob_key_sha256",
+            )
+        },
+        "norm_stats_sha256": source_lock.get("norm_stats_sha256"),
+        "runtime_source_sha256": {
+            str(path.relative_to(ROOT)): sha256_file(path) for path in tracked_sources
+        },
+    }
+
+
+def _adapter_identity(rows: list[EvalRow]) -> dict[str, Any]:
+    identities: dict[str, Any] = {}
+    for row in rows:
+        if row.checkpoint_path is None:
+            continue
+        path = Path(row.checkpoint_path)
+        identities[row.name] = {
+            "sha256": sha256_file(path),
+            "size_bytes": path.stat().st_size,
+        }
+    return identities
+
+
+def _task_asset_identity(
+    *,
+    suite: Any,
+    task_ids: list[int],
+    bddl_root: Path,
+) -> dict[str, Any]:
+    assets: dict[str, Any] = {}
+    for task_id in task_ids:
+        task = suite.get_task(task_id)
+        bddl_path = bddl_root / task.problem_folder / task.bddl_file
+        init_states = suite.get_task_init_states(task_id)
+        assets[str(task_id)] = {
+            "problem_folder": task.problem_folder,
+            "bddl_file": task.bddl_file,
+            "bddl_sha256": sha256_file(bddl_path),
+            "init_states_hash": exact_hash(init_states),
+            "init_states_count": len(init_states),
+        }
+    return assets
+
+
+def _query_contract(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fields = (
+        "policy_query_index",
+        "query_age",
+        "full_refresh",
+        "source",
+        "action_noise_seed",
+        "action_noise_hash",
+        "action_chunk_hash",
+        "condition_hash",
+        "policy_input_hash",
+        "raw_rgb_hash",
+        "proprio_hash",
+        "action_chunk_shape",
+    )
+    return [{field: record.get(field) for field in fields} for record in records]
 
 
 def _load_gate(path: str) -> dict[str, Any]:
@@ -281,7 +398,15 @@ def _paired_summary(
 def run(args: argparse.Namespace) -> dict[str, Any]:
     """Execute the selected paired screening matrix and preserve full traces."""
 
-    from libero.libero import benchmark
+    seed_plan = resolve_seed_plan(
+        experiment_seed=args.experiment_seed,
+        environment_seed_base=args.seed,
+        action_noise_seed_base=args.action_noise_seed_base,
+        bootstrap_seed=args.bootstrap_seed,
+    )
+    strict_runtime = configure_strict_determinism(seed_plan.process_seed)
+
+    from libero.libero import benchmark, get_libero_path
     from models.modeling_smolvlm_vla import SmolVLMVLA
     from models.processing_smolvlm_vla import SmolVLMVLAProcessor
 
@@ -300,6 +425,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint=args.checkpoint,
         norm_stats_path=args.norm_stats,
     )
+    source_lock["processor_checkpoint"] = resolve_huggingface_checkpoint(
+        args.smolvlm_model_path
+    )
+    source_lock["determinism_protocol"] = strict_runtime
+    source_lock["seed_plan"] = seed_plan.__dict__
     _write_json(output / "source_lock.json", source_lock)
     os.environ.setdefault("LIBERO_ROOT", str(LIBERO_ROOT))
     device = torch.device(args.device)
@@ -320,10 +450,69 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         max_tasks=args.max_tasks,
         explicit_task_ids=args.task_ids,
     )
+    task_assets = _task_asset_identity(
+        suite=suite,
+        task_ids=task_ids,
+        bddl_root=Path(get_libero_path("bddl_files")),
+    )
+    semantic_config = {
+        "matrix": args.matrix,
+        "suite": args.suite,
+        "task_ids": task_ids,
+        "rows": [
+            {
+                "name": row.name,
+                "mode": row.mode,
+                "full_query_interval": row.full_query_interval,
+                "has_checkpoint": row.checkpoint_path is not None,
+            }
+            for row in rows
+        ],
+        "execution_horizon": args.execution_horizon,
+        "num_trials": args.num_trials,
+        "max_env_actions": args.max_env_actions,
+        "num_wait_steps": args.num_wait_steps,
+        "flow_steps": args.flow_steps,
+        "client_resize_size": args.client_resize_size,
+        "image_size": args.image_size,
+        "resolution": args.resolution,
+        "task_order": args.task_order,
+        "teacher_tracking": bool(args.teacher_tracking),
+        "save_video": bool(args.save_video),
+        "video_task_id": args.video_task_id,
+        "video_episodes": list(args.video_episodes),
+        "video_fps": args.video_fps,
+        "video_stride": args.video_stride,
+        "environment_lifecycle": "fresh_environment_per_episode",
+        "environment_seed_timing": "before_constructor_and_immediately_before_reset",
+        "success_check_timing": "after_each_environment_action",
+        "device_type": device.type,
+    }
+    determinism_manifest = build_determinism_manifest(
+        seed_plan=seed_plan,
+        strict_runtime=strict_runtime,
+        runtime_identity=collect_runtime_identity(device),
+        source_identity=_source_identity(source_lock),
+        semantic_config=semantic_config,
+        task_assets=task_assets,
+        adapter_checkpoints=_adapter_identity(rows),
+    )
+    reference_manifest_path = args.determinism_reference_manifest
+    if not reference_manifest_path and args.repeat_reference_output:
+        reference_manifest_path = str(
+            Path(args.repeat_reference_output) / "determinism_manifest.json"
+        )
+    if reference_manifest_path:
+        reference_manifest = json.loads(
+            Path(reference_manifest_path).read_text(encoding="utf-8")
+        )
+        compare_manifest_contracts(determinism_manifest, reference_manifest)
+    _write_json(output / "determinism_manifest.json", determinism_manifest)
     _write_json(
         output / "eval_config.json",
         {
             **vars(args),
+            "effective_seed_plan": seed_plan.__dict__,
             "resolved_task_ids": task_ids,
             "rows": [row.__dict__ for row in rows],
             "environment_action_gap_by_row": {
@@ -335,6 +524,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     query_trace_path = output / "query_trace.jsonl"
     progress_path = output / "eval_progress.jsonl"
     episode_rows: list[dict[str, Any]] = []
+    deterministic_episode_rows: list[dict[str, Any]] = []
     outcomes: dict[str, dict[tuple[int, int], bool]] = {row.name: {} for row in rows}
     row_counters: dict[str, collections.Counter[str]] = {
         row.name: collections.Counter() for row in rows
@@ -371,14 +561,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for task_id in task_ids:
             task = suite.get_task(task_id)
             init_states = suite.get_task_init_states(task_id)
-            env, prompt = get_libero_env(task, args.resolution, args.seed)
-            try:
-                for episode in range(args.num_trials):
+            for episode in range(args.num_trials):
+                episode_seed = evaluation_episode_seed(
+                    seed_plan.environment_seed_base,
+                    args.suite,
+                    task_id,
+                    episode,
+                )
+                seed_all(episode_seed)
+                env, prompt = get_libero_env(task, args.resolution, episode_seed)
+                try:
                     episode_id = f"task{task_id:02d}_trial{episode:03d}"
+                    seed_all(episode_seed)
+                    env.seed(episode_seed)
                     env.reset()
                     obs = env.set_init_state(init_states[episode % len(init_states)])
+                    initial_observation_hash = exact_hash(build_env_obs(obs))
                     for _ in range(args.num_wait_steps):
                         obs, _, _, _ = env.step([0.0] * 6 + [-1.0])
+                    post_wait_observation_hash = exact_hash(build_env_obs(obs))
                     policy = RealSimVLALatentLoopPolicy(
                         model=model,
                         processor=processor,
@@ -395,7 +596,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         row_name=row.name,
                         task_id=task_id,
                         episode_id=episode_id,
-                        action_noise_seed_base=args.action_noise_seed_base,
+                        action_noise_seed_base=seed_plan.action_noise_seed_base,
                         log_action_chunks=row.full_query_interval == 1,
                         teacher_tracking=args.teacher_tracking,
                     )
@@ -423,6 +624,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         if done:
                             break
                     success = bool(done)
+                    terminal_observation_hash = exact_hash(build_env_obs(obs))
                     outcomes[row.name][(task_id, episode)] = success
                     for name, value in policy.metrics.counters.items():
                         row_counters[row.name][name] += int(value)
@@ -440,12 +642,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     for name, value in diagnostics.items():
                         row_action_diagnostics[row.name][name].append(float(value))
+                    deterministic_queries = _query_contract(policy.latentloop_query_trace)
+                    query_trace_hash = exact_hash(deterministic_queries)
+                    action_sequence_hash = exact_hash(action_tensor)
+                    video_frame_sequence_hash = exact_hash(frames) if video_enabled else None
+                    deterministic_episode = {
+                        "row": row.name,
+                        "task_id": task_id,
+                        "episode": episode,
+                        "episode_seed": episode_seed,
+                        "success": success,
+                        "environment_actions": len(actions),
+                        "policy_queries": len(deterministic_queries),
+                        "initial_observation_hash": initial_observation_hash,
+                        "post_wait_observation_hash": post_wait_observation_hash,
+                        "terminal_observation_hash": terminal_observation_hash,
+                        "query_trace_hash": query_trace_hash,
+                        "action_sequence_hash": action_sequence_hash,
+                        "video_frame_sequence_hash": video_frame_sequence_hash,
+                    }
+                    deterministic_episode["episode_trace_hash"] = exact_hash(
+                        deterministic_episode
+                    )
+                    deterministic_episode_rows.append(deterministic_episode)
                     for record in policy.latentloop_query_trace:
                         enriched_record = {
                             **record,
                             "row": row.name,
                             "task_id": task_id,
                             "episode": episode,
+                            "episode_seed": episode_seed,
                             "execution_horizon": args.execution_horizon,
                             "full_query_interval": row.full_query_interval,
                         }
@@ -480,6 +706,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "task_id": task_id,
                         "episode": episode,
                         "success": success,
+                        "episode_seed": episode_seed,
                         "environment_actions": len(actions),
                         "policy_queries": int(policy.metrics.counters["num_policy_queries"]),
                         "full_condition_calls": int(policy.metrics.counters["num_full_vlm_calls"]),
@@ -491,6 +718,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "execution_horizon": args.execution_horizon,
                         "full_query_interval": row.full_query_interval,
                         "environment_action_gap": args.execution_horizon * row.full_query_interval,
+                        "initial_observation_hash": initial_observation_hash,
+                        "post_wait_observation_hash": post_wait_observation_hash,
+                        "terminal_observation_hash": terminal_observation_hash,
+                        "query_trace_hash": query_trace_hash,
+                        "action_sequence_hash": action_sequence_hash,
+                        "episode_trace_hash": deterministic_episode["episode_trace_hash"],
+                        "video_frame_sequence_hash": video_frame_sequence_hash,
                         "video_path": video_path,
                         **diagnostics,
                     }
@@ -512,12 +746,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             "row": row.name,
                             "task_id": task_id,
                             "episode": episode,
+                            "episode_seed": episode_seed,
                             "success": success,
                             "elapsed_seconds": time.time() - started,
                         },
                     )
-            finally:
-                env.close()
+                finally:
+                    env.close()
     progress_bar.close()
     with episode_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(episode_rows[0]))
@@ -582,7 +817,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             paired[row.name] = _paired_summary(
                 full_outcomes,
                 outcomes[row.name],
-                seed=args.bootstrap_seed,
+                seed=seed_plan.bootstrap_seed,
             )
     paired_between_rows: dict[str, dict[str, Any]] = {}
     paired_candidates = [
@@ -596,7 +831,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             paired_between_rows[candidate.name][baseline.name] = _paired_summary(
                 outcomes[baseline.name],
                 outcomes[candidate.name],
-                seed=args.bootstrap_seed,
+                seed=seed_plan.bootstrap_seed,
             )
     k1_parity: dict[str, Any] | None = None
     raw_k1_parity: dict[str, Any] | None = None
@@ -642,6 +877,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             outcomes=outcomes,
             traces=k1_query_records,
         )
+    deterministic_results = {
+        "protocol": determinism_manifest["protocol"],
+        "runtime_sha256": determinism_manifest["runtime_sha256"],
+        "run_contract_sha256": determinism_manifest["run_contract_sha256"],
+        "episodes": deterministic_episode_rows,
+        "trajectory_sha256": exact_hash(deterministic_episode_rows),
+        "exact_scope": determinism_manifest["scope"]["exact"],
+        "excluded_scope": determinism_manifest["scope"]["excluded"],
+    }
+    _write_json(output / "deterministic_results.json", deterministic_results)
+    repeat_verification: dict[str, Any] | None = None
+    if args.repeat_reference_output:
+        repeat_verification = verify_repeat(args.repeat_reference_output, output)
+        _write_json(output / "repeat_verification.json", repeat_verification)
+        if not repeat_verification["passed"]:
+            raise RuntimeError(
+                "same-seed repeat diverged; see "
+                f"{output / 'repeat_verification.json'}"
+            )
     result = {
         "matrix": args.matrix,
         "suite": args.suite,
@@ -652,8 +906,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "paired_between_rows": paired_between_rows,
         "k1_parity": k1_parity,
         "raw_k1_parity": raw_k1_parity,
+        "determinism": {
+            "protocol": determinism_manifest["protocol"],
+            "runtime_sha256": determinism_manifest["runtime_sha256"],
+            "run_contract_sha256": determinism_manifest["run_contract_sha256"],
+            "trajectory_sha256": deterministic_results["trajectory_sha256"],
+            "repeat_verification": repeat_verification,
+        },
         "episode_metrics_csv": str(episode_csv),
         "query_trace_jsonl": str(query_trace_path),
+        "deterministic_results_json": str(output / "deterministic_results.json"),
     }
     _write_json(output / "online_summary.json", result)
     return result
@@ -701,6 +963,12 @@ def main() -> int:
     parser.add_argument("--client-resize-size", type=int, default=224)
     parser.add_argument("--image-size", type=int, default=384)
     parser.add_argument("--resolution", type=int, default=256)
+    parser.add_argument(
+        "--experiment-seed",
+        type=int,
+        default=None,
+        help="single master seed; when set, env/action/bootstrap seeds are namespace-derived",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--action-noise-seed-base", type=int, default=20260804)
     parser.add_argument("--bootstrap-seed", type=int, default=20260804)
@@ -713,6 +981,8 @@ def main() -> int:
     parser.add_argument("--video-stride", type=int, default=2)
     parser.add_argument("--tqdm-mininterval", type=float, default=1.0)
     parser.add_argument("--disable-tqdm", action="store_true")
+    parser.add_argument("--determinism-reference-manifest", default="")
+    parser.add_argument("--repeat-reference-output", default="")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     result = run(args)

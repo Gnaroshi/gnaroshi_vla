@@ -17,6 +17,7 @@ from architectures.simvla.wrappers.dcld_eval.rollout_runner import (
 
 from .action_adapter import ActionNoiseKey, explicit_action_noise
 from .condition_adapter import SimVLAChunkAwareAdapter
+from .determinism import exact_hash
 from .query_cache_state import (
     RecursiveQueryCache,
     SimVLAQueryObservation,
@@ -89,7 +90,10 @@ class RealSimVLALatentLoopPolicy(RealSimVLADCLDPolicy):
         self.latentloop_query_trace: list[dict[str, Any]] = []
         self.latentloop_action_chunks: list[dict[str, Any]] = []
         self.latentloop_tracking_trace: list[dict[str, Any]] = []
-        self.action_noise_hashes: dict[int, str] = {}
+        self.action_noise_tensors: dict[int, Tensor] = {}
+        self._pending_determinism_trace: tuple[
+            dict[str, Any], dict[str, Tensor], Tensor, Tensor
+        ] | None = None
         self._pending_teacher_tracking: tuple[dict[str, Tensor], Tensor, Tensor, int, int, str, dict[str, Any]] | None = None
 
     def _action_noise_key(self, policy_query_index: int) -> ActionNoiseKey:
@@ -143,8 +147,42 @@ class RealSimVLALatentLoopPolicy(RealSimVLADCLDPolicy):
             decoded.debug.get("iterations", 0)
         )
         self.metrics.counters["num_action_transformer_decodes"] += 1
-        self.action_noise_hashes[policy_query_index] = _tensor_hash(decoded.initial_noise)
+        self.action_noise_tensors[policy_query_index] = decoded.initial_noise.detach()
         return decoded.action, noise_key.seed()
+
+    def _finalize_determinism_trace(self) -> None:
+        """Hash trace tensors after operational policy latency has been recorded."""
+
+        if self._pending_determinism_trace is None:
+            return
+        record, batch, condition, action_chunk = self._pending_determinism_trace
+        query_index = int(record["policy_query_index"])
+        initial_noise = self.action_noise_tensors.pop(query_index, None)
+        record.update(
+            {
+                "action_noise_hash": (
+                    _tensor_hash(initial_noise) if initial_noise is not None else None
+                ),
+                "action_chunk_hash": _tensor_hash(action_chunk),
+                "condition_hash": _tensor_hash(condition),
+                "policy_input_hash": exact_hash(
+                    {
+                        "raw_rgb": batch["raw_rgb"],
+                        "proprio": batch["proprio"],
+                        "input_ids": batch["input_ids"],
+                        "image_input": batch["image_input"],
+                        "image_mask": batch["image_mask"],
+                    }
+                ),
+                "raw_rgb_hash": _tensor_hash(batch["raw_rgb"]),
+                "proprio_hash": _tensor_hash(batch["proprio"]),
+            }
+        )
+        if self.log_action_chunks:
+            self.latentloop_action_chunks.append(
+                {**record, "action_chunk": action_chunk.detach().cpu()}
+            )
+        self._pending_determinism_trace = None
 
     def _full_refresh(
         self,
@@ -496,19 +534,13 @@ class RealSimVLALatentLoopPolicy(RealSimVLADCLDPolicy):
             "full_refresh": bool(full_refresh),
             "source": source,
             "action_noise_seed": noise_seed,
-            "action_noise_hash": self.action_noise_hashes.get(query_index),
-            "action_chunk_hash": _tensor_hash(action_chunk),
-            "condition_hash": _tensor_hash(condition),
             "action_chunk_shape": list(action_chunk.shape),
         }
         self.latentloop_query_trace.append(record)
-        if self.log_action_chunks:
-            self.latentloop_action_chunks.append(
-                {**record, "action_chunk": action_chunk.detach().cpu()}
-            )
         self.metrics.latencies.setdefault("policy_query_total_ms", []).append(
             (time.perf_counter() - query_started) * 1000.0
         )
+        self._pending_determinism_trace = (record, batch, condition, action_chunk)
         if self.teacher_tracking and not full_refresh:
             self._pending_teacher_tracking = (
                 batch,
@@ -542,6 +574,7 @@ class RealSimVLALatentLoopPolicy(RealSimVLADCLDPolicy):
         self.metrics.counters["num_action_queue_steps"] += 1
         self.metrics.counters["num_environment_actions"] += 1
         self.metrics.latencies["policy_total_ms"].append((time.perf_counter() - total_t0) * 1000.0)
+        self._finalize_determinism_trace()
         if self._pending_teacher_tracking is not None:
             (
                 tracking_batch,

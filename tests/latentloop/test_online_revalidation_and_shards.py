@@ -134,11 +134,20 @@ def _make_shard(path: Path, task_id: int) -> None:
         "client_resize_size": 224,
         "image_size": 384,
         "resolution": 256,
+        "experiment_seed": None,
         "seed": 7,
         "action_noise_seed_base": 17,
         "bootstrap_seed": 19,
         "task_order": "official_reverse",
         "teacher_tracking": True,
+        "effective_seed_plan": {
+            "experiment_seed": None,
+            "process_seed": 7,
+            "environment_seed_base": 7,
+            "action_noise_seed_base": 17,
+            "bootstrap_seed": 19,
+            "derivation": "legacy_explicit_seed_tuple",
+        },
         "rows": [{"name": name} for name in PROTOCOL_A_ROWS],
         "environment_action_gap_by_row": {name: 1 for name in PROTOCOL_A_ROWS},
         "resolved_task_ids": [task_id],
@@ -158,6 +167,44 @@ def _make_shard(path: Path, task_id: int) -> None:
     _write_json(path / "online_summary.json", summary)
     _write_json(path / "eval_config.json", config)
     _write_json(path / "source_lock.json", source)
+    determinism = {
+        "protocol": "simvla_online_determinism_v1",
+        "scope": {"exact": ["trajectory"], "excluded": ["latency"]},
+        "runtime_contract": {"test": True},
+        "runtime_sha256": "runtime",
+        "run_contract": {
+            "runtime_sha256": "runtime",
+            "seed_plan": config["effective_seed_plan"],
+            "semantic_config": {
+                "matrix": "protocol_a_screening",
+                "task_ids": [task_id],
+                "suite": "libero_10",
+            },
+            "task_assets": {str(task_id): {"hash": f"task-{task_id}"}},
+        },
+        "run_contract_sha256": f"run-{task_id}",
+    }
+    _write_json(path / "determinism_manifest.json", determinism)
+    deterministic_rows = [
+        {
+            "row": row_name,
+            "task_id": task_id,
+            "episode": 0,
+            "success": True,
+            "episode_trace_hash": f"{row_name}-{task_id}",
+        }
+        for row_name in PROTOCOL_A_ROWS
+    ]
+    _write_json(
+        path / "deterministic_results.json",
+        {
+            "protocol": determinism["protocol"],
+            "runtime_sha256": "runtime",
+            "run_contract_sha256": f"run-{task_id}",
+            "episodes": deterministic_rows,
+            "trajectory_sha256": f"trajectory-{task_id}",
+        },
+    )
     (path / "query_trace.jsonl").write_text("{}\n", encoding="utf-8")
     fields = [
         "row",
@@ -198,3 +245,5 @@ def test_task_shard_merger_validates_and_reconstructs_matrix(tmp_path: Path) -> 
     assert result["rows"]["full_k1"]["successes"] == 2
     assert result["paired_vs_full"]["chunk_aware_latentloop_k4"]["pairs"] == 2
     assert (output / "query_trace_shards.json").is_file()
+    assert (output / "determinism_manifest.json").is_file()
+    assert (output / "deterministic_results.json").is_file()
