@@ -16,7 +16,9 @@ shift
 
 legacy_seed=7
 experiment_seed=""
+render_backend="${SIMVLA_LATENTLOOP_RENDER_BACKEND:-osmesa}"
 arguments=("$@")
+forwarded=()
 for ((index = 0; index < ${#arguments[@]}; index++)); do
   case "${arguments[$index]}" in
     --seed)
@@ -25,9 +27,12 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
         exit 2
       }
       legacy_seed="${arguments[$((index + 1))]}"
+      forwarded+=("${arguments[$index]}" "${arguments[$((index + 1))]}")
+      ((index += 1))
       ;;
     --seed=*)
       legacy_seed="${arguments[$index]#--seed=}"
+      forwarded+=("${arguments[$index]}")
       ;;
     --experiment-seed)
       ((index + 1 < ${#arguments[@]})) || {
@@ -35,12 +40,37 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
         exit 2
       }
       experiment_seed="${arguments[$((index + 1))]}"
+      forwarded+=("${arguments[$index]}" "${arguments[$((index + 1))]}")
+      ((index += 1))
       ;;
     --experiment-seed=*)
       experiment_seed="${arguments[$index]#--experiment-seed=}"
+      forwarded+=("${arguments[$index]}")
+      ;;
+    --render-backend)
+      ((index + 1 < ${#arguments[@]})) || {
+        echo "--render-backend requires a value" >&2
+        exit 2
+      }
+      render_backend="${arguments[$((index + 1))]}"
+      ((index += 1))
+      ;;
+    --render-backend=*)
+      render_backend="${arguments[$index]#--render-backend=}"
+      ;;
+    *)
+      forwarded+=("${arguments[$index]}")
       ;;
   esac
 done
+
+case "$render_backend" in
+  osmesa|egl) ;;
+  *)
+    echo "--render-backend must be osmesa or egl: $render_backend" >&2
+    exit 2
+    ;;
+esac
 
 process_seed="${experiment_seed:-$legacy_seed}"
 [[ "$process_seed" =~ ^[0-9]+$ ]] && ((10#$process_seed <= 4294967295)) || {
@@ -57,24 +87,26 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export TOKENIZERS_PARALLELISM=false
-export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM=egl
+export SIMVLA_LATENTLOOP_RENDER_BACKEND="$render_backend"
+export MUJOCO_GL="$render_backend"
+export PYOPENGL_PLATFORM="$render_backend"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
 case "$mode" in
   offline)
-    exec python -m architectures.simvla.adapters.latentloop.offline_evaluator "$@"
+    exec python -m architectures.simvla.adapters.latentloop.offline_evaluator "${forwarded[@]}"
     ;;
   online)
-    exec python -m architectures.simvla.adapters.latentloop.online_evaluator "$@"
+    exec python -m architectures.simvla.adapters.latentloop.online_evaluator \
+      --render-backend "$render_backend" "${forwarded[@]}"
     ;;
   aggregate)
-    exec python -m architectures.simvla.adapters.latentloop.result_aggregator "$@"
+    exec python -m architectures.simvla.adapters.latentloop.result_aggregator "${forwarded[@]}"
     ;;
   verify-repeat)
-    exec python -m architectures.simvla.adapters.latentloop.repeat_verifier "$@"
+    exec python -m architectures.simvla.adapters.latentloop.repeat_verifier "${forwarded[@]}"
     ;;
   *)
     echo "unknown mode: ${mode}" >&2

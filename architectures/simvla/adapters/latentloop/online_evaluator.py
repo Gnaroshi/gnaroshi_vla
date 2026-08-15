@@ -438,7 +438,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         action_noise_seed_base=args.action_noise_seed_base,
         bootstrap_seed=args.bootstrap_seed,
     )
-    strict_runtime = configure_strict_determinism(seed_plan.process_seed)
+    strict_runtime = configure_strict_determinism(
+        seed_plan.process_seed,
+        render_backend=args.render_backend,
+    )
 
     from libero.libero import benchmark, get_libero_path
     from models.modeling_smolvlm_vla import SmolVLMVLA
@@ -510,6 +513,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "client_resize_size": args.client_resize_size,
         "image_size": args.image_size,
         "resolution": args.resolution,
+        "render_backend": args.render_backend,
         "task_order": args.task_order,
         "teacher_tracking": bool(args.teacher_tracking),
         "save_video": bool(args.save_video),
@@ -1027,6 +1031,12 @@ def main() -> int:
     parser.add_argument("--client-resize-size", type=int, default=224)
     parser.add_argument("--image-size", type=int, default=384)
     parser.add_argument("--resolution", type=int, default=256)
+    parser.add_argument(
+        "--render-backend",
+        choices=("osmesa", "egl"),
+        default="osmesa",
+        help="offscreen rendering axis; osmesa is required for exact replay",
+    )
     parser.add_argument(
         "--experiment-seed",
         type=int,

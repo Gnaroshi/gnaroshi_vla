@@ -19,7 +19,8 @@ import torch
 
 
 DETERMINISM_PROTOCOL = "simvla_online_determinism_v1"
-REQUIRED_PROCESS_ENV = {
+SUPPORTED_RENDER_BACKENDS = ("osmesa", "egl")
+_BASE_REQUIRED_PROCESS_ENV = {
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     "NVIDIA_TF32_OVERRIDE": "0",
     "OMP_NUM_THREADS": "1",
@@ -27,12 +28,28 @@ REQUIRED_PROCESS_ENV = {
     "OPENBLAS_NUM_THREADS": "1",
     "NUMEXPR_NUM_THREADS": "1",
     "TOKENIZERS_PARALLELISM": "false",
-    "MUJOCO_GL": "egl",
-    "PYOPENGL_PLATFORM": "egl",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
 }
+
+
+def required_process_environment(render_backend: str = "osmesa") -> dict[str, str]:
+    backend = str(render_backend).lower()
+    if backend not in SUPPORTED_RENDER_BACKENDS:
+        raise ValueError(
+            f"unsupported deterministic render backend {render_backend!r}; "
+            f"expected one of {SUPPORTED_RENDER_BACKENDS}"
+        )
+    return {
+        **_BASE_REQUIRED_PROCESS_ENV,
+        "MUJOCO_GL": backend,
+        "PYOPENGL_PLATFORM": backend,
+    }
+
+
+# Backward-compatible default used by callers and tests that do not select an axis.
+REQUIRED_PROCESS_ENV = required_process_environment()
 
 
 def stable_seed(namespace: str, seed: int, *parts: Any, bits: int = 63) -> int:
@@ -142,10 +159,17 @@ def _backend_snapshot() -> dict[str, Any]:
     }
 
 
-def configure_strict_determinism(seed: int) -> dict[str, Any]:
+def configure_strict_determinism(
+    seed: int,
+    *,
+    render_backend: str = "osmesa",
+) -> dict[str, Any]:
     """Enable fail-closed deterministic execution after validating process env."""
 
-    required = {**REQUIRED_PROCESS_ENV, "PYTHONHASHSEED": str(int(seed))}
+    required = {
+        **required_process_environment(render_backend),
+        "PYTHONHASHSEED": str(int(seed)),
+    }
     mismatches = {
         name: {"expected": expected, "actual": os.environ.get(name)}
         for name, expected in required.items()
@@ -187,6 +211,7 @@ def configure_strict_determinism(seed: int) -> dict[str, Any]:
     return {
         "protocol": DETERMINISM_PROTOCOL,
         "seed": int(seed),
+        "render_backend": str(render_backend).lower(),
         "required_process_environment": required,
         "backend": snapshot,
         "fail_on_nondeterministic_operator": True,

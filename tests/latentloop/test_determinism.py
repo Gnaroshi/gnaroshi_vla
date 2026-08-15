@@ -17,6 +17,7 @@ from architectures.simvla.adapters.latentloop.determinism import (
     configure_strict_determinism,
     evaluation_episode_seed,
     exact_hash,
+    required_process_environment,
     resolve_seed_plan,
     seed_all,
 )
@@ -110,6 +111,15 @@ def test_strict_runtime_fails_closed_then_enables_backend(monkeypatch: pytest.Mo
     assert isinstance(snapshot["backend"]["flash_sdp_enabled"], bool)
     assert isinstance(snapshot["backend"]["mem_efficient_sdp_enabled"], bool)
     assert isinstance(snapshot["backend"]["math_sdp_enabled"], bool)
+
+
+def test_render_backend_is_an_explicit_strict_runtime_axis() -> None:
+    osmesa = required_process_environment("osmesa")
+    egl = required_process_environment("egl")
+    assert osmesa["MUJOCO_GL"] == osmesa["PYOPENGL_PLATFORM"] == "osmesa"
+    assert egl["MUJOCO_GL"] == egl["PYOPENGL_PLATFORM"] == "egl"
+    with pytest.raises(ValueError, match="unsupported deterministic render backend"):
+        required_process_environment("auto")
 
 
 def _write_repeat(path: Path, *, trace_hash: str, runtime_hash: str = "runtime") -> None:
