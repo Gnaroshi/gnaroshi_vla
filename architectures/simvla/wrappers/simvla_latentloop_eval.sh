@@ -90,6 +90,13 @@ export TOKENIZERS_PARALLELISM=false
 export SIMVLA_LATENTLOOP_RENDER_BACKEND="$render_backend"
 export MUJOCO_GL="$render_backend"
 export PYOPENGL_PLATFORM="$render_backend"
+if [[ "$render_backend" == "osmesa" ]]; then
+  export GALLIUM_DRIVER=llvmpipe
+  export LIBGL_ALWAYS_SOFTWARE=true
+  export LP_NUM_THREADS=0
+else
+  unset GALLIUM_DRIVER LIBGL_ALWAYS_SOFTWARE LP_NUM_THREADS
+fi
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1

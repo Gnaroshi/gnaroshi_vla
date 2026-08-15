@@ -117,7 +117,11 @@ def test_render_backend_is_an_explicit_strict_runtime_axis() -> None:
     osmesa = required_process_environment("osmesa")
     egl = required_process_environment("egl")
     assert osmesa["MUJOCO_GL"] == osmesa["PYOPENGL_PLATFORM"] == "osmesa"
+    assert osmesa["GALLIUM_DRIVER"] == "llvmpipe"
+    assert osmesa["LIBGL_ALWAYS_SOFTWARE"] == "true"
+    assert osmesa["LP_NUM_THREADS"] == "0"
     assert egl["MUJOCO_GL"] == egl["PYOPENGL_PLATFORM"] == "egl"
+    assert "LP_NUM_THREADS" not in egl
     with pytest.raises(ValueError, match="unsupported deterministic render backend"):
         required_process_environment("auto")
 

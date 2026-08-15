@@ -41,11 +41,20 @@ def required_process_environment(render_backend: str = "osmesa") -> dict[str, st
             f"unsupported deterministic render backend {render_backend!r}; "
             f"expected one of {SUPPORTED_RENDER_BACKENDS}"
         )
-    return {
+    environment = {
         **_BASE_REQUIRED_PROCESS_ENV,
         "MUJOCO_GL": backend,
         "PYOPENGL_PLATFORM": backend,
     }
+    if backend == "osmesa":
+        environment.update(
+            {
+                "GALLIUM_DRIVER": "llvmpipe",
+                "LIBGL_ALWAYS_SOFTWARE": "true",
+                "LP_NUM_THREADS": "0",
+            }
+        )
+    return environment
 
 
 # Backward-compatible default used by callers and tests that do not select an axis.
@@ -332,7 +341,13 @@ def collect_runtime_identity(device: torch.device) -> dict[str, Any]:
         },
         "rendering": {
             name: os.environ.get(name)
-            for name in ("MUJOCO_GL", "PYOPENGL_PLATFORM")
+            for name in (
+                "MUJOCO_GL",
+                "PYOPENGL_PLATFORM",
+                "GALLIUM_DRIVER",
+                "LIBGL_ALWAYS_SOFTWARE",
+                "LP_NUM_THREADS",
+            )
         },
     }
     return identity
