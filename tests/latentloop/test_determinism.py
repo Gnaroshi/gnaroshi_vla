@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ from architectures.simvla.adapters.latentloop.determinism import (
     resolve_seed_plan,
     seed_all,
 )
+from architectures.simvla.adapters.latentloop.online_evaluator import EvalRow, planned_rows
 from architectures.simvla.adapters.latentloop.repeat_verifier import verify_repeat
 
 
@@ -43,6 +45,11 @@ def test_single_experiment_seed_derives_stable_disjoint_namespaces() -> None:
     assert evaluation_episode_seed(first.environment_seed_base, "libero_10", 4, 2) != (
         evaluation_episode_seed(first.environment_seed_base, "libero_10", 4, 3)
     )
+
+
+def test_official_compatible_baseline_has_no_adapter_path() -> None:
+    rows = planned_rows(SimpleNamespace(matrix="official_compatible_baseline"))
+    assert rows == [EvalRow("full_k1", "full", 1, None)]
 
 
 def test_seed_all_replays_python_numpy_and_torch_rngs() -> None:

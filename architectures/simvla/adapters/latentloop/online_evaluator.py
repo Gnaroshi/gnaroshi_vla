@@ -255,6 +255,8 @@ def _custom_rows(args: argparse.Namespace) -> list[EvalRow]:
 def planned_rows(args: argparse.Namespace) -> list[EvalRow]:
     """Build only matrices allowed before R=5 K2 passes."""
 
+    if args.matrix == "official_compatible_baseline":
+        return [EvalRow("full_k1", "full", 1, None)]
     if args.matrix == "k1_parity":
         chunk = _required_path(args.chunk_aware_checkpoint, "chunk-aware")
         return [
@@ -932,6 +934,7 @@ def main() -> int:
     parser.add_argument(
         "--matrix",
         choices=(
+            "official_compatible_baseline",
             "k1_parity",
             "protocol_a_screening",
             "protocol_b_k2_screening",
