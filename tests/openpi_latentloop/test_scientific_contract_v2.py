@@ -36,6 +36,13 @@ from architectures.openpi.adapters.latentloop.prefix_kv_hook import (  # noqa: E
     PrefixEmbeddingState,
     PrefixKVState,
 )
+from architectures.openpi.adapters.latentloop.streaming_teacher import (  # noqa: E402
+    StreamingTeacherConfig,
+    build_streaming_episode_plan,
+    build_streaming_provenance,
+    deterministic_episode_order,
+    iter_rolling_v0_examples,
+)
 from architectures.openpi.adapters.latentloop.transition_core import OpenPITransitionOutput  # noqa: E402
 from architectures.openpi.adapters.latentloop.v0_recursive_unroll import (  # noqa: E402
     V0AgeInput,
@@ -384,6 +391,82 @@ def test_full_cache_inventory_reconstructs_every_query_and_detects_tampering(tmp
             split_contract_path=split_path,
             final_manifest_path=final_path,
         )
+
+
+def test_streaming_v0_plan_is_deterministic_and_uses_no_persistent_teacher_tensors(
+    tmp_path: Path,
+):
+    final = _final_manifest()
+    split = _split_contract(final)
+    final_path = tmp_path / "final.json"
+    split_path = tmp_path / "split.json"
+    final_path.write_text(json.dumps(final))
+    split_path.write_text(json.dumps(split))
+    source_lock = {
+        "source_lock_id": "lock-v2",
+        "checkpoint": {
+            "model_sha256": "model-sha",
+            "config_sha256": "config-sha",
+        },
+        "normalization": {"sha256": "norm-sha"},
+    }
+    config = StreamingTeacherConfig()
+    plan = build_streaming_episode_plan(split)
+    assert len(plan) == 5
+    assert sum(row.query_count for row in plan) == 25
+    assert sum(row.window_count for row in plan) == 10
+    assert deterministic_episode_order(plan, seed=42, epoch=0) == deterministic_episode_order(
+        plan, seed=42, epoch=0
+    )
+    provenance = build_streaming_provenance(
+        source_lock=source_lock,
+        checkpoint=tmp_path / "checkpoint",
+        final_manifest=final,
+        final_manifest_path=final_path,
+        split_contract=split,
+        split_contract_path=split_path,
+        config=config,
+    )
+    assert provenance["training_source_mode"] == "online_frozen_teacher_rolling_v0"
+    assert provenance["persistent_teacher_tensor_bytes"] == 0
+    assert provenance["rolling_window_teacher_records"] == 4
+    assert provenance["maximum_transient_teacher_records_in_trainer"] == 10
+    assert provenance["statistics"]["v0_windows"] == 10
+
+
+def test_streaming_v0_rolling_window_contains_exact_four_consecutive_queries():
+    records = [{"query_index": index} for index in range(6)]
+    examples = list(iter_rolling_v0_examples(records))
+    assert [[row["query_index"] for row in example["records"]] for example in examples] == [
+        [0, 1, 2, 3],
+        [1, 2, 3, 4],
+        [2, 3, 4, 5],
+    ]
+    assert all(example["delta_q"] == 3 for example in examples)
+
+
+def test_streaming_v0_stages_and_wrappers_do_not_require_a_tensor_cache():
+    raw_requirements = set(pi05_stage_gate_v2.STAGE_REQUIREMENTS["stage3_v0_streaming_raw_loss"])
+    assert raw_requirements == {
+        "REAL_KV_ROUNDTRIP_PASS",
+        "K1_ACTION_PARITY_PASS",
+        "K1_EPISODE_PARITY_PASS",
+        "BASE_FREEZE_PASS",
+    }
+    train_requirements = set(pi05_stage_gate_v2.STAGE_REQUIREMENTS["stage3_v0_streaming"])
+    assert "V0_STREAMING_LOSS_WEIGHTS_APPROVED" in train_requirements
+    acceptance = (
+        ROOT / "architectures/openpi/wrappers/accept_pi05_v0_streaming.sh"
+    ).read_text()
+    training = (
+        ROOT / "architectures/openpi/wrappers/train_pi05_v0_streaming.sh"
+    ).read_text()
+    cli = (ROOT / "tools/openpi/train_pi05_v0_streaming.py").read_text()
+    assert "generate_pi05_latentloop_cache" not in acceptance
+    assert "FULL_CACHE_SCHEMA_V2_PASS" not in acceptance
+    assert "--raw-loss-only" in acceptance
+    assert "--cache" not in training
+    assert "validate_pi05_cache_v2" not in cli
 
 
 class _RecursiveAdapter(nn.Module):
