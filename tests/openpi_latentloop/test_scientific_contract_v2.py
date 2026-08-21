@@ -42,6 +42,7 @@ from architectures.openpi.adapters.latentloop.streaming_teacher import (  # noqa
     build_streaming_provenance,
     deterministic_episode_order,
     iter_rolling_v0_examples,
+    iter_rolling_v1_examples,
 )
 from architectures.openpi.adapters.latentloop.transition_core import OpenPITransitionOutput  # noqa: E402
 from architectures.openpi.adapters.latentloop.v0_recursive_unroll import (  # noqa: E402
@@ -61,6 +62,7 @@ from methods.variable_time_latentloop.operation_counters_v2 import (  # noqa: E4
 from simulate_dynamic_budget_v2 import aggregate_simulations, simulate_episode  # noqa: E402
 import defect_split_common  # noqa: E402
 import aggregate_pi05_scientific_row_v2  # noqa: E402
+import derive_pi05_v0_equalized_loss_weights  # noqa: E402
 import pi05_stage_gate_v2  # noqa: E402
 import source_lock_v2  # noqa: E402
 import verify_pi05_dynamic_threshold_lock_v2  # noqa: E402
@@ -443,6 +445,19 @@ def test_streaming_v0_plan_is_deterministic_and_uses_no_persistent_teacher_tenso
     assert provenance["rolling_window_teacher_records"] == 4
     assert provenance["maximum_transient_teacher_records_in_trainer"] == 10
     assert provenance["statistics"]["v0_windows"] == 10
+    v1 = build_streaming_provenance(
+        source_lock=source_lock,
+        checkpoint=tmp_path / "checkpoint",
+        final_manifest=final,
+        final_manifest_path=final_path,
+        split_contract=split,
+        split_contract_path=split_path,
+        config=config,
+        variant="v1",
+    )
+    assert v1["training_source_mode"] == "online_frozen_teacher_rolling_v1"
+    assert v1["training_source_id"] != provenance["training_source_id"]
+    assert v1["statistics"]["v1_examples"] == 45
 
 
 def test_streaming_v0_rolling_window_contains_exact_four_consecutive_queries():
@@ -456,6 +471,61 @@ def test_streaming_v0_rolling_window_contains_exact_four_consecutive_queries():
     assert all(example["delta_q"] == 3 for example in examples)
 
 
+def test_streaming_v1_examples_match_cache_start_major_delta_order():
+    records = [{"query_index": index} for index in range(6)]
+    examples = list(iter_rolling_v1_examples(records))
+    assert [example["delta_q"] for example in examples] == [
+        1,
+        2,
+        3,
+        1,
+        2,
+        3,
+        1,
+        2,
+        3,
+        1,
+        2,
+        1,
+    ]
+    assert [[row["query_index"] for row in example["records"]] for example in examples] == [
+        [0, 1],
+        [0, 1, 2],
+        [0, 1, 2, 3],
+        [1, 2],
+        [1, 2, 3],
+        [1, 2, 3, 4],
+        [2, 3],
+        [2, 3, 4],
+        [2, 3, 4, 5],
+        [3, 4],
+        [3, 4, 5],
+        [4, 5],
+    ]
+
+
+def test_v1_equalized_weights_include_direct_composed_and_composition_terms():
+    metrics = {
+        "direct_state": 2.0,
+        "composed_state": 4.0,
+        "direct_chunk": 3.0,
+        "composed_chunk": 3.0,
+        "direct_executed": 6.0,
+        "composed_executed": 6.0,
+        "direct_gripper": 1.5,
+        "composed_gripper": 1.5,
+        "composition": 12.0,
+    }
+    weights = derive_pi05_v0_equalized_loss_weights.v1_equalized_weights(metrics)
+    assert weights == {
+        "state": 1.0,
+        "chunk": 1.0,
+        "executed": 0.5,
+        "gripper": 2.0,
+        "composition": 0.25,
+    }
+
+
 def test_streaming_v0_stages_and_wrappers_do_not_require_a_tensor_cache():
     raw_requirements = set(pi05_stage_gate_v2.STAGE_REQUIREMENTS["stage3_v0_streaming_raw_loss"])
     assert raw_requirements == {
@@ -466,6 +536,11 @@ def test_streaming_v0_stages_and_wrappers_do_not_require_a_tensor_cache():
     }
     train_requirements = set(pi05_stage_gate_v2.STAGE_REQUIREMENTS["stage3_v0_streaming"])
     assert "V0_STREAMING_LOSS_WEIGHTS_APPROVED" in train_requirements
+    v1_requirements = set(
+        pi05_stage_gate_v2.STAGE_REQUIREMENTS["stage6_v1_streaming_screen"]
+    )
+    assert "V1_STREAMING_LOSS_WEIGHTS_APPROVED" in v1_requirements
+    assert "V0_PAIRED_ROW_PASS" not in v1_requirements
     acceptance = (
         ROOT / "architectures/openpi/wrappers/accept_pi05_v0_streaming.sh"
     ).read_text()

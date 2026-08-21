@@ -113,6 +113,44 @@ def sample_v0_actions_by_age(
     return predicted_by_age, total_timing, len(outputs)
 
 
+def sample_v1_actions(
+    *,
+    hook: Any,
+    direct_state: Any,
+    composed_state: Any,
+    robot_state: Tensor,
+    noise: Tensor,
+    mode: Literal["A", "B"],
+) -> tuple[Tensor, Tensor, dict[str, float], int]:
+    """Evaluate direct/composed V1 action objectives sequentially or as one batch."""
+
+    if mode == "B":
+        batch_size = direct_state.embeddings.shape[0]
+        predicted, timing = hook.sample_actions_from_state(
+            stack_prefix_kv_states([direct_state, composed_state]),
+            torch.cat([robot_state, robot_state], dim=0),
+            torch.cat([noise, noise], dim=0),
+            num_steps=10,
+        )
+        direct_actions, composed_actions = predicted.split((batch_size, batch_size), dim=0)
+        return direct_actions, composed_actions, timing, 1
+    if mode != "A":
+        raise ValueError("action execution mode must be A or B")
+    total_timing = {"cache_rebuild_ms": 0.0, "action_expert_ms": 0.0}
+    outputs = []
+    for state in (direct_state, composed_state):
+        predicted, timing = hook.sample_actions_from_state(
+            state,
+            robot_state,
+            noise,
+            num_steps=10,
+        )
+        outputs.append(predicted)
+        for name in total_timing:
+            total_timing[name] += timing[name]
+    return outputs[0], outputs[1], total_timing, 2
+
+
 class LatentLoopTrainer:
     def __init__(
         self,
@@ -140,8 +178,8 @@ class LatentLoopTrainer:
         self.config = config
         if config.action_execution_mode not in {"A", "B"}:
             raise ValueError("action_execution_mode must be A or B")
-        if config.variant != "v0" and config.action_execution_mode != "A":
-            raise ValueError("batched action execution is currently valid only for V0")
+        if config.variant == "latent_bridge" and config.action_execution_mode != "A":
+            raise ValueError("batched action execution is not defined for latent_bridge")
         self.weights = weights
         self.device = torch.device(device)
         self.wandb_run = wandb_run
@@ -304,21 +342,11 @@ class LatentLoopTrainer:
                 dim=1,
             ),
         )
-        direct_actions, _ = self.hook.sample_actions_from_state(
-            direct.state, robot_state, noise, num_steps=10
-        )
-        direct_state_loss = normalized_kv_loss(self.adapter.codec, direct.state, target)
-        direct_action_loss = action_losses(direct_actions, teacher_action, self.config.execution_horizon)
-        total = weighted_v0_loss(direct_state_loss, direct_action_loss, self.weights)
-        metrics = {
-            "direct_state": float(direct_state_loss.detach().item()),
-            **{f"direct_{name}": float(value.detach().item()) for name, value in direct_action_loss.items()},
-        }
-
+        composed_state = None
+        composed_encoded = None
         if self.config.variant == "v1":
             composed_state = anchor
             previous_embeddings = anchor.embeddings
-            composed_encoded = None
             for offset, record in enumerate(records[1:], start=1):
                 prefix = prefix_embedding_from_record(record, self.device)
                 step_robot = torch.as_tensor(
@@ -349,8 +377,38 @@ class LatentLoopTrainer:
                 composed_encoded = composed.encoded_state
                 previous_embeddings = prefix.embeddings
             assert composed_encoded is not None
-            composed_actions, _ = self.hook.sample_actions_from_state(
-                composed_state, robot_state, noise, num_steps=10
+            direct_actions, composed_actions, action_timing, action_expert_calls = sample_v1_actions(
+                hook=self.hook,
+                direct_state=direct.state,
+                composed_state=composed_state,
+                robot_state=robot_state,
+                noise=noise,
+                mode=self.config.action_execution_mode,
+            )
+        else:
+            direct_actions, action_timing = self.hook.sample_actions_from_state(
+                direct.state, robot_state, noise, num_steps=10
+            )
+            composed_actions = None
+            action_expert_calls = 1
+
+        direct_state_loss = normalized_kv_loss(self.adapter.codec, direct.state, target)
+        direct_action_loss = action_losses(direct_actions, teacher_action, self.config.execution_horizon)
+        total = weighted_v0_loss(direct_state_loss, direct_action_loss, self.weights)
+        metrics = {
+            "direct_state": float(direct_state_loss.detach().item()),
+            **{f"direct_{name}": float(value.detach().item()) for name, value in direct_action_loss.items()},
+            "action_expert_calls": float(action_expert_calls),
+            "cache_rebuild_calls": float(action_expert_calls),
+            "cache_rebuild_ms": float(action_timing["cache_rebuild_ms"]),
+            "action_expert_ms": float(action_timing["action_expert_ms"]),
+        }
+
+        if self.config.variant == "v1":
+            assert (
+                composed_state is not None
+                and composed_encoded is not None
+                and composed_actions is not None
             )
             composed_state_loss = normalized_kv_loss(self.adapter.codec, composed_state, target)
             composed_action_loss = action_losses(composed_actions, teacher_action, self.config.execution_horizon)
@@ -367,6 +425,9 @@ class LatentLoopTrainer:
                     },
                 }
             )
+            metrics["primary_executed"] = float(composed_action_loss["executed"].detach().item())
+        else:
+            metrics["primary_executed"] = float(direct_action_loss["executed"].detach().item())
         metrics["loss"] = float(total.detach().item())
         return total, metrics
 
@@ -440,6 +501,7 @@ class LatentLoopTrainer:
         first_r = torch.stack(executed_metrics).mean()
         metrics["direct_executed"] = float(first_r.detach().item())
         metrics["recursive_first_r"] = float(first_r.detach().item())
+        metrics["primary_executed"] = float(first_r.detach().item())
         metrics["loss"] = float(total.detach().item())
         return total, metrics
 
@@ -471,13 +533,17 @@ class LatentLoopTrainer:
     def raw_loss_calibration(self, examples: int = 32) -> dict[str, Any]:
         started = time.time()
         metrics = self.validate(max_examples=examples)
+        if self.config.variant == "v0":
+            completion_marker = "V0_RAW_LOSS_CALIBRATION_COMPLETE"
+        elif self.config.variant == "v1" and self.example_source is not None:
+            completion_marker = "V1_STREAMING_RAW_LOSS_CALIBRATION_COMPLETE"
+        else:
+            completion_marker = "V1_RAW_LOSS_CALIBRATION_COMPLETE"
         payload = {
             "schema_version": 2,
             "complete": True,
-            "V0_RAW_LOSS_CALIBRATION_COMPLETE": self.config.variant == "v0",
-            "markers": (
-                ["V0_RAW_LOSS_CALIBRATION_COMPLETE"] if self.config.variant == "v0" else []
-            ),
+            completion_marker: True,
+            "markers": [completion_marker],
             "variant": self.config.variant,
             "action_execution_mode": self.config.action_execution_mode,
             "examples": examples,
@@ -557,7 +623,7 @@ class LatentLoopTrainer:
                     handle.write(json.dumps(log_record, sort_keys=True) + "\n")
                 progress.set_postfix(
                     loss=f"{averaged['loss']:.4g}",
-                    first_r=f"{averaged['direct_executed']:.4g}",
+                    first_r=f"{averaged['primary_executed']:.4g}",
                 )
             if self.wandb_run is not None and (
                 step % self.config.wandb_log_interval == 0 or step == 1
@@ -566,7 +632,7 @@ class LatentLoopTrainer:
 
             if step % self.config.validation_interval == 0 or step == self.config.max_steps:
                 validation = self.validate()
-                primary = validation["direct_executed"]
+                primary = validation["primary_executed"]
                 record = {"step": step, "validation": validation, "elapsed_seconds": time.time() - started}
                 with (self.output / "validation.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -580,22 +646,36 @@ class LatentLoopTrainer:
                     self._save(step, "best.pt", validation)
             if step % self.config.save_interval == 0 or step == self.config.max_steps:
                 self._save(step, f"step_{step:06d}.pt", None)
+        if self.config.variant == "v0":
+            completion_marker = "V0_TRAIN_COMPLETE"
+        elif self.config.variant == "v1" and self.example_source is not None:
+            completion_marker = "V1_STREAMING_SCREEN_TRAIN_COMPLETE"
+        elif self.config.variant == "v1":
+            completion_marker = "V1_TRAIN_COMPLETE"
+        else:
+            completion_marker = "LATENT_BRIDGE_TRAIN_COMPLETE"
+        checkpoint_selection_metric = {
+            "v0": "mean_recursive_age1_age2_age3_executed_action_mse",
+            "v1": "composed_sequential_executed_action_mse",
+            "latent_bridge": "direct_executed_action_mse",
+        }[self.config.variant]
         summary = {
             "complete": True,
             "variant": self.config.variant,
             "steps": self.config.max_steps,
             "best_step": best_step,
             "best_validation_first_r_action_mse": best_executed,
+            "checkpoint_selection_metric": checkpoint_selection_metric,
+            "optimizer": "AdamW",
+            "learning_rate": self.config.learning_rate,
+            "learning_rate_schedule": "constant",
+            "weight_decay": self.config.weight_decay,
             "adapter_trainable_parameters": self.adapter.trainable_parameters,
             "action_execution_mode": self.config.action_execution_mode,
             "source_lock_id": self.provenance["source_lock_id"],
             "training_source_mode": self.provenance["training_source_mode"],
             "training_source_id": self.provenance["training_source_id"],
-            (
-                "V0_TRAIN_COMPLETE"
-                if self.config.variant == "v0"
-                else "V1_TRAIN_COMPLETE"
-            ): True,
+            completion_marker: True,
             "elapsed_seconds": time.time() - started,
             "peak_vram_bytes": (
                 torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0

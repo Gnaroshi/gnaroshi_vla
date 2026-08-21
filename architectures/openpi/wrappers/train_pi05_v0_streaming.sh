@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "${SCRIPT_DIR}/latentloop_common.sh"
 
 OUTPUT=
+VARIANT=v0
 SOURCE_LOCK=
 K1_GATE=
 FREEZE_GATE=
@@ -21,6 +22,7 @@ WANDB_NAME=
 ACTION_EXECUTION_MODE=A
 while (($#)); do
   case "$1" in
+    --variant) VARIANT=$2; shift 2 ;;
     --output) OUTPUT=$2; shift 2 ;;
     --source-lock) SOURCE_LOCK=$2; shift 2 ;;
     --k1-gate) K1_GATE=$2; shift 2 ;;
@@ -39,6 +41,9 @@ while (($#)); do
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+[[ "${VARIANT}" == "v0" || "${VARIANT}" == "v1" ]] || {
+  echo "--variant must be v0 or v1" >&2; exit 2;
+}
 [[ "${ACTION_EXECUTION_MODE}" == "A" || "${ACTION_EXECUTION_MODE}" == "B" ]] || {
   echo "--action-execution-mode must be A or B" >&2; exit 2;
 }
@@ -62,7 +67,7 @@ if [[ -n "${WANDB_NAME}" ]]; then
 fi
 CUDA_VISIBLE_DEVICES=${GPU} OPENPI_LATENTLOOP_STREAMING_RUN=1 \
 "${OPENPI_LL_MAIN_PY}" "${OPENPI_LL_ROOT}/tools/openpi/train_pi05_v0_streaming.py" \
-  --run --output "${OUTPUT}" --checkpoint "${OPENPI_LL_CHECKPOINT}" \
+  --run --variant "${VARIANT}" --output "${OUTPUT}" --checkpoint "${OPENPI_LL_CHECKPOINT}" \
   --source-lock "${SOURCE_LOCK}" --k1-gate "${K1_GATE}" \
   --freeze-gate "${FREEZE_GATE}" \
   --final-evaluation-manifest "${FINAL_MANIFEST}" \

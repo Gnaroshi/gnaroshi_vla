@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze human-approved V0 weights for the cacheless streaming source."""
+"""Freeze human-approved V0/V1 weights for the cacheless streaming source."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ def _identity(payload: dict) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--variant", choices=("v0", "v1"), default="v0")
     parser.add_argument("--raw-loss-calibration", required=True)
     parser.add_argument("--source-lock", required=True)
     parser.add_argument("--checkpoint", required=True)
@@ -38,6 +39,7 @@ def main() -> None:
     parser.add_argument("--chunk-weight", type=float, required=True)
     parser.add_argument("--executed-weight", type=float, required=True)
     parser.add_argument("--gripper-weight", type=float, required=True)
+    parser.add_argument("--composition-weight", type=float)
     parser.add_argument("--noise-seed-base", type=int, default=20260820)
     parser.add_argument("--episode-order-seed", type=int, default=42)
     parser.add_argument("--approve", action="store_true")
@@ -63,32 +65,47 @@ def main() -> None:
             noise_seed_base=args.noise_seed_base,
             episode_order_seed=args.episode_order_seed,
         ),
+        variant=args.variant,
     )
     raw_path = Path(args.raw_loss_calibration).resolve()
     raw = json.loads(raw_path.read_text(encoding="utf-8"))
+    raw_marker = (
+        "V0_RAW_LOSS_CALIBRATION_COMPLETE"
+        if args.variant == "v0"
+        else "V1_STREAMING_RAW_LOSS_CALIBRATION_COMPLETE"
+    )
     if (
-        raw.get("V0_RAW_LOSS_CALIBRATION_COMPLETE") is not True
-        or raw.get("variant") != "v0"
+        raw.get(raw_marker) is not True
+        or raw.get("variant") != args.variant
         or raw.get("source_lock_id") != verified["source_lock_id"]
         or raw.get("training_source_id") != provenance["training_source_id"]
     ):
         raise RuntimeError("raw-loss calibration is absent, stale, or for another streaming source")
+    if args.variant == "v1" and args.composition_weight is None:
+        raise ValueError("V1 streaming weights require --composition-weight")
+    composition_weight = 0.0 if args.variant == "v0" else float(args.composition_weight)
     weights = {
         "state": args.state_weight,
         "chunk": args.chunk_weight,
         "executed": args.executed_weight,
         "gripper": args.gripper_weight,
-        "composition": 0.0,
+        "composition": composition_weight,
     }
     if any(not math.isfinite(value) or value < 0.0 for value in weights.values()):
-        raise ValueError("all streaming V0 loss weights must be finite and nonnegative")
+        raise ValueError("all streaming loss weights must be finite and nonnegative")
     if sum(weights.values()) <= 0:
-        raise ValueError("at least one streaming V0 loss weight must be positive")
+        raise ValueError("at least one streaming loss weight must be positive")
+    approval_marker = (
+        "V0_STREAMING_LOSS_WEIGHTS_APPROVED"
+        if args.variant == "v0"
+        else "V1_STREAMING_LOSS_WEIGHTS_APPROVED"
+    )
     payload = {
         "schema_version": 1,
         "frozen": True,
-        "V0_STREAMING_LOSS_WEIGHTS_APPROVED": True,
-        "markers": ["V0_STREAMING_LOSS_WEIGHTS_APPROVED"],
+        approval_marker: True,
+        "markers": [approval_marker],
+        "variant": args.variant,
         "source_lock_id": verified["source_lock_id"],
         "training_source_mode": provenance["training_source_mode"],
         "training_source_id": provenance["training_source_id"],

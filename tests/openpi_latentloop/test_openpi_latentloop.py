@@ -28,6 +28,7 @@ from architectures.openpi.adapters.latentloop.trainer import (
     freeze_base_model,
     optimizer_parameter_names,
     sample_v0_actions_by_age,
+    sample_v1_actions,
 )
 from architectures.openpi.adapters.latentloop.transition_core import (
     OpenPIKVLatentLoop,
@@ -213,6 +214,53 @@ def test_mode_b_stacks_all_ages_without_changing_per_age_actions():
     assert timing_b == {"cache_rebuild_ms": 1.0, "action_expert_ms": 2.0}
     for sequential, batched in zip(action_a, action_b, strict=True):
         torch.testing.assert_close(sequential, batched)
+
+
+def test_v1_mode_b_batches_direct_and_composed_action_objectives():
+    direct = _state()
+    composed = _state()
+    direct.pre_rope_keys[0].fill_(1.0)
+    composed.pre_rope_keys[0].fill_(2.0)
+
+    class Hook:
+        def __init__(self):
+            self.calls = 0
+
+        def sample_actions_from_state(self, state, robot_state, noise, *, num_steps):
+            assert num_steps == 10
+            self.calls += 1
+            bias = state.pre_rope_keys[0].mean(dim=(1, 2, 3)).view(-1, 1, 1)
+            return noise + robot_state[:, :1, None] + bias, {
+                "cache_rebuild_ms": 1.0,
+                "action_expert_ms": 2.0,
+            }
+
+    robot_state = torch.full((1, 4), 3.0)
+    noise = torch.zeros(1, 10, 32)
+    hook_a = Hook()
+    direct_a, composed_a, timing_a, calls_a = sample_v1_actions(
+        hook=hook_a,
+        direct_state=direct,
+        composed_state=composed,
+        robot_state=robot_state,
+        noise=noise,
+        mode="A",
+    )
+    hook_b = Hook()
+    direct_b, composed_b, timing_b, calls_b = sample_v1_actions(
+        hook=hook_b,
+        direct_state=direct,
+        composed_state=composed,
+        robot_state=robot_state,
+        noise=noise,
+        mode="B",
+    )
+    assert calls_a == hook_a.calls == 2
+    assert calls_b == hook_b.calls == 1
+    assert timing_a == {"cache_rebuild_ms": 2.0, "action_expert_ms": 4.0}
+    assert timing_b == {"cache_rebuild_ms": 1.0, "action_expert_ms": 2.0}
+    torch.testing.assert_close(direct_a, direct_b)
+    torch.testing.assert_close(composed_a, composed_b)
 
 
 def test_horizon_and_execution_semantics_are_pinned():

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train or calibrate V0 from an online frozen teacher without a tensor cache."""
+"""Train or calibrate V0/V1 from an online frozen teacher without a tensor cache."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import torch
 from architectures.openpi.adapters.latentloop.cache_contract_v2 import load_final_evaluation_manifest
 from architectures.openpi.adapters.latentloop.cache_contract_v2 import load_split_contract
 from architectures.openpi.adapters.latentloop.losses import LossWeights
-from architectures.openpi.adapters.latentloop.streaming_teacher import OnlineV0TeacherSource
+from architectures.openpi.adapters.latentloop.streaming_teacher import OnlineStreamingTeacherSource
 from architectures.openpi.adapters.latentloop.streaming_teacher import StreamingTeacherConfig
 from architectures.openpi.adapters.latentloop.trainer import LatentLoopTrainer
 from architectures.openpi.adapters.latentloop.trainer import TrainerConfig
@@ -26,6 +26,7 @@ from architectures.openpi.adapters.latentloop.transition_core import OpenPIKVLat
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--variant", choices=("v0", "v1"), default="v0")
     parser.add_argument("--output", required=True)
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
     parser.add_argument("--source-lock", required=True)
@@ -51,6 +52,7 @@ def main() -> None:
     parser.add_argument("--chunk-weight", type=float, default=1.0)
     parser.add_argument("--executed-weight", type=float, default=1.0)
     parser.add_argument("--gripper-weight", type=float, default=1.0)
+    parser.add_argument("--composition-weight", type=float, default=0.0)
     parser.add_argument("--raw-loss-only", action="store_true")
     parser.add_argument("--raw-loss-examples", type=int, default=32)
     parser.add_argument("--wandb-project", default="gnaroshi-openpi-latentloop")
@@ -63,7 +65,7 @@ def main() -> None:
     if args.max_steps < 1:
         raise ValueError("--max-steps must be positive")
     if args.batch_size != 1:
-        raise ValueError("streaming V0 currently pins batch-size=1 to bound live teacher state")
+        raise ValueError("streaming training pins batch-size=1 to bound live teacher state")
     if args.validation_examples < 1 or args.raw_loss_examples < 1:
         raise ValueError("streaming validation and raw-loss limits must be positive")
     if min(args.validation_interval, args.save_interval, args.log_interval) < 1:
@@ -72,11 +74,19 @@ def main() -> None:
     output = Path(args.output).resolve()
     artifacts = [args.k1_gate, args.freeze_gate]
     if args.raw_loss_only:
-        stage = "stage3_v0_streaming_raw_loss"
+        stage = (
+            "stage3_v0_streaming_raw_loss"
+            if args.variant == "v0"
+            else "stage6_v1_streaming_screen_raw_loss"
+        )
     else:
         if not args.loss_weights_gate:
-            raise ValueError("streaming V0 training requires an explicitly approved loss-weight gate")
-        stage = "stage3_v0_streaming"
+            raise ValueError("streaming training requires an explicitly approved loss-weight gate")
+        stage = (
+            "stage3_v0_streaming"
+            if args.variant == "v0"
+            else "stage6_v1_streaming_screen"
+        )
         artifacts.append(args.loss_weights_gate)
     stage_gate = verify_stage(stage, args.source_lock, artifacts, output_candidate=output)
     source_lock = json.loads(Path(args.source_lock).read_text(encoding="utf-8"))
@@ -93,7 +103,7 @@ def main() -> None:
         noise_seed_base=args.noise_seed_base,
         episode_order_seed=args.seed,
     )
-    example_source = OnlineV0TeacherSource.from_openpi(
+    example_source = OnlineStreamingTeacherSource.from_openpi(
         policy=policy,
         source_lock=source_lock,
         checkpoint=args.checkpoint,
@@ -103,6 +113,7 @@ def main() -> None:
         split_contract_path=args.split_contract,
         config=source_config,
         device=args.device,
+        variant=args.variant,
     )
     if example_source.provenance["source_lock_id"] != stage_gate["source_lock_id"]:
         raise RuntimeError("streaming source and stage gate were created under different source locks")
@@ -110,22 +121,30 @@ def main() -> None:
     approved_weights = None
     if not args.raw_loss_only:
         loss_payload = json.loads(Path(args.loss_weights_gate).read_text(encoding="utf-8"))
+        approval_marker = (
+            "V0_STREAMING_LOSS_WEIGHTS_APPROVED"
+            if args.variant == "v0"
+            else "V1_STREAMING_LOSS_WEIGHTS_APPROVED"
+        )
         if (
-            loss_payload.get("V0_STREAMING_LOSS_WEIGHTS_APPROVED") is not True
+            loss_payload.get(approval_marker) is not True
+            or loss_payload.get("variant", "v0") != args.variant
             or loss_payload.get("training_source_id") != example_source.provenance["training_source_id"]
             or loss_payload.get("action_execution_mode", "A") != args.action_execution_mode
         ):
-            raise RuntimeError("streaming V0 loss weights are absent, stale, or for another source")
+            raise RuntimeError("streaming loss weights are absent, stale, or for another source")
         approved_weights = loss_payload["weights"]
     weights = LossWeights(
         state=float(approved_weights["state"] if approved_weights else args.state_weight),
         chunk=float(approved_weights["chunk"] if approved_weights else args.chunk_weight),
         executed=float(approved_weights["executed"] if approved_weights else args.executed_weight),
         gripper=float(approved_weights["gripper"] if approved_weights else args.gripper_weight),
-        composition=0.0,
+        composition=float(
+            approved_weights["composition"] if approved_weights else args.composition_weight
+        ),
     )
     config = TrainerConfig(
-        variant="v0",
+        variant=args.variant,
         max_steps=args.max_steps,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,

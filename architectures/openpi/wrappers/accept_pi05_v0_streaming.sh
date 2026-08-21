@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "${SCRIPT_DIR}/latentloop_common.sh"
 
 OUTPUT=
+VARIANT=v0
 GPU=4
 PORT=8161
 RAW_LOSS_EXAMPLES=32
@@ -12,6 +13,7 @@ ACTION_EXECUTION_MODE=A
 EXPECTED_CHECKPOINT_SHA256=
 while (($#)); do
   case "$1" in
+    --variant) VARIANT=$2; shift 2 ;;
     --output) OUTPUT=$2; shift 2 ;;
     --gpu) GPU=$2; shift 2 ;;
     --port) PORT=$2; shift 2 ;;
@@ -21,6 +23,9 @@ while (($#)); do
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+[[ "${VARIANT}" == "v0" || "${VARIANT}" == "v1" ]] || {
+  echo "--variant must be v0 or v1" >&2; exit 2;
+}
 [[ "${ACTION_EXECUTION_MODE}" == "A" || "${ACTION_EXECUTION_MODE}" == "B" ]] || {
   echo "--action-execution-mode must be A or B" >&2; exit 2;
 }
@@ -56,7 +61,7 @@ K1_TENSOR=${OUTPUT}/k1_tensor
 FREEZE=${OUTPUT}/freeze
 K1_EPISODE=${OUTPUT}/k1_episode
 K1_GATE=${K1_EPISODE}/combined_gate/pi05_k1_equivalence.json
-RAW_LOSS=${OUTPUT}/v0_streaming_raw_loss
+RAW_LOSS=${OUTPUT}/${VARIANT}_streaming_raw_loss
 
 echo "[1/6] Freeze and verify current source/checkpoint/environment identity."
 "${OPENPI_LL_MAIN_PY}" "${OPENPI_LL_ROOT}/tools/openpi/source_lock_v2.py" create \
@@ -94,10 +99,10 @@ bash "${OPENPI_LL_ROOT}/architectures/openpi/wrappers/eval_pi05_latentloop.sh" \
   --freeze-gate "${FREEZE}/freeze_gate.json" \
   --gpu "${GPU}" --port "${PORT}"
 
-echo "[6/6] Measure untrained V0 loss on online teacher windows; write no teacher tensors."
+echo "[6/6] Measure untrained ${VARIANT^^} loss on online teacher windows; write no teacher tensors."
 CUDA_VISIBLE_DEVICES=${GPU} OPENPI_LATENTLOOP_STREAMING_RUN=1 \
-"${OPENPI_LL_MAIN_PY}" "${OPENPI_LL_ROOT}/tools/openpi/train_pi05_v0_streaming.py" \
-  --run --raw-loss-only --output "${RAW_LOSS}" \
+  "${OPENPI_LL_MAIN_PY}" "${OPENPI_LL_ROOT}/tools/openpi/train_pi05_v0_streaming.py" \
+  --run --variant "${VARIANT}" --raw-loss-only --output "${RAW_LOSS}" \
   --checkpoint "${OPENPI_LL_CHECKPOINT}" --source-lock "${LOCK}" \
   --k1-gate "${K1_GATE}" --freeze-gate "${FREEZE}/freeze_gate.json" \
   --final-evaluation-manifest "${FINAL_MANIFEST}" \
@@ -109,6 +114,6 @@ CUDA_VISIBLE_DEVICES=${GPU} OPENPI_LATENTLOOP_STREAMING_RUN=1 \
 
 "${OPENPI_LL_MAIN_PY}" "${OPENPI_LL_ROOT}/tools/openpi/source_lock_v2.py" verify \
   --lock "${LOCK}"
-printf 'STREAMING_V0_PREAPPROVAL_COMPLETE output=%s raw_loss=%s\n' \
-  "${OUTPUT}" "${RAW_LOSS}/raw_loss_calibration.json"
+printf 'STREAMING_%s_PREAPPROVAL_COMPLETE output=%s raw_loss=%s\n' \
+  "${VARIANT^^}" "${OUTPUT}" "${RAW_LOSS}/raw_loss_calibration.json"
 printf 'Persistent teacher tensor cache written: 0 bytes. Training was not started.\n'

@@ -1,4 +1,4 @@
-"""Cacheless V0 teacher windows generated online from frozen pi0.5.
+"""Cacheless V0/V1 teacher windows generated online from frozen pi0.5.
 
 Only four consecutive query states are live in an iterator. Teacher tensors are
 never serialized, and deterministic query noise matches the schema-v2 cache
@@ -16,7 +16,7 @@ import hashlib
 import json
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -30,6 +30,8 @@ from .prefix_kv_hook import PrefixKVState
 
 STREAMING_SOURCE_SCHEMA_VERSION = 1
 STREAMING_SOURCE_MODE = "online_frozen_teacher_rolling_v0"
+STREAMING_V1_SOURCE_MODE = "online_frozen_teacher_rolling_v1"
+StreamingVariant = Literal["v0", "v1"]
 
 
 @dataclass(frozen=True)
@@ -42,7 +44,7 @@ class StreamingTeacherConfig:
 
     def validate(self) -> None:
         if (self.action_horizon, self.execution_horizon, self.flow_steps) != (10, 5, 10):
-            raise ValueError("pi0.5 streaming V0 is pinned to H=10, R=5, and ten flow steps")
+            raise ValueError("pi0.5 streaming training is pinned to H=10, R=5, and ten flow steps")
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,13 @@ class StreamingEpisode:
     @property
     def identity(self) -> tuple[str, int, int]:
         return (self.suite, self.benchmark_task_index, self.episode_id)
+
+    def example_count(self, variant: StreamingVariant) -> int:
+        if variant == "v0":
+            return self.window_count
+        if variant == "v1":
+            return sum(min(3, self.query_count - start - 1) for start in range(self.query_count - 1))
+        raise ValueError(f"unsupported streaming variant: {variant}")
 
 
 def _sha256(path: str | Path) -> str:
@@ -85,7 +94,7 @@ def build_streaming_episode_plan(
         stop = int(assignment["dataset_frame_stop"])
         query_count = _expected_query_count(start, stop, execution_horizon)
         if query_count < 4:
-            raise ValueError("every streaming V0 episode must provide anchor plus ages 1,2,3")
+            raise ValueError("every streaming episode must provide anchor plus ages 1,2,3")
         episodes.append(
             StreamingEpisode(
                 suite=str(assignment["suite"]),
@@ -126,6 +135,24 @@ def iter_rolling_v0_examples(records: Iterable[dict[str, Any]]) -> Iterator[dict
             yield {"records": tuple(window), "delta_q": 3}
 
 
+def iter_rolling_v1_examples(records: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """Yield start-major delta-1/2/3 examples while retaining at most four records."""
+
+    window: deque[dict[str, Any]] = deque()
+    for record in records:
+        window.append(record)
+        if len(window) == 4:
+            snapshot = tuple(window)
+            for delta_q in (1, 2, 3):
+                yield {"records": snapshot[: delta_q + 1], "delta_q": delta_q}
+            window.popleft()
+    while len(window) >= 2:
+        snapshot = tuple(window)
+        for delta_q in range(1, len(snapshot)):
+            yield {"records": snapshot[: delta_q + 1], "delta_q": delta_q}
+        window.popleft()
+
+
 def build_streaming_provenance(
     *,
     source_lock: dict[str, Any],
@@ -135,6 +162,7 @@ def build_streaming_provenance(
     split_contract: dict[str, Any],
     split_contract_path: str | Path,
     config: StreamingTeacherConfig,
+    variant: StreamingVariant = "v0",
 ) -> dict[str, Any]:
     config.validate()
     if final_manifest.get("source_lock_id") != source_lock.get("source_lock_id"):
@@ -150,9 +178,12 @@ def build_streaming_provenance(
     for row in episodes:
         role_queries[row.role] += row.query_count
         role_windows[row.role] += row.window_count
+    if variant not in {"v0", "v1"}:
+        raise ValueError(f"unsupported streaming variant: {variant}")
+    source_mode = STREAMING_SOURCE_MODE if variant == "v0" else STREAMING_V1_SOURCE_MODE
     identity = {
         "schema_version": STREAMING_SOURCE_SCHEMA_VERSION,
-        "training_source_mode": STREAMING_SOURCE_MODE,
+        "training_source_mode": source_mode,
         "source_lock_id": source_lock["source_lock_id"],
         "checkpoint_model_sha256": source_lock["checkpoint"]["model_sha256"],
         "checkpoint_config_sha256": source_lock["checkpoint"]["config_sha256"],
@@ -165,24 +196,43 @@ def build_streaming_provenance(
         "teacher_checkpoint": str(Path(checkpoint).resolve()),
         "protocol": asdict(config),
     }
+    statistics = {
+        "episodes": len(episodes),
+        "queries": sum(row.query_count for row in episodes),
+        "episodes_by_role": dict(sorted(role_episodes.items())),
+        "queries_by_role": dict(sorted(role_queries.items())),
+    }
+    if variant == "v0":
+        statistics.update(
+            {
+                "v0_windows": sum(row.window_count for row in episodes),
+                "v0_windows_by_role": dict(sorted(role_windows.items())),
+            }
+        )
+    else:
+        examples_by_role = Counter()
+        for row in episodes:
+            examples_by_role[row.role] += row.example_count("v1")
+        statistics.update(
+            {
+                "v1_examples": sum(row.example_count("v1") for row in episodes),
+                "v1_examples_by_role": dict(sorted(examples_by_role.items())),
+                "v1_delta_q": [1, 2, 3],
+            }
+        )
     return {
         **identity,
         "training_source_id": _canonical_hash(identity),
+        "variant": variant,
+        "base_checkpoint": str(Path(checkpoint).resolve()),
         "persistent_teacher_tensor_bytes": 0,
         "rolling_window_teacher_records": 4,
         "maximum_transient_teacher_records_per_active_iterator": 5,
         "maximum_concurrent_iterators_during_training_validation": 2,
         "maximum_transient_teacher_records_in_trainer": 10,
-        "teacher_tensor_lifetime": "one rolling V0 window; discarded after iterator advance",
+        "teacher_tensor_lifetime": "one rolling four-query window; discarded after iterator advance",
         "episode_order": "deterministic SHA256 permutation per epoch",
-        "statistics": {
-            "episodes": len(episodes),
-            "queries": sum(row.query_count for row in episodes),
-            "v0_windows": sum(row.window_count for row in episodes),
-            "episodes_by_role": dict(sorted(role_episodes.items())),
-            "queries_by_role": dict(sorted(role_queries.items())),
-            "v0_windows_by_role": dict(sorted(role_windows.items())),
-        },
+        "statistics": statistics,
     }
 
 
@@ -216,8 +266,8 @@ def _training_state_payload(state: PrefixKVState) -> dict[str, torch.Tensor]:
     }
 
 
-class OnlineV0TeacherSource:
-    """Generate exact frozen-teacher V0 windows without persistent tensor files."""
+class OnlineStreamingTeacherSource:
+    """Generate exact frozen-teacher V0/V1 examples without persistent tensor files."""
 
     def __init__(
         self,
@@ -232,13 +282,17 @@ class OnlineV0TeacherSource:
         split_contract_path: str | Path,
         config: StreamingTeacherConfig,
         device: str | torch.device,
+        variant: StreamingVariant = "v0",
     ) -> None:
         config.validate()
+        if variant not in {"v0", "v1"}:
+            raise ValueError(f"unsupported streaming variant: {variant}")
         self.policy = policy
         self.model = policy._model  # noqa: SLF001
         self.dataset = dataset
         self.device = torch.device(device)
         self.config = config
+        self.variant = variant
         self.final_manifest = final_manifest
         self.episodes = build_streaming_episode_plan(split_contract, execution_horizon=config.execution_horizon)
         self._episodes_by_role = {
@@ -255,6 +309,7 @@ class OnlineV0TeacherSource:
             split_contract=split_contract,
             split_contract_path=split_contract_path,
             config=config,
+            variant=variant,
         )
         self.hook = PrefixKVHook(self.model)
         base_dataset = getattr(dataset, "_dataset", dataset)
@@ -277,7 +332,8 @@ class OnlineV0TeacherSource:
         split_contract_path: str | Path,
         config: StreamingTeacherConfig,
         device: str | torch.device,
-    ) -> OnlineV0TeacherSource:
+        variant: StreamingVariant = "v0",
+    ) -> OnlineStreamingTeacherSource:
         from openpi.training import config as config_api
         from openpi.training import data_loader
 
@@ -295,6 +351,7 @@ class OnlineV0TeacherSource:
             split_contract_path=split_contract_path,
             config=config,
             device=device,
+            variant=variant,
         )
 
     def _verify_dataset_frame_contract(self) -> None:
@@ -373,13 +430,22 @@ class OnlineV0TeacherSource:
     def _iter_episode(self, row: StreamingEpisode) -> Iterator[dict[str, Any]]:
         records = (self._materialize_record(row, query) for query in range(row.query_count))
         yielded = 0
-        for example in iter_rolling_v0_examples(records):
+        iterator = (
+            iter_rolling_v0_examples(records)
+            if self.variant == "v0"
+            else iter_rolling_v1_examples(records)
+        )
+        counter = "v0_windows" if self.variant == "v0" else "v1_examples"
+        for example in iterator:
             yielded += 1
-            self._counters["v0_windows_yielded"] += 1
-            self._counters[f"v0_windows_{row.role}"] += 1
+            self._counters[f"{counter}_yielded"] += 1
+            self._counters[f"{counter}_{row.role}"] += 1
             yield example
-        if yielded != row.window_count:
-            raise RuntimeError(f"streaming V0 window count differs from plan: {row.identity}")
+        expected = row.example_count(self.variant)
+        if yielded != expected:
+            raise RuntimeError(
+                f"streaming {self.variant.upper()} example count differs from plan: {row.identity}"
+            )
 
     def iter_train_examples(self) -> Iterator[dict[str, Any]]:
         epoch = 0
@@ -417,3 +483,7 @@ class OnlineV0TeacherSource:
             "counters": dict(sorted(self._counters.items())),
             "timing_seconds": dict(sorted(self._timing_seconds.items())),
         }
+
+
+# Historical import kept so completed V0 launchers and reports remain readable.
+OnlineV0TeacherSource = OnlineStreamingTeacherSource
