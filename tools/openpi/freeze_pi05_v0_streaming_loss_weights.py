@@ -92,6 +92,7 @@ def main() -> None:
         "source_lock_id": verified["source_lock_id"],
         "training_source_mode": provenance["training_source_mode"],
         "training_source_id": provenance["training_source_id"],
+        "action_execution_mode": raw.get("action_execution_mode", "A"),
         "raw_loss_calibration": str(raw_path),
         "raw_loss_calibration_sha256": _sha256(raw_path),
         "raw_loss_calibration_id": raw["raw_loss_calibration_id"],

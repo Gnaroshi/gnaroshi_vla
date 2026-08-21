@@ -8,15 +8,20 @@ OUTPUT=
 GPU=4
 PORT=8161
 RAW_LOSS_EXAMPLES=32
+ACTION_EXECUTION_MODE=A
 while (($#)); do
   case "$1" in
     --output) OUTPUT=$2; shift 2 ;;
     --gpu) GPU=$2; shift 2 ;;
     --port) PORT=$2; shift 2 ;;
     --raw-loss-examples) RAW_LOSS_EXAMPLES=$2; shift 2 ;;
+    --action-execution-mode) ACTION_EXECUTION_MODE=$2; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+[[ "${ACTION_EXECUTION_MODE}" == "A" || "${ACTION_EXECUTION_MODE}" == "B" ]] || {
+  echo "--action-execution-mode must be A or B" >&2; exit 2;
+}
 
 : "${OUTPUT:?--output is required}"
 OUTPUT=$(realpath -m -- "${OUTPUT}")
@@ -87,6 +92,7 @@ CUDA_VISIBLE_DEVICES=${GPU} OPENPI_LATENTLOOP_STREAMING_RUN=1 \
   --final-evaluation-manifest "${FINAL_MANIFEST}" \
   --split-contract "${SPLIT_CONTRACT}" \
   --raw-loss-examples "${RAW_LOSS_EXAMPLES}" --validation-examples 32 \
+  --action-execution-mode "${ACTION_EXECUTION_MODE}" \
   --max-steps 1 --seed 42 --noise-seed-base 20260820 \
   --wandb-mode disabled --device cuda
 

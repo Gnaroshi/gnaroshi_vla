@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--validation-interval", type=int, default=1000)
     parser.add_argument("--validation-examples", type=int, default=32)
+    parser.add_argument("--action-execution-mode", choices=("A", "B"), default="A")
     parser.add_argument("--save-interval", type=int, default=5000)
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--wandb-log-interval", type=int, default=100)
@@ -112,6 +113,7 @@ def main() -> None:
         if (
             loss_payload.get("V0_STREAMING_LOSS_WEIGHTS_APPROVED") is not True
             or loss_payload.get("training_source_id") != example_source.provenance["training_source_id"]
+            or loss_payload.get("action_execution_mode", "A") != args.action_execution_mode
         ):
             raise RuntimeError("streaming V0 loss weights are absent, stale, or for another source")
         approved_weights = loss_payload["weights"]
@@ -131,6 +133,7 @@ def main() -> None:
         max_grad_norm=args.max_grad_norm,
         validation_interval=args.validation_interval,
         validation_examples=args.validation_examples,
+        action_execution_mode=args.action_execution_mode,
         save_interval=args.save_interval,
         seed=args.seed,
         num_workers=0,

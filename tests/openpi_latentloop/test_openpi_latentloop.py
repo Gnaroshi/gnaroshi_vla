@@ -15,6 +15,7 @@ from architectures.openpi.adapters.latentloop.prefix_kv_hook import (
     PrefixKVHook,
     PrefixKVState,
     apply_rope_to_keys,
+    stack_prefix_kv_states,
 )
 from architectures.openpi.adapters.latentloop.recurrent_policy import OpenPILatentLoopPolicy
 from architectures.openpi.adapters.latentloop.serialization import (
@@ -23,7 +24,11 @@ from architectures.openpi.adapters.latentloop.serialization import (
     prefix_state_from_record,
     prefix_state_to_dict,
 )
-from architectures.openpi.adapters.latentloop.trainer import freeze_base_model, optimizer_parameter_names
+from architectures.openpi.adapters.latentloop.trainer import (
+    freeze_base_model,
+    optimizer_parameter_names,
+    sample_v0_actions_by_age,
+)
 from architectures.openpi.adapters.latentloop.transition_core import (
     OpenPIKVLatentLoop,
     OpenPIKVLatentLoopConfig,
@@ -156,6 +161,58 @@ def test_prefix_state_device_move_and_serialization():
     record = prefix_state_to_dict(state)
     rebuilt = prefix_state_from_record(record, "cpu")
     assert torch.equal(rebuilt.pre_rope_keys[1], state.pre_rope_keys[1])
+
+
+def test_mode_b_stacks_all_ages_without_changing_per_age_actions():
+    states = [_state() for _ in range(3)]
+    for age, state in enumerate(states, start=1):
+        state.pre_rope_keys[0].fill_(float(age))
+    stacked = stack_prefix_kv_states(states)
+    assert stacked.embeddings.shape[0] == 3
+    assert [float(value.mean()) for value in stacked.pre_rope_keys[0].split(1)] == [
+        1.0,
+        2.0,
+        3.0,
+    ]
+
+    class Hook:
+        def __init__(self):
+            self.calls = 0
+
+        def sample_actions_from_state(self, state, robot_state, noise, *, num_steps):
+            assert num_steps == 10
+            self.calls += 1
+            bias = state.pre_rope_keys[0].mean(dim=(1, 2, 3)).view(-1, 1, 1)
+            return noise + robot_state[:, :1, None] + bias, {
+                "cache_rebuild_ms": 1.0,
+                "action_expert_ms": 2.0,
+            }
+
+    outputs = [
+        SimpleNamespace(
+            transition=SimpleNamespace(state=state),
+            action_noise=torch.zeros(1, 10, 32),
+        )
+        for state in states
+    ]
+    steps = [
+        SimpleNamespace(robot_state=torch.full((1, 4), float(age)))
+        for age in range(1, 4)
+    ]
+    hook_a = Hook()
+    action_a, timing_a, calls_a = sample_v0_actions_by_age(
+        hook=hook_a, outputs=outputs, steps=steps, mode="A"
+    )
+    hook_b = Hook()
+    action_b, timing_b, calls_b = sample_v0_actions_by_age(
+        hook=hook_b, outputs=outputs, steps=steps, mode="B"
+    )
+    assert calls_a == hook_a.calls == 3
+    assert calls_b == hook_b.calls == 1
+    assert timing_a == {"cache_rebuild_ms": 3.0, "action_expert_ms": 6.0}
+    assert timing_b == {"cache_rebuild_ms": 1.0, "action_expert_ms": 2.0}
+    for sequential, batched in zip(action_a, action_b, strict=True):
+        torch.testing.assert_close(sequential, batched)
 
 
 def test_horizon_and_execution_semantics_are_pinned():

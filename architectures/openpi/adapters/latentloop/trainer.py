@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from .cache_dataset import LatentLoopSequenceDataset
 from .losses import LossWeights, action_losses, composition_loss, normalized_kv_loss, weighted_v0_loss
-from .prefix_kv_hook import PrefixKVHook
+from .prefix_kv_hook import PrefixKVHook, stack_prefix_kv_states
 from .serialization import adapter_checkpoint_config, prefix_embedding_from_record, prefix_state_from_record
 from .v0_recursive_unroll import V0AgeInput, recursive_v0_unroll
 
@@ -38,6 +38,7 @@ class TrainerConfig:
     execution_horizon: int = 5
     action_horizon: int = 10
     validation_examples: int | None = None
+    action_execution_mode: Literal["A", "B"] = "A"
 
 
 class LatentLoopExampleSource(Protocol):
@@ -75,6 +76,43 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sample_v0_actions_by_age(
+    *,
+    hook: Any,
+    outputs: list[Any],
+    steps: list[V0AgeInput],
+    mode: Literal["A", "B"],
+) -> tuple[list[Tensor], dict[str, float], int]:
+    """Evaluate the same all-age action objective sequentially or as one batch."""
+
+    if len(outputs) != len(steps) or not outputs:
+        raise ValueError("V0 outputs and age inputs must be nonempty and aligned")
+    if mode == "B":
+        batch_sizes = [output.transition.state.embeddings.shape[0] for output in outputs]
+        predicted_batch, timing = hook.sample_actions_from_state(
+            stack_prefix_kv_states([output.transition.state for output in outputs]),
+            torch.cat([step.robot_state for step in steps], dim=0),
+            torch.cat([output.action_noise for output in outputs], dim=0),
+            num_steps=10,
+        )
+        return list(predicted_batch.split(batch_sizes, dim=0)), timing, 1
+    if mode != "A":
+        raise ValueError("action execution mode must be A or B")
+    predicted_by_age = []
+    total_timing = {"cache_rebuild_ms": 0.0, "action_expert_ms": 0.0}
+    for output, step in zip(outputs, steps, strict=True):
+        predicted, timing = hook.sample_actions_from_state(
+            output.transition.state,
+            step.robot_state,
+            output.action_noise,
+            num_steps=10,
+        )
+        predicted_by_age.append(predicted)
+        for name in total_timing:
+            total_timing[name] += timing[name]
+    return predicted_by_age, total_timing, len(outputs)
+
+
 class LatentLoopTrainer:
     def __init__(
         self,
@@ -100,6 +138,10 @@ class LatentLoopTrainer:
             raise FileExistsError(f"refusing to overwrite or reuse training root: {self.output}")
         self.output.mkdir(parents=True, exist_ok=True)
         self.config = config
+        if config.action_execution_mode not in {"A", "B"}:
+            raise ValueError("action_execution_mode must be A or B")
+        if config.variant != "v0" and config.action_execution_mode != "A":
+            raise ValueError("batched action execution is currently valid only for V0")
         self.weights = weights
         self.device = torch.device(device)
         self.wandb_run = wandb_run
@@ -365,13 +407,13 @@ class LatentLoopTrainer:
         losses: list[Tensor] = []
         metrics: dict[str, float] = {}
         executed_metrics: list[Tensor] = []
-        for output, step in zip(outputs, steps, strict=True):
-            predicted_actions, _ = self.hook.sample_actions_from_state(
-                output.transition.state,
-                step.robot_state,
-                output.action_noise,
-                num_steps=10,
-            )
+        predicted_by_age, action_timing, action_expert_calls = sample_v0_actions_by_age(
+            hook=self.hook,
+            outputs=outputs,
+            steps=steps,
+            mode=self.config.action_execution_mode,
+        )
+        for output, step, predicted_actions in zip(outputs, steps, predicted_by_age, strict=True):
             state_loss = normalized_kv_loss(
                 self.adapter.codec,
                 output.transition.state,
@@ -390,6 +432,10 @@ class LatentLoopTrainer:
             metrics[f"age{output.age}_consumed_predicted_previous"] = float(
                 output.consumed_predicted_previous
             )
+        metrics["action_expert_calls"] = float(action_expert_calls)
+        metrics["cache_rebuild_calls"] = float(action_expert_calls)
+        metrics["cache_rebuild_ms"] = float(action_timing["cache_rebuild_ms"])
+        metrics["action_expert_ms"] = float(action_timing["action_expert_ms"])
         total = torch.stack(losses).mean()
         first_r = torch.stack(executed_metrics).mean()
         metrics["direct_executed"] = float(first_r.detach().item())
@@ -433,6 +479,7 @@ class LatentLoopTrainer:
                 ["V0_RAW_LOSS_CALIBRATION_COMPLETE"] if self.config.variant == "v0" else []
             ),
             "variant": self.config.variant,
+            "action_execution_mode": self.config.action_execution_mode,
             "examples": examples,
             "adapter_state": "deterministically initialized, untrained",
             "adapter_trainable_parameters": self.adapter.trainable_parameters,
@@ -540,6 +587,7 @@ class LatentLoopTrainer:
             "best_step": best_step,
             "best_validation_first_r_action_mse": best_executed,
             "adapter_trainable_parameters": self.adapter.trainable_parameters,
+            "action_execution_mode": self.config.action_execution_mode,
             "source_lock_id": self.provenance["source_lock_id"],
             "training_source_mode": self.provenance["training_source_mode"],
             "training_source_id": self.provenance["training_source_id"],

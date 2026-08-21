@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import hashlib
@@ -120,6 +121,42 @@ class PrefixKVState(PrefixEmbeddingState):
             pre_rope_keys=tuple(value.to(*args, **kwargs) for value in self.pre_rope_keys),
             values=tuple(value.to(*args, **kwargs) for value in self.values),
         )
+
+
+def stack_prefix_kv_states(states: Sequence[PrefixKVState]) -> PrefixKVState:
+    """Stack aligned prefix states along batch for exact action-head batching."""
+
+    if not states:
+        raise ValueError("cannot stack an empty prefix-state sequence")
+    reference = states[0]
+    reference.validate()
+    for state in states[1:]:
+        state.validate()
+        if state.num_tokens != reference.num_tokens or state.num_layers != reference.num_layers:
+            raise ValueError("batched prefix states must have aligned token and layer counts")
+        if state.embeddings.shape[2:] != reference.embeddings.shape[2:]:
+            raise ValueError("batched prefix states must have aligned embedding shapes")
+        for layer in range(reference.num_layers):
+            if state.pre_rope_keys[layer].shape[1:] != reference.pre_rope_keys[layer].shape[1:]:
+                raise ValueError("batched prefix states must have aligned key shapes")
+            if state.values[layer].shape[1:] != reference.values[layer].shape[1:]:
+                raise ValueError("batched prefix states must have aligned value shapes")
+    result = PrefixKVState(
+        embeddings=torch.cat([state.embeddings for state in states], dim=0),
+        pad_mask=torch.cat([state.pad_mask for state in states], dim=0),
+        attention_pattern=torch.cat([state.attention_pattern for state in states], dim=0),
+        position_ids=torch.cat([state.position_ids for state in states], dim=0),
+        pre_rope_keys=tuple(
+            torch.cat([state.pre_rope_keys[layer] for state in states], dim=0)
+            for layer in range(reference.num_layers)
+        ),
+        values=tuple(
+            torch.cat([state.values[layer] for state in states], dim=0)
+            for layer in range(reference.num_layers)
+        ),
+    )
+    result.validate()
+    return result
 
 
 @dataclass(frozen=True)

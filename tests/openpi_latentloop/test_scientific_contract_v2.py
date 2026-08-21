@@ -466,6 +466,7 @@ def test_streaming_v0_stages_and_wrappers_do_not_require_a_tensor_cache():
     assert "FULL_CACHE_SCHEMA_V2_PASS" not in acceptance
     assert "--raw-loss-only" in acceptance
     assert "--cache" not in training
+    assert "--action-execution-mode" in training
     assert "validate_pi05_cache_v2" not in cli
 
 
