@@ -120,25 +120,33 @@ for index in "${!SUITES[@]}"; do
   echo "LAUNCHED suite=${suite} gpu=${gpu} port=${port} pid=${pid}"
 done
 
-progress_count() {
+progress_counts() {
   local log=$1
+  local completed successes
   if [[ -f "${log}" ]]; then
-    grep -c '"success":' "${log}" 2>/dev/null || true
+    completed=$(grep -c '"success":' "${log}" 2>/dev/null || true)
+    successes=$(grep -c '"success": true' "${log}" 2>/dev/null || true)
+    printf '%s %s\n' "${successes:-0}" "${completed:-0}"
   else
-    printf '0\n'
+    printf '0 0\n'
   fi
 }
 monitor_progress() {
-  local active index suite v0_count original_count
+  local active index suite
+  local v0_success v0_count original_success original_count
   while :; do
     active=0
     for index in "${!pids[@]}"; do
       kill -0 "${pids[${index}]}" 2>/dev/null && active=1
       suite=${SUITES[${index}]}
-      v0_count=$(progress_count "${OUTPUT}/${suite}/v0_client.log")
-      original_count=$(progress_count "${OUTPUT}/${suite}/original_client.log")
-      printf 'PROGRESS suite=%s gpu=%s v0=%s/500 original=%s/500\n' \
-        "${suite}" "${GPUS[${index}]}" "${v0_count}" "${original_count}"
+      read -r v0_success v0_count \
+        < <(progress_counts "${OUTPUT}/${suite}/v0_client.log")
+      read -r original_success original_count \
+        < <(progress_counts "${OUTPUT}/${suite}/original_client.log")
+      printf '%s\n' \
+        "PROGRESS suite=${suite} gpu=${GPUS[${index}]}" \
+        "  v0_success=${v0_success}/${v0_count} v0_progress=${v0_count}/500" \
+        "  original_success=${original_success}/${original_count} original_progress=${original_count}/500"
     done
     ((active)) || return 0
     sleep 60
