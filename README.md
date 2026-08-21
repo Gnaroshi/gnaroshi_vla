@@ -27,13 +27,14 @@ architecture-specific adapters.
 
 ### Seer
 
-- Source baseline: `$SEER_WORKSPACE_ROOT`
 - Integrated copy: `architectures/seer/upstream/`
 - Known working environment: `conda activate seer_libero`
-- Method currently mixed into the Seer copy: LR-NODE
+- Integrated method: LR-NODE
 
-`seer_node3` was treated as a known-working baseline asset. It was copied, not
-renamed or modified.
+The initial Seer integration was based on a known-working Seer workspace.
+Subsequent LR-NODE training, checkpoint-contract validation, and instrumented
+evaluation changes are versioned directly in this repository. See
+[`docs/seer/lrnode.md`](docs/seer/lrnode.md) for the public workflow.
 
 ### SimVLA
 

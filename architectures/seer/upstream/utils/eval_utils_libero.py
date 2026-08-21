@@ -8,6 +8,7 @@ os.environ['MUJOCO_GL'] = 'osmesa'
 
 from pathlib import Path
 import copy
+import fcntl
 import io
 import distutils.dir_util
 import json
@@ -64,6 +65,126 @@ def _is_rank0() -> bool:
         return (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)
     except Exception:
         return True
+
+
+def _atomic_write_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _write_live_eval_progress(
+    args,
+    local_results,
+    local_eval_ids,
+    total_sequences: int,
+    local_assigned: int,
+    last_eval_id: int,
+) -> None:
+    """Persist asynchronous completed-episode SR without synchronizing DDP ranks."""
+    log_dir = os.environ.get("LOG_DIR")
+    if not log_dir:
+        return
+
+    try:
+        rank = int(torch.distributed.get_rank()) if torch.distributed.is_initialized() else 0
+        world_size = int(torch.distributed.get_world_size()) if torch.distributed.is_initialized() else 1
+        analysis_dir = Path(log_dir) / "analysis"
+        task_progress = {}
+        for eval_id, success in zip(local_eval_ids, local_results):
+            task_id = int(eval_id) // int(num_eval_episodes)
+            item = task_progress.setdefault(str(task_id), {"completed": 0, "successes": 0})
+            item["completed"] += 1
+            item["successes"] += int(bool(success))
+
+        local_completed = len(local_results)
+        local_successes = sum(int(bool(value)) for value in local_results)
+        rank_payload = {
+            "schema_version": 1,
+            "status": "rank_complete" if local_completed == local_assigned else "running",
+            "run_name": str(getattr(args, "run_name", os.environ.get("RUN_NAME", ""))),
+            "checkpoint_tag": os.environ.get("CKPT_TAG", ""),
+            "rank": rank,
+            "world_size": world_size,
+            "total_sequences": int(total_sequences),
+            "local_assigned": int(local_assigned),
+            "local_completed": local_completed,
+            "local_successes": local_successes,
+            "local_completed_success_rate": (
+                float(local_successes) / local_completed if local_completed else 0.0
+            ),
+            "last_eval_id": int(last_eval_id),
+            "last_task_id": int(last_eval_id) // int(num_eval_episodes),
+            "last_episode_id": int(last_eval_id) % int(num_eval_episodes),
+            "last_success": bool(local_results[-1]),
+            "task_progress": task_progress,
+            "updated_at_unix_s": time.time(),
+        }
+        rank_path = analysis_dir / f"eval_progress_rank{rank}.json"
+        _atomic_write_json(rank_path, rank_payload)
+
+        # File locking avoids competing aggregate writers while keeping the
+        # policy evaluation itself free of per-episode DDP collectives.
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = analysis_dir / ".eval_progress.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            rank_payloads = []
+            for rank_id in range(world_size):
+                path = analysis_dir / f"eval_progress_rank{rank_id}.json"
+                if not path.is_file():
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if int(payload.get("total_sequences", -1)) != int(total_sequences):
+                    continue
+                rank_payloads.append(payload)
+
+            completed = sum(int(item["local_completed"]) for item in rank_payloads)
+            successes = sum(int(item["local_successes"]) for item in rank_payloads)
+            aggregate_tasks = {}
+            for payload in rank_payloads:
+                for task_id, item in payload.get("task_progress", {}).items():
+                    target = aggregate_tasks.setdefault(task_id, {"completed": 0, "successes": 0})
+                    target["completed"] += int(item["completed"])
+                    target["successes"] += int(item["successes"])
+            for item in aggregate_tasks.values():
+                item["completed_success_rate"] = (
+                    float(item["successes"]) / item["completed"] if item["completed"] else 0.0
+                )
+
+            aggregate = {
+                "schema_version": 1,
+                "status": "complete" if completed == int(total_sequences) else "running",
+                "metric_scope": "completed_episodes_only",
+                "total_sequences": int(total_sequences),
+                "completed": completed,
+                "successes": successes,
+                "completed_success_rate": float(successes) / completed if completed else 0.0,
+                "ranks_reporting": len(rank_payloads),
+                "world_size": world_size,
+                "task_progress": aggregate_tasks,
+                "updated_at_unix_s": time.time(),
+            }
+            _atomic_write_json(analysis_dir / "eval_progress.json", aggregate)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+        print(
+            f"[EVAL PROGRESS] completed={completed}/{total_sequences} "
+            f"successes={successes} completed_sr={100.0 * aggregate['completed_success_rate']:.2f}% "
+            f"ranks={len(rank_payloads)}/{world_size} last_rank={rank} "
+            f"last_task={rank_payload['last_task_id']} last_episode={rank_payload['last_episode_id']} "
+            f"last_success={int(rank_payload['last_success'])}",
+            flush=True,
+        )
+    except Exception as exc:
+        # Progress reporting must never invalidate an otherwise valid rollout.
+        print(f"[EVAL PROGRESS][WARN] failed to update live progress: {exc}", flush=True)
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -141,7 +262,10 @@ class ModelWrapper:
                  use_ensembling=False, ensembling_temp=0.01, libero_eval_max_steps=600, action_pred_steps=3,
                  gripper_width=False, use_lrnode_latent_update=0, lrnode_eval_skip_full_forward=0,
                  lrnode_query_interval=1, lrnode_eval_step_log=0, lrnode_eval_shadow_full_forward=0,
-                 lrnode_eval_refresh_policy="periodic", lrnode_eval_max_full_forwards_per_episode=1):
+                 lrnode_eval_profile_full_action_head=0,
+                 lrnode_eval_refresh_policy="periodic", lrnode_eval_max_full_forwards_per_episode=1,
+                 lrnode_eval_ablation_mode="stepwise", lrnode_no_delta_mode="zero",
+                 lrnode_chunk_token_policy="skip_only"):
         super().__init__()
         self.model = model
         self.cast_type = cast_dtype
@@ -167,21 +291,54 @@ class ModelWrapper:
         self.lrnode_query_interval = max(1, int(lrnode_query_interval))
         self.lrnode_eval_step_log = bool(lrnode_eval_step_log)
         self.lrnode_eval_shadow_full_forward = bool(lrnode_eval_shadow_full_forward)
+        self.lrnode_eval_profile_full_action_head = bool(lrnode_eval_profile_full_action_head)
         self.lrnode_eval_refresh_policy = str(lrnode_eval_refresh_policy)
         if self.lrnode_eval_refresh_policy not in {"periodic", "first_only", "fixed_budget"}:
             raise ValueError(f"Unknown lrnode_eval_refresh_policy={self.lrnode_eval_refresh_policy}")
         self.lrnode_eval_max_full_forwards_per_episode = max(
             1, int(lrnode_eval_max_full_forwards_per_episode)
         )
+        self.lrnode_eval_ablation_mode = str(lrnode_eval_ablation_mode)
+        valid_ablation_modes = {"stepwise", "hold_action", "hold_latent", "seer_token_chunk", "no_delta"}
+        if self.lrnode_eval_ablation_mode not in valid_ablation_modes:
+            raise ValueError(
+                f"Unknown lrnode_eval_ablation_mode={self.lrnode_eval_ablation_mode}; "
+                f"expected one of {sorted(valid_ablation_modes)}"
+            )
+        self.lrnode_no_delta_mode = str(lrnode_no_delta_mode)
+        if self.lrnode_no_delta_mode not in {"zero", "learned_constant", "previous"}:
+            raise ValueError(f"Unknown lrnode_no_delta_mode={self.lrnode_no_delta_mode}")
+        if self.lrnode_eval_ablation_mode == "no_delta" and self.lrnode_no_delta_mode != "zero":
+            raise NotImplementedError(
+                "lrnode_eval_ablation_mode=no_delta currently implements only "
+                "lrnode_no_delta_mode=zero"
+            )
+        self.lrnode_chunk_token_policy = str(lrnode_chunk_token_policy)
+        if self.lrnode_chunk_token_policy != "skip_only":
+            raise NotImplementedError(
+                "Only lrnode_chunk_token_policy=skip_only is implemented for "
+                "seer_token_chunk ablation"
+            )
         self.lrnode_episode_full_forward_calls = 0
         self.lrnode_cached_latent = None
         self.lrnode_cached_image_primary = None
         self.lrnode_cached_image_wrist = None
         self.lrnode_cached_state = None
+        self.lrnode_cached_action_tokens = None
+        self.lrnode_cached_env_action = None
         self.lrnode_cached_age = 0
+        self.lrnode_last_full_timestep = None
         self.full_forward_calls = 0
         self.lrnode_update_calls = 0
+        self.fast_encoder_calls = 0
+        self.action_head_calls = 0
+        self.hold_action_steps = 0
+        self.hold_latent_steps = 0
+        self.chunk_token_steps = 0
+        self.no_delta_steps = 0
         self.full_forward_latency_sum = 0.0
+        self.full_action_head_latency_sum = 0.0
+        self.full_non_action_head_latency_sum = 0.0
         self.lrnode_latency_sum = 0.0
         self.fast_encoder_latency_sum = 0.0
         self.node_update_latency_sum = 0.0
@@ -202,6 +359,7 @@ class ModelWrapper:
         self.current_episode_start_time = None
         self.last_action = None
         self.last_action_delta = None
+        setattr(self._base_model(), "profile_full_action_head", self.lrnode_eval_profile_full_action_head)
         if self.lrnode_eval_skip_full_forward:
             base_model = self._base_model()
             if not getattr(base_model, "use_lrnode_latent_update", False):
@@ -227,7 +385,10 @@ class ModelWrapper:
         self.lrnode_cached_image_primary = None
         self.lrnode_cached_image_wrist = None
         self.lrnode_cached_state = None
+        self.lrnode_cached_action_tokens = None
+        self.lrnode_cached_env_action = None
         self.lrnode_cached_age = 0
+        self.lrnode_last_full_timestep = None
         self.lrnode_episode_full_forward_calls = 0
         self.current_step_records = []
         self.current_episode_start_time = time.perf_counter()
@@ -280,6 +441,20 @@ class ModelWrapper:
             raise RuntimeError(f"LIBERO action must have shape (7,), got {action.shape}")
         return action
 
+    def _raw_action_token_to_env_action(self, action_token):
+        if action_token.dim() == 3:
+            if action_token.shape[0] != 1 or action_token.shape[1] != 1 or action_token.shape[-1] != 7:
+                raise RuntimeError(f"Expected action token [1, 1, 7], got {tuple(action_token.shape)}")
+            action_token = action_token[:, 0]
+        if action_token.dim() != 2 or action_token.shape[0] != 1 or action_token.shape[-1] != 7:
+            raise RuntimeError(f"Expected action token [1, 7], got {tuple(action_token.shape)}")
+        action = torch.concat((action_token[:, :6], action_token[:, 6:] > 0.5), dim=-1)
+        action[:, -1] = (action[:, -1] - 0.5) * 2
+        action = action.detach().cpu().numpy()[-1]
+        if action.shape != (7,):
+            raise RuntimeError(f"LIBERO action must have shape (7,), got {action.shape}")
+        return action
+
     def _should_use_lrnode(self, timestep):
         if not (
             self.use_lrnode_latent_update
@@ -313,36 +488,82 @@ class ModelWrapper:
             return "scheduled_fixed_budget"
         return "forced_full"
 
-    def _cache_full_forward_state(self, action_latent, selected_step, image_x, gripper, state):
+    def _cache_full_forward_state(
+        self,
+        action_latent,
+        selected_step,
+        image_x,
+        gripper,
+        state,
+        action_tokens=None,
+        timestep=None,
+    ):
         if not self.use_lrnode_latent_update:
             return
         if action_latent is None or action_latent.dim() != 4:
             raise RuntimeError(f"Expected full action latent [B, S, action_pred_steps, D], got {type(action_latent)}")
-        self.lrnode_cached_latent = action_latent[:, selected_step].detach()
+        if action_tokens is not None:
+            if action_tokens.dim() != 3 or action_tokens.shape[0] != 1 or action_tokens.shape[-1] != 7:
+                raise RuntimeError(f"Expected cached action tokens [1, action_pred_steps, 7], got {tuple(action_tokens.shape)}")
+            self.lrnode_cached_action_tokens = action_tokens.detach()
         self.lrnode_cached_image_primary = image_x.detach()
         self.lrnode_cached_image_wrist = gripper.detach()
         self.lrnode_cached_state = state.detach()
+        self.lrnode_cached_latent = action_latent[:, selected_step].detach()
         self.lrnode_cached_age = 0
+        self.lrnode_last_full_timestep = int(timestep) if timestep is not None else None
 
-    def _update_from_lrnode_cache(self, image_x, gripper, state):
+    def _cache_executed_env_action(self, action):
+        if self.use_lrnode_latent_update:
+            self.lrnode_cached_env_action = np.asarray(action, dtype=np.float32).copy()
+
+    def _zero_u_delta_like_latent(self, z_prev):
+        base_model = self._base_model()
+        motion_dim = int(getattr(base_model, "lrnode_motion_dim", 0))
+        if motion_dim <= 0:
+            raise RuntimeError("Cannot infer LR-NODE motion dimension for no_delta ablation")
+        if z_prev.dim() >= 3 and z_prev.shape[-2] == self.action_pred_steps:
+            leading_shape = tuple(z_prev.shape[:-2])
+        else:
+            leading_shape = tuple(z_prev.shape[:-1])
+        return torch.zeros(
+            leading_shape + (motion_dim,),
+            device=z_prev.device,
+            dtype=z_prev.dtype,
+        )
+
+    def _update_from_lrnode_cache(
+        self,
+        image_x,
+        gripper,
+        state,
+        use_zero_delta=False,
+        compute_hold_action=False,
+    ):
         base_model = self._base_model()
         if self.lrnode_cached_latent is None:
             raise RuntimeError("LR-NODE skip requested before a full-forward latent was cached")
 
         age = self.lrnode_cached_age + 1
         z_prev = self.lrnode_cached_latent
-        self._sync_cuda()
-        t_fast = time.perf_counter()
-        u_delta = base_model.lrnode_encode_delta(
-            key_image_primary=self.lrnode_cached_image_primary[:, 0],
-            key_image_wrist=self.lrnode_cached_image_wrist[:, 0],
-            cur_image_primary=image_x[:, 0],
-            cur_image_wrist=gripper[:, 0],
-            q_key=self.lrnode_cached_state[:, 0],
-            q_cur=state[:, 0],
-        )
-        self._sync_cuda()
-        fast_encoder_ms = (time.perf_counter() - t_fast) * 1000.0
+        if use_zero_delta:
+            u_delta = self._zero_u_delta_like_latent(z_prev)
+            fast_encoder_ms = 0.0
+            fast_encoder_called = 0
+        else:
+            self._sync_cuda()
+            t_fast = time.perf_counter()
+            u_delta = base_model.lrnode_encode_delta(
+                key_image_primary=self.lrnode_cached_image_primary[:, 0],
+                key_image_wrist=self.lrnode_cached_image_wrist[:, 0],
+                cur_image_primary=image_x[:, 0],
+                cur_image_wrist=gripper[:, 0],
+                q_key=self.lrnode_cached_state[:, 0],
+                q_cur=state[:, 0],
+            )
+            self._sync_cuda()
+            fast_encoder_ms = (time.perf_counter() - t_fast) * 1000.0
+            fast_encoder_called = 1
 
         self._sync_cuda()
         t_node = time.perf_counter()
@@ -358,19 +579,25 @@ class ModelWrapper:
         self._sync_cuda()
         t_head = time.perf_counter()
         arm_action, gripper_action = base_model.decode_action_from_latent(z_next)
-        with torch.no_grad():
-            hold_arm_action, hold_gripper_action = base_model.decode_action_from_latent(z_prev.detach())
         self._sync_cuda()
         action_head_ms = (time.perf_counter() - t_head) * 1000.0
 
         action_seq = torch.concat((arm_action, gripper_action), dim=-1)
-        hold_action_seq = torch.concat((hold_arm_action, hold_gripper_action), dim=-1)
+        hold_action_seq = None
+        if compute_hold_action:
+            with torch.no_grad():
+                hold_arm_action, hold_gripper_action = base_model.decode_action_from_latent(z_prev.detach())
+            hold_action_seq = torch.concat((hold_arm_action, hold_gripper_action), dim=-1)
         update = getattr(base_model.lrnode_dynamics, "last_update", None)
         gate = getattr(base_model.lrnode_dynamics, "last_gate", None)
         imgdiff_primary = (image_x[:, 0].detach().float() - self.lrnode_cached_image_primary[:, 0].detach().float()).abs()
         imgdiff_wrist = (gripper[:, 0].detach().float() - self.lrnode_cached_image_wrist[:, 0].detach().float()).abs()
         debug = {
             "cache_age": age,
+            "skip_age": age,
+            "fast_encoder_called": fast_encoder_called,
+            "lrnode_update_called": 1,
+            "action_head_called": 1,
             "fast_encoder_ms": fast_encoder_ms,
             "node_update_ms": node_update_ms,
             "action_head_ms": action_head_ms,
@@ -384,8 +611,9 @@ class ModelWrapper:
             "z_pred": z_next.detach(),
             "z_hold": z_prev.detach(),
             "action_pred": action_seq.detach(),
-            "action_hold": hold_action_seq.detach(),
         }
+        if hold_action_seq is not None:
+            debug["action_hold"] = hold_action_seq.detach()
         self.lrnode_cached_latent = z_next.detach()
         self.lrnode_cached_image_primary = image_x.detach()
         self.lrnode_cached_image_wrist = gripper.detach()
@@ -393,9 +621,89 @@ class ModelWrapper:
         self.lrnode_cached_age = age
         return action_seq, debug
 
+    def _decode_from_cached_latent(self):
+        base_model = self._base_model()
+        if self.lrnode_cached_latent is None:
+            raise RuntimeError("hold_latent ablation requested before a full-forward latent was cached")
+
+        age = self.lrnode_cached_age + 1
+        z_prev = self.lrnode_cached_latent
+        self._sync_cuda()
+        t_head = time.perf_counter()
+        arm_action, gripper_action = base_model.decode_action_from_latent(z_prev)
+        self._sync_cuda()
+        action_head_ms = (time.perf_counter() - t_head) * 1000.0
+        action_seq = torch.concat((arm_action, gripper_action), dim=-1)
+        self.lrnode_cached_age = age
+        return action_seq, {
+            "cache_age": age,
+            "skip_age": age,
+            "action_head_called": 1,
+            "lrnode_update_called": 0,
+            "fast_encoder_called": 0,
+            "fast_encoder_ms": 0.0,
+            "node_update_ms": 0.0,
+            "action_head_ms": action_head_ms,
+            "gate_mean": 0.0,
+            "gate_max": 0.0,
+            "u_delta_norm": 0.0,
+            "image_diff_primary_l1": 0.0,
+            "image_diff_wrist_l1": 0.0,
+            "update_norm": 0.0,
+            "z_norm": float(z_prev.detach().float().norm(dim=-1).mean().item()),
+        }
+
+    def _cached_chunk_token_action(self, timestep):
+        if self.lrnode_cached_action_tokens is None:
+            raise RuntimeError("seer_token_chunk ablation requested before full action tokens were cached")
+        if self.lrnode_last_full_timestep is None:
+            raise RuntimeError("seer_token_chunk ablation requested before last full timestep was cached")
+
+        skip_age = int(timestep) - int(self.lrnode_last_full_timestep)
+        token_idx = skip_age - 1
+        num_tokens = int(self.lrnode_cached_action_tokens.shape[1])
+        if token_idx < 0:
+            raise RuntimeError(
+                f"Invalid seer_token_chunk token_idx={token_idx}; "
+                f"timestep={timestep}, last_full_timestep={self.lrnode_last_full_timestep}"
+            )
+        if token_idx >= num_tokens:
+            raise RuntimeError(
+                "seer_token_chunk skip-only policy requires token_idx < action_pred_steps; "
+                f"got token_idx={token_idx}, action_pred_steps={num_tokens}. "
+                "For this MVP use K <= action_pred_steps + 1."
+            )
+        action_token = self.lrnode_cached_action_tokens[:, token_idx:token_idx + 1]
+        self.lrnode_cached_age = skip_age
+        action = self._raw_action_token_to_env_action(action_token)
+        return action, {
+            "cache_age": skip_age,
+            "skip_age": skip_age,
+            "token_idx_used": token_idx,
+            "action_head_called": 0,
+            "lrnode_update_called": 0,
+            "fast_encoder_called": 0,
+            "fast_encoder_ms": 0.0,
+            "node_update_ms": 0.0,
+            "action_head_ms": 0.0,
+            "gate_mean": 0.0,
+            "gate_max": 0.0,
+            "u_delta_norm": 0.0,
+            "image_diff_primary_l1": 0.0,
+            "image_diff_wrist_l1": 0.0,
+            "update_norm": 0.0,
+            "z_norm": 0.0,
+        }
+
     def get_lrnode_stats(self):
         total_calls = self.full_forward_calls + self.lrnode_update_calls
         avg_full_latency = self.full_forward_latency_sum / self.full_forward_calls if self.full_forward_calls else 0.0
+        avg_full_action_head_latency = (
+            self.full_action_head_latency_sum / self.full_forward_calls if self.full_forward_calls else 0.0
+        )
+        avg_full_non_action_head_latency = (
+            self.full_non_action_head_latency_sum / self.full_forward_calls if self.full_forward_calls else 0.0
+        )
         avg_lrnode_latency = self.lrnode_latency_sum / self.lrnode_update_calls if self.lrnode_update_calls else 0.0
         query_reduction = self.lrnode_update_calls / total_calls if total_calls else 0.0
         full_query_reduction_ratio = 1.0 - (self.full_forward_calls / self.num_policy_steps) if self.num_policy_steps else 0.0
@@ -404,22 +712,33 @@ class ModelWrapper:
             "num_env_steps": self.num_policy_steps,
             "full_forward_calls": self.full_forward_calls,
             "lrnode_update_calls": self.lrnode_update_calls,
+            "fast_encoder_calls": self.fast_encoder_calls,
+            "action_head_calls": self.action_head_calls,
+            "hold_action_steps": self.hold_action_steps,
+            "hold_latent_steps": self.hold_latent_steps,
+            "chunk_token_steps": self.chunk_token_steps,
+            "no_delta_steps": self.no_delta_steps,
             "num_fallback_full_calls": 0,
             "refresh_policy": self.lrnode_eval_refresh_policy,
             "max_full_forwards_per_episode": int(self.lrnode_eval_max_full_forwards_per_episode),
+            "eval_ablation_mode": self.lrnode_eval_ablation_mode,
+            "no_delta_mode": self.lrnode_no_delta_mode,
+            "chunk_token_policy": self.lrnode_chunk_token_policy,
             "avg_full_forward_latency_sec": avg_full_latency,
+            "avg_full_action_head_latency_sec": avg_full_action_head_latency,
+            "avg_full_non_action_head_latency_sec": avg_full_non_action_head_latency,
             "avg_lrnode_latency_sec": avg_lrnode_latency,
             "avg_fast_encoder_latency_sec": (
-                self.fast_encoder_latency_sum / self.lrnode_update_calls / 1000.0
-                if self.lrnode_update_calls else 0.0
+                self.fast_encoder_latency_sum / self.fast_encoder_calls / 1000.0
+                if self.fast_encoder_calls else 0.0
             ),
             "avg_node_update_latency_sec": (
                 self.node_update_latency_sum / self.lrnode_update_calls / 1000.0
                 if self.lrnode_update_calls else 0.0
             ),
             "avg_action_head_latency_sec": (
-                self.action_head_latency_sum / max(1, self.lrnode_update_calls) / 1000.0
-                if self.lrnode_update_calls else 0.0
+                self.action_head_latency_sum / self.action_head_calls / 1000.0
+                if self.action_head_calls else 0.0
             ),
             "avg_policy_step_latency_sec": (
                 self.policy_step_latency_sum / self.num_policy_steps / 1000.0
@@ -470,8 +789,14 @@ class ModelWrapper:
             return float(np.percentile(vals, q)) if vals else 0.0
 
         full_count = sum(1 for r in records if r.get("mode") == "full")
-        update_count = sum(1 for r in records if r.get("mode") == "lrnode_update")
-        hold_count = sum(1 for r in records if r.get("mode") == "hold")
+        stepwise_count = sum(1 for r in records if r.get("mode") in {"lrnode_update", "stepwise"})
+        no_delta_count = sum(1 for r in records if r.get("mode") == "no_delta")
+        update_count = stepwise_count + no_delta_count
+        hold_action_count = sum(1 for r in records if r.get("mode") == "hold_action")
+        hold_latent_count = sum(1 for r in records if r.get("mode") == "hold_latent")
+        chunk_token_count = sum(1 for r in records if r.get("mode") == "seer_token_chunk")
+        hold_count = hold_action_count + hold_latent_count
+        skip_step_count = max(0, len(records) - full_count)
         episode_wallclock = (
             time.perf_counter() - self.current_episode_start_time
             if self.current_episode_start_time is not None else 0.0
@@ -494,14 +819,27 @@ class ModelWrapper:
             "lrnode_enabled": int(self.use_lrnode_latent_update),
             "eval_skip_full_forward": int(self.lrnode_eval_skip_full_forward),
             "query_interval": int(self.lrnode_query_interval),
+            "ablation_mode": self.lrnode_eval_ablation_mode,
+            "no_delta_mode": self.lrnode_no_delta_mode,
+            "chunk_token_policy": self.lrnode_chunk_token_policy,
             "refresh_policy": self.lrnode_eval_refresh_policy,
             "max_full_forwards_per_episode": int(self.lrnode_eval_max_full_forwards_per_episode),
             "mode_full_count": int(full_count),
             "mode_update_count": int(update_count),
             "mode_hold_count": int(hold_count),
+            "mode_stepwise_count": int(stepwise_count),
+            "mode_hold_action_count": int(hold_action_count),
+            "mode_hold_latent_count": int(hold_latent_count),
+            "mode_chunk_token_count": int(chunk_token_count),
+            "mode_no_delta_count": int(no_delta_count),
+            "mode_skip_step_count": int(skip_step_count),
             "full_forward_ratio": full_count / max(1, len(records)),
             "skip_ratio": update_count / max(1, len(records)),
+            "nonfull_skip_ratio": skip_step_count / max(1, len(records)),
+            "max_cache_age": int(max(values("cache_age") or [0.0])),
             "avg_full_forward_ms": mean("full_forward_ms"),
+            "avg_full_action_head_ms": mean("full_action_head_ms"),
+            "avg_full_non_action_head_ms": mean("full_non_action_head_ms"),
             "avg_fast_encoder_ms": mean("fast_encoder_ms"),
             "avg_node_update_ms": mean("node_update_ms"),
             "avg_action_head_ms": mean("action_head_ms"),
@@ -518,6 +856,8 @@ class ModelWrapper:
             "p95_action_delta_l2": percentile("action_delta_norm", 95),
             "avg_action_jerk": mean("action_jerk"),
             "p95_action_jerk": percentile("action_jerk", 95),
+            "max_action_jerk": max(values("action_jerk") or [0.0]),
+            "mean_action_jerk": mean("action_jerk"),
             "arm_action_jerk": mean("arm_action_jerk"),
             "trans_action_jerk": mean("trans_action_jerk"),
             "rot_action_jerk": mean("rot_action_jerk"),
@@ -559,9 +899,18 @@ class ModelWrapper:
             "timestep": int(timestep),
             "mode": "full",
             "cache_age": int(self.lrnode_cached_age),
+            "skip_age": 0,
+            "token_idx_used": "",
             "query_interval": int(self.lrnode_query_interval),
+            "ablation_mode": self.lrnode_eval_ablation_mode,
+            "no_delta_mode": self.lrnode_no_delta_mode,
+            "chunk_token_policy": self.lrnode_chunk_token_policy,
             "refresh_policy": self.lrnode_eval_refresh_policy,
             "max_full_forwards_per_episode": int(self.lrnode_eval_max_full_forwards_per_episode),
+            "full_forward_called": 0,
+            "lrnode_update_called": 0,
+            "fast_encoder_called": 0,
+            "action_head_called": 0,
             "full_forward_ms": 0.0,
             "fast_encoder_ms": 0.0,
             "node_update_ms": 0.0,
@@ -659,25 +1008,90 @@ class ModelWrapper:
             preprocess_ms = (time.perf_counter() - preprocess_t0) * 1000.0
             step_record["preprocess_ms"] = preprocess_ms
 
+            direct_env_action = None
             if self._should_use_lrnode(timestep):
                 self._sync_cuda()
                 t0 = time.perf_counter()
-                action_seq, lrnode_debug = self._update_from_lrnode_cache(image_x, gripper, state)
+                mode = self.lrnode_eval_ablation_mode
+                if mode == "hold_action":
+                    if self.lrnode_cached_env_action is None:
+                        raise RuntimeError("hold_action ablation requested before an executed full-step action was cached")
+                    self.lrnode_cached_age += 1
+                    direct_env_action = self.lrnode_cached_env_action.copy()
+                    action_seq = None
+                    lrnode_debug = {
+                        "cache_age": int(self.lrnode_cached_age),
+                        "skip_age": int(self.lrnode_cached_age),
+                        "fast_encoder_called": 0,
+                        "lrnode_update_called": 0,
+                        "action_head_called": 0,
+                        "fast_encoder_ms": 0.0,
+                        "node_update_ms": 0.0,
+                        "action_head_ms": 0.0,
+                        "gate_mean": 0.0,
+                        "gate_max": 0.0,
+                        "u_delta_norm": 0.0,
+                        "image_diff_primary_l1": 0.0,
+                        "image_diff_wrist_l1": 0.0,
+                        "update_norm": 0.0,
+                        "z_norm": 0.0,
+                    }
+                elif mode == "hold_latent":
+                    action_seq, lrnode_debug = self._decode_from_cached_latent()
+                elif mode == "seer_token_chunk":
+                    direct_env_action, lrnode_debug = self._cached_chunk_token_action(timestep)
+                    action_seq = None
+                elif mode == "no_delta":
+                    action_seq, lrnode_debug = self._update_from_lrnode_cache(
+                        image_x,
+                        gripper,
+                        state,
+                        use_zero_delta=True,
+                        compute_hold_action=self.lrnode_eval_shadow_full_forward,
+                    )
+                else:
+                    action_seq, lrnode_debug = self._update_from_lrnode_cache(
+                        image_x,
+                        gripper,
+                        state,
+                        use_zero_delta=False,
+                        compute_hold_action=self.lrnode_eval_shadow_full_forward,
+                    )
                 self._sync_cuda()
-                lrnode_ms = (time.perf_counter() - t0) * 1000.0
-                self.lrnode_latency_sum += lrnode_ms / 1000.0
-                self.lrnode_update_calls += 1
+                skip_ms = (time.perf_counter() - t0) * 1000.0
+
+                lrnode_update_called = int(lrnode_debug.get("lrnode_update_called", 0))
+                fast_encoder_called = int(lrnode_debug.get("fast_encoder_called", 0))
+                action_head_called = int(lrnode_debug.get("action_head_called", 0))
+                self.lrnode_update_calls += lrnode_update_called
+                self.fast_encoder_calls += fast_encoder_called
+                self.action_head_calls += action_head_called
+                if lrnode_update_called:
+                    self.lrnode_latency_sum += skip_ms / 1000.0
                 self.fast_encoder_latency_sum += float(lrnode_debug.get("fast_encoder_ms", 0.0))
                 self.node_update_latency_sum += float(lrnode_debug.get("node_update_ms", 0.0))
                 self.action_head_latency_sum += float(lrnode_debug.get("action_head_ms", 0.0))
+                if mode == "hold_action":
+                    self.hold_action_steps += 1
+                elif mode == "hold_latent":
+                    self.hold_latent_steps += 1
+                elif mode == "seer_token_chunk":
+                    self.chunk_token_steps += 1
+                elif mode == "no_delta":
+                    self.no_delta_steps += 1
                 step_record.update(
                     {
-                        "mode": "lrnode_update",
+                        "mode": mode,
                         "cache_age": int(lrnode_debug.get("cache_age", 0)),
+                        "skip_age": int(lrnode_debug.get("skip_age", lrnode_debug.get("cache_age", 0))),
+                        "token_idx_used": lrnode_debug.get("token_idx_used", ""),
+                        "lrnode_update_called": lrnode_update_called,
+                        "fast_encoder_called": fast_encoder_called,
+                        "action_head_called": action_head_called,
                         "fast_encoder_ms": float(lrnode_debug.get("fast_encoder_ms", 0.0)),
                         "node_update_ms": float(lrnode_debug.get("node_update_ms", 0.0)),
                         "action_head_ms": float(lrnode_debug.get("action_head_ms", 0.0)),
-                        "total_policy_ms": lrnode_ms + preprocess_ms,
+                        "total_policy_ms": skip_ms + preprocess_ms,
                         "gate_mean": float(lrnode_debug.get("gate_mean", 0.0)),
                         "gate_max": float(lrnode_debug.get("gate_max", 0.0)),
                         "u_delta_norm": float(lrnode_debug.get("u_delta_norm", 0.0)),
@@ -687,7 +1101,7 @@ class ModelWrapper:
                         "z_norm": float(lrnode_debug.get("z_norm", 0.0)),
                     }
                 )
-                if self.lrnode_eval_shadow_full_forward:
+                if self.lrnode_eval_shadow_full_forward and "action_pred" in lrnode_debug:
                     selected_step = self._selected_step(num_step)
                     self._sync_cuda()
                     shadow_t0 = time.perf_counter()
@@ -758,13 +1172,23 @@ class ModelWrapper:
                 )
                 self._sync_cuda()
                 full_ms = (time.perf_counter() - t0) * 1000.0
+                full_action_head_ms = (
+                    float(getattr(self._base_model(), "last_full_action_head_ms", 0.0))
+                    if self.lrnode_eval_profile_full_action_head else 0.0
+                )
+                full_non_action_head_ms = max(0.0, full_ms - full_action_head_ms)
                 self.full_forward_latency_sum += full_ms / 1000.0
+                self.full_action_head_latency_sum += full_action_head_ms / 1000.0
+                self.full_non_action_head_latency_sum += full_non_action_head_ms / 1000.0
                 self.full_forward_calls += 1
                 self.lrnode_episode_full_forward_calls += 1
                 step_record.update(
                     {
                         "mode": "full",
+                        "full_forward_called": 1,
                         "full_forward_ms": full_ms,
+                        "full_action_head_ms": full_action_head_ms,
+                        "full_non_action_head_ms": full_non_action_head_ms,
                         "full_refresh_reason": self._full_refresh_reason(timestep),
                     }
                 )
@@ -778,9 +1202,22 @@ class ModelWrapper:
                     action_latent = None
                 selected_step = self._selected_step(num_step)
                 action_seq = torch.concat((arm_action[:, selected_step], gripper_action[:, selected_step]), dim=-1)
-                self._cache_full_forward_state(action_latent, selected_step, image_x, gripper, state)
+                self._cache_full_forward_state(
+                    action_latent,
+                    selected_step,
+                    image_x,
+                    gripper,
+                    state,
+                    action_tokens=action_seq,
+                    timestep=timestep,
+                )
 
-            action = self._action_sequence_to_env_action(action_seq, timestep)
+            if direct_env_action is None:
+                action = self._action_sequence_to_env_action(action_seq, timestep)
+            else:
+                action = np.asarray(direct_env_action, dtype=np.float32)
+            if step_record.get("mode") == "full":
+                self._cache_executed_env_action(action)
             action_float = np.asarray(action, dtype=np.float32)
             action_delta = np.zeros_like(action_float) if self.last_action is None else action_float - self.last_action
             action_jerk = (
@@ -792,7 +1229,9 @@ class ModelWrapper:
                 {
                     "action_norm": float(np.linalg.norm(action_float)),
                     "action_delta_norm": float(np.linalg.norm(action_delta)),
+                    "action_delta_l2": float(np.linalg.norm(action_delta)),
                     "action_jerk": float(np.linalg.norm(action_jerk)),
+                    "action_jerk_l2": float(np.linalg.norm(action_jerk)),
                     "arm_action_jerk": float(np.linalg.norm(action_jerk[:6])),
                     "trans_action_jerk": float(np.linalg.norm(action_jerk[:3])),
                     "rot_action_jerk": float(np.linalg.norm(action_jerk[3:6])),
@@ -894,8 +1333,12 @@ def evaluate_policy_ddp(args, model):
         if args.finetune_type == "libero_10":
             global num_eval_episodes
             global task_num
-            num_eval_episodes = 20
-            task_num = 10
+            num_eval_episodes = int(os.environ.get("EVAL_NUM_EPISODES_PER_TASK", "20"))
+            task_num = int(os.environ.get("EVAL_NUM_TASKS", "10"))
+            if num_eval_episodes <= 0:
+                raise ValueError(f"EVAL_NUM_EPISODES_PER_TASK must be positive, got {num_eval_episodes}")
+            if task_num <= 0 or task_num > 10:
+                raise ValueError(f"EVAL_NUM_TASKS must be in [1, 10], got {task_num}")
 
             NUM_SEQUENCES = num_eval_episodes * task_num
             eval_sequences = list(range(NUM_SEQUENCES))
@@ -953,7 +1396,14 @@ def evaluate_policy_ddp(args, model):
         result, episode_metrics = evaluate_libero_task(task, env, obs, args, model)
         results.append(result)
         local_episode_metrics.append(episode_metrics)
-        print("rank", torch.distributed.get_rank(), "results :", results)
+        _write_live_eval_progress(
+            args=args,
+            local_results=results,
+            local_eval_ids=eval_sequence_ids[:len(results)],
+            total_sequences=NUM_SEQUENCES,
+            local_assigned=len(eval_sequence_ids),
+            last_eval_id=eval_id,
+        )
 
     def merge_multi_list(res):
         tmp = []
@@ -995,8 +1445,16 @@ def merge_lrnode_stats(stats_list):
         "num_env_steps": 0,
         "full_forward_calls": 0,
         "lrnode_update_calls": 0,
+        "fast_encoder_calls": 0,
+        "action_head_calls": 0,
+        "hold_action_steps": 0,
+        "hold_latent_steps": 0,
+        "chunk_token_steps": 0,
+        "no_delta_steps": 0,
         "num_fallback_full_calls": 0,
         "full_forward_latency_sum": 0.0,
+        "full_action_head_latency_sum": 0.0,
+        "full_non_action_head_latency_sum": 0.0,
         "lrnode_latency_sum": 0.0,
         "fast_encoder_latency_sum": 0.0,
         "node_update_latency_sum": 0.0,
@@ -1018,16 +1476,30 @@ def merge_lrnode_stats(stats_list):
         env_steps = int(item.get("num_env_steps", 0))
         full_calls = int(item.get("full_forward_calls", 0))
         lrnode_calls = int(item.get("lrnode_update_calls", 0))
+        fast_encoder_calls = int(item.get("fast_encoder_calls", 0))
+        action_head_calls = int(item.get("action_head_calls", 0))
         shadow_calls = int(item.get("shadow_full_forward_calls", 0))
         merged["num_env_steps"] += env_steps
         merged["full_forward_calls"] += full_calls
         merged["lrnode_update_calls"] += lrnode_calls
+        merged["fast_encoder_calls"] += fast_encoder_calls
+        merged["action_head_calls"] += action_head_calls
+        merged["hold_action_steps"] += int(item.get("hold_action_steps", 0))
+        merged["hold_latent_steps"] += int(item.get("hold_latent_steps", 0))
+        merged["chunk_token_steps"] += int(item.get("chunk_token_steps", 0))
+        merged["no_delta_steps"] += int(item.get("no_delta_steps", 0))
         merged["num_fallback_full_calls"] += int(item.get("num_fallback_full_calls", 0))
         merged["full_forward_latency_sum"] += float(item.get("avg_full_forward_latency_sec", 0.0)) * full_calls
+        merged["full_action_head_latency_sum"] += (
+            float(item.get("avg_full_action_head_latency_sec", 0.0)) * full_calls
+        )
+        merged["full_non_action_head_latency_sum"] += (
+            float(item.get("avg_full_non_action_head_latency_sec", 0.0)) * full_calls
+        )
         merged["lrnode_latency_sum"] += float(item.get("avg_lrnode_latency_sec", 0.0)) * lrnode_calls
-        merged["fast_encoder_latency_sum"] += float(item.get("avg_fast_encoder_latency_sec", 0.0)) * lrnode_calls
+        merged["fast_encoder_latency_sum"] += float(item.get("avg_fast_encoder_latency_sec", 0.0)) * fast_encoder_calls
         merged["node_update_latency_sum"] += float(item.get("avg_node_update_latency_sec", 0.0)) * lrnode_calls
-        merged["action_head_latency_sum"] += float(item.get("avg_action_head_latency_sec", 0.0)) * lrnode_calls
+        merged["action_head_latency_sum"] += float(item.get("avg_action_head_latency_sec", 0.0)) * action_head_calls
         merged["policy_step_latency_sum"] += float(item.get("avg_policy_step_latency_sec", 0.0)) * env_steps
         merged["env_step_latency_sum"] += float(item.get("avg_env_step_latency_sec", 0.0)) * env_steps
         merged["shadow_full_forward_calls"] += shadow_calls
@@ -1048,8 +1520,24 @@ def merge_lrnode_stats(stats_list):
             target["action_hold_l1_sum"] += float(age_item.get("action_hold_l1_sum", 0.0))
 
     total_calls = merged["full_forward_calls"] + merged["lrnode_update_calls"]
+    # action_head_calls is the legacy skip-path counter. Every full Seer call
+    # also executes the shared action head once.
+    merged["skip_action_head_calls"] = merged["action_head_calls"]
+    merged["total_action_head_calls"] = (
+        merged["full_forward_calls"] + merged["skip_action_head_calls"]
+    )
     merged["avg_full_forward_latency_sec"] = (
         merged["full_forward_latency_sum"] / merged["full_forward_calls"]
+        if merged["full_forward_calls"]
+        else 0.0
+    )
+    merged["avg_full_action_head_latency_sec"] = (
+        merged["full_action_head_latency_sum"] / merged["full_forward_calls"]
+        if merged["full_forward_calls"]
+        else 0.0
+    )
+    merged["avg_full_non_action_head_latency_sec"] = (
+        merged["full_non_action_head_latency_sum"] / merged["full_forward_calls"]
         if merged["full_forward_calls"]
         else 0.0
     )
@@ -1059,8 +1547,8 @@ def merge_lrnode_stats(stats_list):
         else 0.0
     )
     merged["avg_fast_encoder_latency_sec"] = (
-        merged["fast_encoder_latency_sum"] / merged["lrnode_update_calls"]
-        if merged["lrnode_update_calls"]
+        merged["fast_encoder_latency_sum"] / merged["fast_encoder_calls"]
+        if merged["fast_encoder_calls"]
         else 0.0
     )
     merged["avg_node_update_latency_sec"] = (
@@ -1069,8 +1557,8 @@ def merge_lrnode_stats(stats_list):
         else 0.0
     )
     merged["avg_action_head_latency_sec"] = (
-        merged["action_head_latency_sum"] / merged["lrnode_update_calls"]
-        if merged["lrnode_update_calls"]
+        merged["action_head_latency_sum"] / merged["action_head_calls"]
+        if merged["action_head_calls"]
         else 0.0
     )
     merged["avg_policy_step_latency_sec"] = (
@@ -1141,9 +1629,11 @@ def _profile_values(values):
 def _write_latency_profile(path, episode_metrics):
     key_map = {
         "full_forward_model_ms": "avg_full_forward_ms",
+        "full_action_head_ms": "avg_full_action_head_ms",
+        "full_non_action_head_ms": "avg_full_non_action_head_ms",
         "fast_delta_encoder_ms": "avg_fast_encoder_ms",
         "node_update_ms": "avg_node_update_ms",
-        "action_head_ms": "avg_action_head_ms",
+        "skip_action_head_ms": "avg_action_head_ms",
         "policy_total_ms": "avg_policy_step_ms",
         "env_step_ms": "avg_env_step_ms",
         "e2e_step_ms": "avg_policy_step_ms",
@@ -1182,9 +1672,13 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
         effective_lrnode_update_hz = (
             control_hz * float(lrnode_stats.get("lrnode_update_calls", 0)) / float(num_env_steps)
         )
+        effective_action_head_hz = (
+            control_hz * float(lrnode_stats.get("total_action_head_calls", 0)) / float(num_env_steps)
+        )
     else:
         effective_full_query_hz = nominal_full_query_hz
         effective_lrnode_update_hz = nominal_lrnode_update_hz
+        effective_action_head_hz = 0.0
 
     task_results = []
     for j in range(task_num):
@@ -1204,6 +1698,48 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
         "run_name": args.run_name,
         "suite": args.finetune_type,
         "success_rate": success_rate,
+        "lrnode_eval_ablation_mode": getattr(args, "lrnode_eval_ablation_mode", "stepwise"),
+        "lrnode_no_delta_mode": getattr(args, "lrnode_no_delta_mode", "zero"),
+        "lrnode_chunk_token_policy": getattr(args, "lrnode_chunk_token_policy", "skip_only"),
+        "lrnode_query_interval": query_interval,
+        "control_freq": int(round(control_hz)),
+        "num_env_steps": int(lrnode_stats.get("num_env_steps", 0)),
+        "num_full_forward_calls": int(lrnode_stats.get("full_forward_calls", 0)),
+        "num_lrnode_update_calls": int(lrnode_stats.get("lrnode_update_calls", 0)),
+        "num_fast_encoder_calls": int(lrnode_stats.get("fast_encoder_calls", 0)),
+        "num_action_head_calls": int(lrnode_stats.get("action_head_calls", 0)),
+        "num_skip_action_head_calls": int(lrnode_stats.get("skip_action_head_calls", 0)),
+        "num_total_action_head_calls": int(lrnode_stats.get("total_action_head_calls", 0)),
+        "num_hold_action_steps": int(lrnode_stats.get("hold_action_steps", 0)),
+        "num_hold_latent_steps": int(lrnode_stats.get("hold_latent_steps", 0)),
+        "num_chunk_token_steps": int(lrnode_stats.get("chunk_token_steps", 0)),
+        "num_no_delta_steps": int(lrnode_stats.get("no_delta_steps", 0)),
+        "full_query_reduction_ratio": float(lrnode_stats.get("full_query_reduction_ratio", 0.0)),
+        "effective_full_query_hz": effective_full_query_hz,
+        "effective_lrnode_update_hz": effective_lrnode_update_hz,
+        "effective_action_head_hz": effective_action_head_hz,
+        "avg_policy_step_latency_ms": float(lrnode_stats.get("avg_policy_step_latency_sec", 0.0)) * 1000.0,
+        "avg_full_forward_latency_ms": float(lrnode_stats.get("avg_full_forward_latency_sec", 0.0)) * 1000.0,
+        "avg_full_action_head_latency_ms": (
+            float(lrnode_stats.get("avg_full_action_head_latency_sec", 0.0)) * 1000.0
+        ),
+        "avg_full_non_action_head_latency_ms": (
+            float(lrnode_stats.get("avg_full_non_action_head_latency_sec", 0.0)) * 1000.0
+        ),
+        "avg_lrnode_latency_ms": float(lrnode_stats.get("avg_lrnode_latency_sec", 0.0)) * 1000.0,
+        "avg_fast_encoder_latency_ms": float(lrnode_stats.get("avg_fast_encoder_latency_sec", 0.0)) * 1000.0,
+        "avg_action_head_latency_ms": float(lrnode_stats.get("avg_action_head_latency_sec", 0.0)) * 1000.0,
+        "avg_skip_action_head_latency_ms": float(lrnode_stats.get("avg_action_head_latency_sec", 0.0)) * 1000.0,
+        "action_delta_l2_mean": float(np.mean([m.get("avg_action_delta_l2", 0.0) for m in episode_metrics]))
+        if episode_metrics else 0.0,
+        "action_delta_l2_p95": float(np.mean([m.get("p95_action_delta_l2", 0.0) for m in episode_metrics]))
+        if episode_metrics else 0.0,
+        "action_jerk_l2_mean": float(np.mean([m.get("avg_action_jerk", 0.0) for m in episode_metrics]))
+        if episode_metrics else 0.0,
+        "action_jerk_l2_p95": float(np.mean([m.get("p95_action_jerk", 0.0) for m in episode_metrics]))
+        if episode_metrics else 0.0,
+        "gripper_switch_rate": float(np.mean([m.get("gripper_switch_rate", 0.0) for m in episode_metrics]))
+        if episode_metrics else 0.0,
         "environment": {
             "control_freq": int(round(control_hz)),
             "control_hz": control_hz,
@@ -1221,6 +1757,9 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
             "enabled": bool(args.use_lrnode_latent_update),
             "eval_skip_full_forward": bool(args.lrnode_eval_skip_full_forward),
             "query_interval": query_interval,
+            "eval_ablation_mode": getattr(args, "lrnode_eval_ablation_mode", "stepwise"),
+            "no_delta_mode": getattr(args, "lrnode_no_delta_mode", "zero"),
+            "chunk_token_policy": getattr(args, "lrnode_chunk_token_policy", "skip_only"),
             "eval_refresh_policy": getattr(args, "lrnode_eval_refresh_policy", "periodic"),
             "max_full_forwards_per_episode": int(
                 getattr(args, "lrnode_eval_max_full_forwards_per_episode", 1)
@@ -1231,6 +1770,8 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
             "nominal_lrnode_update_hz": nominal_lrnode_update_hz,
             "effective_full_query_hz": effective_full_query_hz,
             "effective_lrnode_update_hz": effective_lrnode_update_hz,
+            "effective_action_head_hz": effective_action_head_hz,
+            "profile_full_action_head": bool(getattr(args, "lrnode_eval_profile_full_action_head", 0)),
             "detach_input_latent": bool(args.lrnode_detach_input_latent),
             "detach_teacher_latent": bool(args.lrnode_detach_teacher_latent),
             "freeze_action_head_for_lrnode": bool(args.lrnode_freeze_action_head_for_lrnode),
@@ -1243,6 +1784,14 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
             "num_env_steps": int(lrnode_stats.get("num_env_steps", 0)),
             "num_full_forward_calls": int(lrnode_stats.get("full_forward_calls", 0)),
             "num_lrnode_update_calls": int(lrnode_stats.get("lrnode_update_calls", 0)),
+            "num_fast_encoder_calls": int(lrnode_stats.get("fast_encoder_calls", 0)),
+            "num_action_head_calls": int(lrnode_stats.get("action_head_calls", 0)),
+            "num_skip_action_head_calls": int(lrnode_stats.get("skip_action_head_calls", 0)),
+            "num_total_action_head_calls": int(lrnode_stats.get("total_action_head_calls", 0)),
+            "num_hold_action_steps": int(lrnode_stats.get("hold_action_steps", 0)),
+            "num_hold_latent_steps": int(lrnode_stats.get("hold_latent_steps", 0)),
+            "num_chunk_token_steps": int(lrnode_stats.get("chunk_token_steps", 0)),
+            "num_no_delta_steps": int(lrnode_stats.get("no_delta_steps", 0)),
             "num_fallback_full_calls": int(lrnode_stats.get("num_fallback_full_calls", 0)),
             "full_query_reduction_ratio": float(lrnode_stats.get("full_query_reduction_ratio", 0.0)),
             "effective_query_interval": float(lrnode_stats.get("effective_query_interval", 0.0)),
@@ -1306,13 +1855,31 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
 
     print(f"[LR-NODE eval] success_rate: {success_rate * 100:.1f}%")
     print(f"[LR-NODE eval] control_hz: {control_hz:.2f}")
+    print(f"[LR-NODE eval] ablation_mode: {getattr(args, 'lrnode_eval_ablation_mode', 'stepwise')}")
     print(f"[LR-NODE eval] effective_action_hz: {control_hz:.2f}")
     print(f"[LR-NODE eval] effective_full_query_hz: {effective_full_query_hz:.2f}")
     print(f"[LR-NODE eval] effective_lrnode_update_hz: {effective_lrnode_update_hz:.2f}")
+    print(f"[LR-NODE eval] effective_action_head_hz: {effective_action_head_hz:.2f}")
     print(f"[LR-NODE eval] full_forward_calls: {lrnode_stats['full_forward_calls']}")
     print(f"[LR-NODE eval] lrnode_update_calls: {lrnode_stats['lrnode_update_calls']}")
+    print(f"[LR-NODE eval] fast_encoder_calls: {lrnode_stats.get('fast_encoder_calls', 0)}")
+    print(f"[LR-NODE eval] skip_action_head_calls: {lrnode_stats.get('skip_action_head_calls', 0)}")
+    print(f"[LR-NODE eval] total_action_head_calls: {lrnode_stats.get('total_action_head_calls', 0)}")
+    print(f"[LR-NODE eval] hold_action_steps: {lrnode_stats.get('hold_action_steps', 0)}")
+    print(f"[LR-NODE eval] hold_latent_steps: {lrnode_stats.get('hold_latent_steps', 0)}")
+    print(f"[LR-NODE eval] chunk_token_steps: {lrnode_stats.get('chunk_token_steps', 0)}")
+    print(f"[LR-NODE eval] no_delta_steps: {lrnode_stats.get('no_delta_steps', 0)}")
     print(f"[LR-NODE eval] avg_full_forward_latency_sec: {lrnode_stats['avg_full_forward_latency_sec']:.6f}")
+    print(
+        "[LR-NODE eval] avg_full_action_head_latency_sec: "
+        f"{lrnode_stats.get('avg_full_action_head_latency_sec', 0.0):.6f}"
+    )
+    print(
+        "[LR-NODE eval] avg_full_non_action_head_latency_sec: "
+        f"{lrnode_stats.get('avg_full_non_action_head_latency_sec', 0.0):.6f}"
+    )
     print(f"[LR-NODE eval] avg_lrnode_latency_sec: {lrnode_stats['avg_lrnode_latency_sec']:.6f}")
+    print(f"[LR-NODE eval] avg_skip_action_head_latency_sec: {lrnode_stats['avg_action_head_latency_sec']:.6f}")
     print(f"[LR-NODE eval] effective_query_reduction: {lrnode_stats['effective_query_reduction'] * 100:.1f}%")
     print(f"[LR-NODE eval] full_query_reduction_ratio: {lrnode_stats['full_query_reduction_ratio'] * 100:.1f}%")
     print(f"[LR-NODE eval] effective_query_interval: {lrnode_stats['effective_query_interval']:.3f}")
@@ -1353,6 +1920,10 @@ def eval_one_epoch_libero_ddp(args, model, image_processor, tokenizer):
         lrnode_query_interval=args.lrnode_query_interval,
         lrnode_eval_step_log=args.lrnode_eval_step_log,
         lrnode_eval_shadow_full_forward=args.lrnode_eval_shadow_full_forward,
+        lrnode_eval_profile_full_action_head=args.lrnode_eval_profile_full_action_head,
         lrnode_eval_refresh_policy=args.lrnode_eval_refresh_policy,
-        lrnode_eval_max_full_forwards_per_episode=args.lrnode_eval_max_full_forwards_per_episode)
+        lrnode_eval_max_full_forwards_per_episode=args.lrnode_eval_max_full_forwards_per_episode,
+        lrnode_eval_ablation_mode=args.lrnode_eval_ablation_mode,
+        lrnode_no_delta_mode=args.lrnode_no_delta_mode,
+        lrnode_chunk_token_policy=args.lrnode_chunk_token_policy)
     evaluate_policy_ddp(args, wrapped_model)

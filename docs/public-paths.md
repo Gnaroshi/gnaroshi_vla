@@ -9,6 +9,9 @@ personal workstation, server, dataset, and checkpoint roots.
 | `$SEER_WORKSPACE_ROOT` | Local known-working Seer source/workspace |
 | `$SEER_BASELINE_ROOT` | Local clean or comparison Seer baseline |
 | `$LIBERO_ROOT` | Local LIBERO dataset root |
+| `$LIBERO_PATH` | Local checkout of the LIBERO repository used at evaluation |
+| `$ROOT_DIR` | Parent directory containing the converted training dataset |
+| `$VIT_CHECKPOINT_PATH` | Local MAE ViT checkpoint used by Seer |
 | `$CODEX_GENERATED_IMAGES` | Local generated-image output directory |
 | `$SEER_PYTHON` | Python executable for the Seer environment |
 | `$HOME` | Current user's home directory, never a committed username |

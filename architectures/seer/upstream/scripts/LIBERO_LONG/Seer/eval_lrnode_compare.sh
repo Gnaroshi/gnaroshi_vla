@@ -20,9 +20,12 @@ set -euo pipefail
 #   OURS_NAME="lrnode_v3" \
 #   bash scripts/LIBERO_LONG/Seer/eval_lrnode_compare.sh
 
-export PYTHONPATH="/home/mingyujung/private/LIBERO:${PYTHONPATH:-}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UPSTREAM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${UPSTREAM_DIR}/../../.." && pwd)"
 
 # Videos are saved by default because qualitative comparison is part of this experiment.
 export SAVE_VIDEO="${SAVE_VIDEO:-1}"
@@ -43,12 +46,23 @@ safe_tag() {
 
 which_server="${WHICH_SERVER:-sd1}"
 dataset="${DATASET:-libero_10_converted}"
-libero_path="${LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
-vit_checkpoint_path="${VIT_CHECKPOINT_PATH:-checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
-save_checkpoint_path="${SAVE_CHECKPOINT_PATH:-checkpoints/}"
-protocol_root="${LRNODE_PROTOCOL_ROOT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616}"
+libero_path="${LIBERO_PATH:-}"
+vit_checkpoint_path="${VIT_CHECKPOINT_PATH:-${UPSTREAM_DIR}/checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
+save_checkpoint_path="${SAVE_CHECKPOINT_PATH:-${REPO_ROOT}/checkpoints/seer}"
+protocol_root="${LRNODE_PROTOCOL_ROOT:-${REPO_ROOT}/results/seer/lrnode/default}"
 latest_baseline="${BASELINE_ENV:-${protocol_root}/train/_latest/scratch.env}"
 latest_ours="${OURS_ENV:-${protocol_root}/train/_latest/scratch_node.env}"
+
+if [[ -z "${libero_path}" || ! -d "${libero_path}" ]]; then
+    echo "[ERROR] Set LIBERO_PATH to a valid LIBERO repository path." >&2
+    exit 1
+fi
+if [[ ! -f "${vit_checkpoint_path}" ]]; then
+    echo "[ERROR] Missing ViT checkpoint: ${vit_checkpoint_path}" >&2
+    echo "[ERROR] Set VIT_CHECKPOINT_PATH explicitly." >&2
+    exit 1
+fi
+export PYTHONPATH="${libero_path}:${PYTHONPATH:-}"
 
 # Baseline definition. By default this uses the latest current-repo scratch.sh
 # output. Set BASELINE_CKPT explicitly to evaluate any other checkpoint.
@@ -159,6 +173,7 @@ LRNODE_EVAL_STEP_LOG="${LRNODE_EVAL_STEP_LOG:-1}"
 LRNODE_EVAL_SHADOW_FULL_FORWARD="${LRNODE_EVAL_SHADOW_FULL_FORWARD:-0}"
 LRNODE_EVAL_REFRESH_POLICY="${LRNODE_EVAL_REFRESH_POLICY:-periodic}"
 LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE="${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE:-1}"
+LRNODE_EVAL_PROFILE_FULL_ACTION_HEAD="${LRNODE_EVAL_PROFILE_FULL_ACTION_HEAD:-1}"
 
 common_eval_args=(
     --traj_cons
@@ -248,6 +263,7 @@ run_eval() {
         --lrnode_trace "${LRNODE_TRACE}"
         --lrnode_eval_step_log "${LRNODE_EVAL_STEP_LOG}"
         --lrnode_eval_shadow_full_forward "${LRNODE_EVAL_SHADOW_FULL_FORWARD}"
+        --lrnode_eval_profile_full_action_head "${LRNODE_EVAL_PROFILE_FULL_ACTION_HEAD}"
         --lrnode_eval_refresh_policy "${LRNODE_EVAL_REFRESH_POLICY}"
         --lrnode_eval_max_full_forwards_per_episode "${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE}"
     )
@@ -272,6 +288,7 @@ run_eval() {
     echo "[RUN] refresh_policy=${LRNODE_EVAL_REFRESH_POLICY}, max_full_per_episode=${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE}"
     echo "[RUN] video SAVE_VIDEO=${SAVE_VIDEO}, success=${SAVE_VIDEO_SUCC}, fail=${SAVE_VIDEO_FAIL}, all_ranks=${SAVE_VIDEO_ALL_RANKS}, stride=${VIDEO_STRIDE}"
     echo "[RUN] log_dir=${log_dir}"
+    echo "[RUN] live_progress=${log_dir}/analysis/eval_progress.json"
     echo "------------------------------------------------------------"
 
     python -m torch.distributed.run \
@@ -287,6 +304,7 @@ run_eval() {
 
     for required in \
         "${log_dir}/analysis/eval_summary.json" \
+        "${log_dir}/analysis/eval_progress.json" \
         "${log_dir}/analysis/eval_episode_metrics.csv" \
         "${log_dir}/analysis/eval_latency_profile.json" \
         "${log_dir}/analysis/args_snapshot_${ckpt_tag}.json"; do
@@ -453,12 +471,18 @@ for path in sorted(root.glob("*/analysis/eval_summary.json")):
         "nominal_full_query_hz": lr.get("nominal_full_query_hz"),
         "effective_full_query_hz": lr.get("effective_full_query_hz"),
         "effective_lrnode_update_hz": lr.get("effective_lrnode_update_hz"),
+        "effective_action_head_hz": lr.get("effective_action_head_hz"),
         "full_forward_calls": qr.get("num_full_forward_calls"),
         "lrnode_update_calls": qr.get("num_lrnode_update_calls"),
+        "skip_action_head_calls": qr.get("num_skip_action_head_calls", qr.get("num_action_head_calls")),
+        "total_action_head_calls": qr.get("num_total_action_head_calls"),
         "full_query_reduction_pct": round(float(qr.get("full_query_reduction_ratio", 0.0)) * 100.0, 3),
         "effective_query_interval": round(float(qr.get("effective_query_interval", 0.0)), 3),
         "avg_full_forward_ms": round(float(lr.get("avg_full_forward_latency_sec", 0.0)) * 1000.0, 3),
+        "avg_full_action_head_ms": round(float(lr.get("avg_full_action_head_latency_sec", 0.0)) * 1000.0, 3),
+        "avg_full_non_action_head_ms": round(float(lr.get("avg_full_non_action_head_latency_sec", 0.0)) * 1000.0, 3),
         "avg_lrnode_ms": round(float(lr.get("avg_lrnode_latency_sec", 0.0)) * 1000.0, 3),
+        "avg_skip_action_head_ms": round(float(lr.get("avg_action_head_latency_sec", 0.0)) * 1000.0, 3),
         "avg_policy_step_ms": round(float(lr.get("avg_policy_step_latency_sec", 0.0)) * 1000.0, 3),
         "action_jerk_l2_mean": round(float(smooth.get("action_jerk_l2_mean", 0.0)), 6),
         "action_jerk_l2_p95": round(float(smooth.get("action_jerk_l2_p95", 0.0)), 6),

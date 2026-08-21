@@ -1,0 +1,45 @@
+{
+  "camera_serials_file": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/CAMERA_SERIALS.json",
+  "checkpoint": "/home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/baseline/teacher_37.pth",
+  "checkpoint_dir": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37",
+  "instructions": [
+    "Pick up the red ball and place it in the basketball hoop"
+  ],
+  "media_capture_enabled": true,
+  "media_dir": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/rollouts",
+  "notes_file": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/NOTES.txt",
+  "policy_step_log_pattern": "policy_steps_rollout_*.jsonl",
+  "results_file": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725/deploy_results.json",
+  "runtime_summary_file_pattern": "deployment_runtime_rollout_*.json",
+  "seer_deployment": {
+    "action_pred_steps": 3,
+    "adapter_checkpoint": null,
+    "adapter_id": null,
+    "artifact_manifest": "/home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/checkpoint_manifest.json",
+    "artifact_sha256": {
+      "teacher": "90f73d0a55da443a35ba863261ea8a00de6d5cc466f6519f0e704505f76cc25a",
+      "vit": "aec5f0b68e5f3193a00b07bc65a37440db549c15b36b8bea242606cc40c4bc5d"
+    },
+    "control_freq": 60.0,
+    "control_period_ms": 16.666666666666668,
+    "deployment_method": "baseline",
+    "deployment_profile": "basketball_teacher37_full_initial_k1_60hz_v2_live_sync",
+    "deployment_runtime_version": 2,
+    "image_preprocess_mode": "sequential",
+    "latentloop_architecture": null,
+    "method": "Seer baseline",
+    "optimized_fast_path": true,
+    "query_interval": 1,
+    "rollout_policy": "hold_latent",
+    "sequence_length": 7,
+    "teacher_checkpoint": "/home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/baseline/teacher_37.pth",
+    "teacher_id": 37,
+    "teacher_rebuilt_key_count": 558,
+    "temporal_ensemble_enabled": true,
+    "temporal_ensemble_temperature": 0.01,
+    "vit_checkpoint": "/home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/shared/mae_pretrain_vit_base.pth"
+  },
+  "session_dir": "/home/jbr/gnaroshi_vla/real_deploy_results_v2/baseline/basketball_teacher37_full_initial_k1_60hz_v2_live_sync/baseline_ckpt_teacher_37/deploy_20260815_204725",
+  "session_stamp": "20260815_204725",
+  "session_started_at": "2026-08-15 20:47:25"
+}

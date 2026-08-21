@@ -1,8 +1,14 @@
-# Workspace Docs
+# Documentation
 
-This directory stores workspace-level documentation that should not live inside
-architecture upstream trees.
+This directory contains release-facing instructions for users who clone the
+repository.
 
-- `agent_context/`: instructions and working context for coding agents.
-- `agent_notes/`: generated handoff notes, reports, analysis, and figures.
-- `architectures/`: integration metadata for architecture sources.
+Include documentation here only when it is needed to install, train, evaluate,
+or reproduce a published method. Experiment notes, result analyses, handoff
+documents, audits, generated figures, and working drafts belong in the ignored
+`codex_outputs/` directory.
+
+## Methods
+
+- [Seer LR-NODE](seer/lrnode.md): frozen-teacher adapter training and LIBERO
+  evaluation.

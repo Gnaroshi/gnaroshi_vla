@@ -1,0 +1,7 @@
+**/rollouts/
+**/_tmp/
+**/*.avi
+**/*.mp4
+**/*.jpg
+**/*.jpeg
+**/*.png

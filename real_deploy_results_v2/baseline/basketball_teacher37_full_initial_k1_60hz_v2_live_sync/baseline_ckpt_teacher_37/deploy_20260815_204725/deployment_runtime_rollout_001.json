@@ -1,0 +1,88 @@
+{
+  "achieved_control_hz": 7.053703751511257,
+  "action_pred_steps": 3,
+  "adapter_checkpoint": null,
+  "adapter_id": null,
+  "artifact_manifest": "/home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/checkpoint_manifest.json",
+  "artifact_sha256": {
+    "teacher": "90f73d0a55da443a35ba863261ea8a00de6d5cc466f6519f0e704505f76cc25a",
+    "vit": "aec5f0b68e5f3193a00b07bc65a37440db549c15b36b8bea242606cc40c4bc5d"
+  },
+  "average_control_period_ms": 141.7694923444651,
+  "average_full_forward_ms": 49.93588721787381,
+  "average_hold_action_ms": 0.0,
+  "average_hold_latent_ms": 0.0,
+  "average_latentloop_ms": 0.0,
+  "average_policy_ms": 74.91587616725644,
+  "control_elapsed_s": 28.35389846889302,
+  "control_freq": 60.0,
+  "control_period_ms": 16.666666666666668,
+  "deployment_method": "baseline",
+  "deployment_profile": "basketball_teacher37_full_initial_k1_60hz_v2_live_sync",
+  "deployment_runtime_version": 2,
+  "effective_query_interval": 1.0,
+  "full_forward_calls": 201,
+  "hold_action_calls": 0,
+  "hold_latent_calls": 0,
+  "image_preprocess_mode": "sequential",
+  "latentloop_architecture": null,
+  "latentloop_update_calls": 0,
+  "maximum_control_period_ms": 196.15413900464773,
+  "measured_control_period_count": 200,
+  "method": "Seer baseline",
+  "optimized_fast_path": true,
+  "p95_control_period_ms": 170.1292222365737,
+  "policy_deadline_miss_count": 201,
+  "policy_deadline_miss_rate": 1.0,
+  "policy_latency_ms": {
+    "all": {
+      "count": 201,
+      "max": 108.46689296886325,
+      "mean": 74.91587616725644,
+      "median": 70.03157678991556,
+      "p95": 101.11195174977183
+    },
+    "full": {
+      "count": 201,
+      "max": 108.46689296886325,
+      "mean": 74.91587616725644,
+      "median": 70.03157678991556,
+      "p95": 101.11195174977183
+    },
+    "hold_action": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p95": 0.0
+    },
+    "hold_latent": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p95": 0.0
+    },
+    "latentloop": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p95": 0.0
+    }
+  },
+  "policy_steps": 201,
+  "query_interval": 1,
+  "query_reduction": 0.0,
+  "rollout_index": 1,
+  "rollout_policy": "hold_action",
+  "sequence_length": 7,
+  "strict_deadline_miss_count": 200,
+  "strict_deadline_miss_rate": 1.0,
+  "teacher_checkpoint": "/home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/baseline/teacher_37.pth",
+  "teacher_id": 37,
+  "teacher_rebuilt_key_count": 558,
+  "temporal_ensemble_enabled": true,
+  "temporal_ensemble_temperature": 0.01,
+  "vit_checkpoint": "/home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/shared/mae_pretrain_vit_base.pth"
+}

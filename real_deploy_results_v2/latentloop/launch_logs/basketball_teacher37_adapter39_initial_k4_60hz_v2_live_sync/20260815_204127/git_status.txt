@@ -1,0 +1,10 @@
+ M architectures/seer/upstream/scripts/REAL/deploy_ll_gui.sh
+?? architectures/seer/adapters/latentloop_real_deploy/controller_v2.py
+?? architectures/seer/adapters/latentloop_real_deploy/deploy_ll_gui_v2.py
+?? architectures/seer/adapters/latentloop_real_deploy/runtime_v2.py
+?? architectures/seer/upstream/scripts/REAL/deploy_ll_gui_v2.sh
+?? real_deploy_results/baseline/
+?? real_deploy_results/deploy_camera_serials.json
+?? real_deploy_results/latentloop/
+?? real_deploy_results_v2/
+?? tests/test_latentloop_real_deploy_v2.py

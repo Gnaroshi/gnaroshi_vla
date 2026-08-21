@@ -73,14 +73,63 @@ def _is_lrnode_adapter_only_state_dict(state_dict):
     return has_lrnode and not has_core_seer
 
 
-def _load_checkpoint_into_model(ddp_model, checkpoint_path, label, rank):
+def _is_lrnode_state_key(key):
+    return key.startswith("module.lrnode_delta_encoder.") or key.startswith("module.lrnode_dynamics.")
+
+
+def _expected_checkpoint_keys(ddp_model, checkpoint_kind):
+    if checkpoint_kind == "adapter":
+        return {
+            name for name, _ in ddp_model.named_parameters()
+            if _is_lrnode_state_key(name)
+        }
+    if checkpoint_kind == "base":
+        return {
+            name for name, param in ddp_model.named_parameters()
+            if param.requires_grad and not _is_lrnode_state_key(name)
+        }
+    raise ValueError(f"Unknown checkpoint_kind={checkpoint_kind}")
+
+
+def _assert_checkpoint_contract(ddp_model, state_dict, checkpoint_path, checkpoint_kind):
+    expected_keys = _expected_checkpoint_keys(ddp_model, checkpoint_kind)
+    actual_keys = set(state_dict.keys())
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint contract failed for kind={checkpoint_kind}: {checkpoint_path}; "
+            f"missing={missing[:50]}, unexpected={unexpected[:50]}"
+        )
+    return len(expected_keys)
+
+
+def _load_checkpoint_into_model(ddp_model, checkpoint_path, label, rank, checkpoint_kind=None):
     checkpoint, state_dict = _checkpoint_state_dict(checkpoint_path)
+    verified_key_count = None
+    if checkpoint_kind is not None:
+        verified_key_count = _assert_checkpoint_contract(
+            ddp_model,
+            state_dict,
+            checkpoint_path,
+            checkpoint_kind,
+        )
     ret = ddp_model.load_state_dict(state_dict, False)
+    if ret.unexpected_keys:
+        raise RuntimeError(
+            f"Unexpected checkpoint keys while loading {checkpoint_path}: "
+            f"{ret.unexpected_keys[:50]}"
+        )
     if rank == 0:
         print(f"[CKPT LOAD:{label}] path={checkpoint_path}")
         print(f"[CKPT LOAD:{label}] epoch={checkpoint.get('epoch', 'NA')}")
         print(f"[CKPT LOAD:{label}] state_dict_keys={len(state_dict)}")
         print(f"[CKPT LOAD:{label}] adapter_only={_is_lrnode_adapter_only_state_dict(state_dict)}")
+        if checkpoint_kind is not None:
+            print(
+                f"[CKPT VERIFY:{label}] contract={checkpoint_kind} "
+                f"exact_keys=True verified_key_count={verified_key_count}"
+            )
         try:
             print(f"[CKPT LOAD:{label}] missing_keys={len(ret.missing_keys)}")
             if len(ret.missing_keys) > 0:
@@ -108,10 +157,17 @@ def main():
         print(f"[EVAL ARGS] use_lrnode_latent_update={bool(args.use_lrnode_latent_update)}")
         print(f"[EVAL ARGS] lrnode_eval_skip_full_forward={bool(args.lrnode_eval_skip_full_forward)}")
         print(f"[EVAL ARGS] lrnode_query_interval={args.lrnode_query_interval}")
+        print(f"[EVAL ARGS] lrnode_eval_ablation_mode={args.lrnode_eval_ablation_mode}")
+        print(f"[EVAL ARGS] lrnode_no_delta_mode={args.lrnode_no_delta_mode}")
+        print(f"[EVAL ARGS] lrnode_chunk_token_policy={args.lrnode_chunk_token_policy}")
         print(f"[EVAL ARGS] lrnode_eval_refresh_policy={args.lrnode_eval_refresh_policy}")
         print(
             "[EVAL ARGS] "
             f"lrnode_eval_max_full_forwards_per_episode={args.lrnode_eval_max_full_forwards_per_episode}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"lrnode_eval_profile_full_action_head={bool(args.lrnode_eval_profile_full_action_head)}"
         )
         print(f"[EVAL ARGS] lrnode_hidden_dim={args.lrnode_hidden_dim}")
         print(f"[EVAL ARGS] lrnode_motion_dim={args.lrnode_motion_dim}")
@@ -207,14 +263,22 @@ def main():
             args.finetune_from_pretrained_ckpt,
             "base",
             args.rank,
+            checkpoint_kind="base" if args.lrnode_train_protocol == "adapter" else None,
         )
 
     if args.resume_from_checkpoint is not None:
+        resume_checkpoint_kind = None
+        if args.lrnode_train_protocol == "adapter":
+            _, resume_state_dict = _checkpoint_state_dict(args.resume_from_checkpoint)
+            resume_checkpoint_kind = (
+                "adapter" if _is_lrnode_adapter_only_state_dict(resume_state_dict) else "base"
+            )
         _load_checkpoint_into_model(
             ddp_model,
             args.resume_from_checkpoint,
             "resume_or_adapter",
             args.rank,
+            checkpoint_kind=resume_checkpoint_kind,
         )
         if args.rank == 0:
             m = ddp_model.module

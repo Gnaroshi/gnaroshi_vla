@@ -1,0 +1,8 @@
+{
+  "updated_at": "2026-08-15 20:47:24",
+  "deploy_cameras": {
+    "exterior": "243722072499",
+    "wrist": "342222070922"
+  },
+  "notes": "These are the RealSense serials used by deploy inference views. Any connected RealSense not listed here can be used as the observer camera."
+}

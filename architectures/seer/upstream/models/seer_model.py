@@ -196,6 +196,8 @@ class SeerAgent(nn.Module):
         self.lrnode_gate_init_bias = lrnode_gate_init_bias
         self.lrnode_trace = bool(lrnode_trace)
         self._lrnode_trace_printed = False
+        self.profile_full_action_head = False
+        self.last_full_action_head_ms = 0.0
 
         # text projector
         self.text_projector = nn.Linear(512, self.hidden_dim)        
@@ -624,9 +626,19 @@ class SeerAgent(nn.Module):
             # action_latent_full is the action-token transformer output fed into the existing action decoder.
             # Shape: [B, S, action_pred_steps, hidden_dim].
             action_latent_full = transformer_output[:, :, pred_token_start_idx+this_num_obs_token:pred_token_start_idx+this_num_obs_token+self.action_pred_steps, :]
+            if getattr(self, "profile_full_action_head", False) and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            full_action_head_t0 = time.perf_counter() if getattr(self, "profile_full_action_head", False) else None
             arm_pred_action, gripper_pred_action = self.decode_action_from_latent(action_latent_full)
+            if full_action_head_t0 is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                self.last_full_action_head_ms = (time.perf_counter() - full_action_head_t0) * 1000.0
+            else:
+                self.last_full_action_head_ms = 0.0
         else:
             action_latent_full = None
+            self.last_full_action_head_ms = 0.0
 
         if lrnode_compute_loss:
             if not self.use_lrnode_latent_update:
