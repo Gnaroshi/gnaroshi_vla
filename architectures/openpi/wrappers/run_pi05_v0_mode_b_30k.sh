@@ -8,6 +8,7 @@ GPU=${OPENPI_PI05_V0_MODE_B_GPU:-0}
 PORT=${OPENPI_PI05_V0_MODE_B_PORT:-8164}
 RUN_NAME=${OPENPI_PI05_V0_MODE_B_RUN_NAME:-pi05_v0_mode_b_rb2_seed42_30k}
 BASELINE_SUMMARY=${OPENPI_PI05_BASELINE_SUMMARY:-}
+BASELINE_CHECKPOINT_SHA256_FILE=${OPENPI_PI05_BASELINE_CHECKPOINT_SHA256_FILE:-}
 MIN_FREE_MIB=${OPENPI_PI05_V0_MODE_B_MIN_FREE_MIB:-18000}
 
 if [[ ${OPENPI_PI05_V0_MODE_B_RUN:-0} != 1 ]]; then
@@ -18,6 +19,7 @@ fi
 [[ ${PORT} =~ ^[0-9]+$ ]] || { echo "PORT must be numeric" >&2; exit 2; }
 [[ ${MIN_FREE_MIB} =~ ^[0-9]+$ ]] || { echo "MIN_FREE_MIB must be numeric" >&2; exit 2; }
 : "${BASELINE_SUMMARY:?Set OPENPI_PI05_BASELINE_SUMMARY to the completed 2,000-episode baseline summary}"
+: "${BASELINE_CHECKPOINT_SHA256_FILE:?Set OPENPI_PI05_BASELINE_CHECKPOINT_SHA256_FILE to the baseline checkpoint hash evidence}"
 
 CONTRACT=${OPENPI_LL_RESULTS}/contracts/${RUN_NAME}
 LOSS_LOCK=${CONTRACT}/v0_streaming_loss_weights_equalized.json
@@ -42,6 +44,22 @@ assert p["total_successes"] == 1937
 assert abs(p["micro_success_rate"] - 0.9685) < 1e-12
 print("RB2_BASELINE_1937_OF_2000_PASS")
 PY
+read -r EXPECTED_CHECKPOINT_SHA256 RECORDED_CHECKPOINT < "${BASELINE_CHECKPOINT_SHA256_FILE}"
+[[ ${EXPECTED_CHECKPOINT_SHA256} =~ ^[0-9a-fA-F]{64}$ ]] || {
+  echo "Baseline checkpoint evidence does not begin with a SHA-256 value." >&2
+  exit 1
+}
+MODEL_PATH=${OPENPI_LL_CHECKPOINT}/model.safetensors
+[[ $(realpath -- "${RECORDED_CHECKPOINT}") == $(realpath -- "${MODEL_PATH}") ]] || {
+  echo "Baseline checkpoint evidence names another model file." >&2
+  exit 1
+}
+ACTUAL_CHECKPOINT_SHA256=$(sha256sum "${MODEL_PATH}" | awk '{print $1}')
+[[ ${ACTUAL_CHECKPOINT_SHA256} == "${EXPECTED_CHECKPOINT_SHA256}" ]] || {
+  echo "Baseline checkpoint hash evidence is stale." >&2
+  exit 1
+}
+echo "RB2_BASELINE_CHECKPOINT_HASH_PASS sha256=${ACTUAL_CHECKPOINT_SHA256}"
 
 free_mib=$(nvidia-smi -i "${GPU}" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d ' ')
 if ((free_mib < MIN_FREE_MIB)); then
@@ -58,11 +76,18 @@ if [[ ! -e ${CONTRACT} ]]; then
   OPENPI_LATENTLOOP_STREAMING_ACCEPT_RUN=1 \
   bash architectures/openpi/wrappers/accept_pi05_v0_streaming.sh \
     --output "${CONTRACT}" --gpu "${GPU}" --port "${PORT}" \
-    --raw-loss-examples 32 --action-execution-mode B
+    --raw-loss-examples 32 --action-execution-mode B \
+    --expected-checkpoint-sha256 "${EXPECTED_CHECKPOINT_SHA256}"
 else
   "${OPENPI_LL_MAIN_PY}" tools/openpi/source_lock_v2.py verify --lock "${LOCK}"
   test -f "${RAW_LOSS}"
 fi
+"${OPENPI_LL_MAIN_PY}" - "${LOCK}" "${EXPECTED_CHECKPOINT_SHA256}" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+assert p["checkpoint"]["expected_model_sha256"] == sys.argv[2].lower()
+print("RB2_BASELINE_SOURCE_LOCK_BINDING_PASS")
+PY
 
 if [[ ! -e ${LOSS_LOCK} ]]; then
   read -r state_weight chunk_weight executed_weight gripper_weight < <(

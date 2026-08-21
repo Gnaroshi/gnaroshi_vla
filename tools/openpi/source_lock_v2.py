@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any, Iterable
@@ -59,6 +60,13 @@ POSTPROCESSING_FILES = (
 
 class SourceLockError(RuntimeError):
     """Raised when required lock evidence is absent or differs."""
+
+
+def normalize_sha256(value: str) -> str:
+    normalized = value.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
+        raise SourceLockError(f"invalid SHA-256 value: {value!r}")
+    return normalized
 
 
 def sha256_file(path: str | Path) -> str:
@@ -193,10 +201,12 @@ def collect_current(
     checkpoint_dir: str | Path,
     norm_stats_path: str | Path,
     config_path: str | Path | None = None,
+    expected_checkpoint_sha256: str = EXPECTED_CHECKPOINT_SHA256,
     action_horizon: int = 10,
     execution_horizon: int = 5,
 ) -> dict[str, Any]:
     checkpoint_dir = Path(checkpoint_dir).resolve()
+    expected_checkpoint_sha256 = normalize_sha256(expected_checkpoint_sha256)
     checkpoint = checkpoint_dir / "model.safetensors"
     norm_stats = Path(norm_stats_path).resolve()
     config = (
@@ -237,7 +247,7 @@ def collect_current(
             "directory": str(checkpoint_dir),
             "model_path": str(checkpoint),
             "model_sha256": sha256_file(checkpoint),
-            "expected_model_sha256": EXPECTED_CHECKPOINT_SHA256,
+            "expected_model_sha256": expected_checkpoint_sha256,
             "config_path": str(config),
             "config_sha256": sha256_file(config),
             "expected_config_sha256": EXPECTED_CONFIG_SHA256,
@@ -255,7 +265,7 @@ def collect_current(
         "preprocessing": _implementation_hash(PREPROCESSING_FILES),
         "postprocessing": _implementation_hash(POSTPROCESSING_FILES),
     }
-    if payload["checkpoint"]["model_sha256"] != EXPECTED_CHECKPOINT_SHA256:
+    if payload["checkpoint"]["model_sha256"] != expected_checkpoint_sha256:
         raise SourceLockError("checkpoint mismatch: baseline model hash differs from the audited checkpoint")
     if payload["checkpoint"]["config_sha256"] != EXPECTED_CONFIG_SHA256:
         raise SourceLockError("checkpoint mismatch: config hash differs from the audited config")
@@ -282,10 +292,16 @@ def verify_lock(lock_path: str | Path) -> dict[str, Any]:
     missing = sorted(required - locked.keys())
     if missing:
         raise SourceLockError(f"missing evidence: source lock lacks keys {missing}")
+    expected_checkpoint_sha256 = locked["checkpoint"].get("expected_model_sha256")
+    if expected_checkpoint_sha256 is None:
+        raise SourceLockError(
+            "missing evidence: source lock checkpoint lacks expected_model_sha256"
+        )
     observed = collect_current(
         checkpoint_dir=locked["checkpoint"]["directory"],
         norm_stats_path=locked["normalization"]["path"],
         config_path=locked["checkpoint"]["config_path"],
+        expected_checkpoint_sha256=expected_checkpoint_sha256,
         action_horizon=locked["native_intervals"]["action_horizon_h"],
         execution_horizon=locked["native_intervals"]["execution_horizon_r"],
     )
@@ -331,6 +347,9 @@ def main() -> None:
     create.add_argument("--checkpoint", required=True)
     create.add_argument("--norm-stats", required=True)
     create.add_argument("--config")
+    create.add_argument(
+        "--expected-checkpoint-sha256", default=EXPECTED_CHECKPOINT_SHA256
+    )
     verify = subparsers.add_parser("verify")
     verify.add_argument("--lock", required=True)
     args = parser.parse_args()
@@ -342,6 +361,7 @@ def main() -> None:
             checkpoint_dir=args.checkpoint,
             norm_stats_path=args.norm_stats,
             config_path=args.config,
+            expected_checkpoint_sha256=args.expected_checkpoint_sha256,
         )
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

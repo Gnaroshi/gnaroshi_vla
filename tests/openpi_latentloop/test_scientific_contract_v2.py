@@ -214,7 +214,11 @@ def test_source_lock_v2_fails_closed_on_mismatch(tmp_path: Path, monkeypatch):
         "upstream": {"head": "b"},
         "nested_libero": {"head": "c"},
         "ours_and_upstream_source": {"combined_sha256": "c"},
-        "checkpoint": {"directory": "/x", "config_path": "/y"},
+        "checkpoint": {
+            "directory": "/x",
+            "config_path": "/y",
+            "expected_model_sha256": "a" * 64,
+        },
         "normalization": {"path": "/z"},
         "environment": {"python": "3.11"},
         "native_intervals": {"action_horizon_h": 10, "execution_horizon_r": 5},
@@ -235,6 +239,13 @@ def test_source_lock_v2_fails_closed_on_mismatch(tmp_path: Path, monkeypatch):
         source_lock_v2.verify_lock(path)
     with pytest.raises(source_lock_v2.SourceLockError, match="missing evidence"):
         source_lock_v2.verify_lock(tmp_path / "missing.json")
+
+
+def test_source_lock_accepts_only_explicit_valid_checkpoint_sha256():
+    value = "A1" * 32
+    assert source_lock_v2.normalize_sha256(value) == value.lower()
+    with pytest.raises(source_lock_v2.SourceLockError, match="invalid SHA-256"):
+        source_lock_v2.normalize_sha256("not-a-checkpoint-hash")
 
 
 def test_source_lock_requires_trusted_vendored_libero_loader_opt_in(monkeypatch):

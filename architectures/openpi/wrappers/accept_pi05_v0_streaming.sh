@@ -9,6 +9,7 @@ GPU=4
 PORT=8161
 RAW_LOSS_EXAMPLES=32
 ACTION_EXECUTION_MODE=A
+EXPECTED_CHECKPOINT_SHA256=
 while (($#)); do
   case "$1" in
     --output) OUTPUT=$2; shift 2 ;;
@@ -16,12 +17,21 @@ while (($#)); do
     --port) PORT=$2; shift 2 ;;
     --raw-loss-examples) RAW_LOSS_EXAMPLES=$2; shift 2 ;;
     --action-execution-mode) ACTION_EXECUTION_MODE=$2; shift 2 ;;
+    --expected-checkpoint-sha256) EXPECTED_CHECKPOINT_SHA256=$2; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [[ "${ACTION_EXECUTION_MODE}" == "A" || "${ACTION_EXECUTION_MODE}" == "B" ]] || {
   echo "--action-execution-mode must be A or B" >&2; exit 2;
 }
+SOURCE_LOCK_CHECKPOINT_ARGS=()
+if [[ -n "${EXPECTED_CHECKPOINT_SHA256}" ]]; then
+  [[ "${EXPECTED_CHECKPOINT_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] || {
+    echo "--expected-checkpoint-sha256 must contain 64 hexadecimal characters" >&2
+    exit 2
+  }
+  SOURCE_LOCK_CHECKPOINT_ARGS=(--expected-checkpoint-sha256 "${EXPECTED_CHECKPOINT_SHA256}")
+fi
 
 : "${OUTPUT:?--output is required}"
 OUTPUT=$(realpath -m -- "${OUTPUT}")
@@ -51,7 +61,8 @@ RAW_LOSS=${OUTPUT}/v0_streaming_raw_loss
 echo "[1/6] Freeze and verify current source/checkpoint/environment identity."
 "${OPENPI_LL_MAIN_PY}" "${OPENPI_LL_ROOT}/tools/openpi/source_lock_v2.py" create \
   --output "${LOCK}" --checkpoint "${OPENPI_LL_CHECKPOINT}" \
-  --config "${CONFIG}" --norm-stats "${OPENPI_LL_NORM}"
+  --config "${CONFIG}" --norm-stats "${OPENPI_LL_NORM}" \
+  "${SOURCE_LOCK_CHECKPOINT_ARGS[@]}"
 "${OPENPI_LL_MAIN_PY}" "${OPENPI_LL_ROOT}/tools/openpi/source_lock_v2.py" verify \
   --lock "${LOCK}"
 
