@@ -26,6 +26,7 @@ CHECKPOINT=${SIMVLA_CHECKPOINT:-YuankaiLuo/SimVLA-LIBERO}
 REVISION=${SIMVLA_CHECKPOINT_REVISION:-93dc4d90b0596c652ad2840ad743c62b9c4473fb}
 SMOLVLM=${SIMVLA_SMOLVLM_MODEL:-HuggingFaceTB/SmolVLM-500M-Instruct}
 TRAIN=${EXP}/train/ng2_schedule30k
+BENCH=${EXP}/benchmark/ng2_200
 OFFLINE10=${EXP}/offline/step_010000_ng3_ng2
 ONLINE10=${EXP}/online/step_010000_long100
 PORT=${SIMVLA_GENERATION_PORT:-29723}
@@ -73,6 +74,26 @@ train_10k() {
     --save-interval 5000 \
     --wandb-project "${SIMVLA_GENERATION_WANDB_PROJECT:-gnaroshi-simvla-generation-loop}" \
     --wandb-name "${SIMVLA_GENERATION_WANDB_NAME:-simvla_generation_ng2_10k}"
+}
+
+benchmark_200() {
+  guard "${BENCH}"
+  "${PYTHON}" -m torch.distributed.run \
+    --standalone --nnodes=1 --nproc-per-node=2 --master-port="$((PORT + 4))" \
+    -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_train \
+    --output "${BENCH}" \
+    --cache "${CACHE}" \
+    --checkpoint "${CHECKPOINT}" \
+    --checkpoint-revision "${REVISION}" \
+    --norm-stats "${NORM}" \
+    --smolvlm-model "${SMOLVLM}" \
+    --n-g 2 \
+    --stop-step 200 \
+    --schedule-total-steps 30000 \
+    --save-interval 200 \
+    --log-interval 20 \
+    --wandb-project "${SIMVLA_GENERATION_WANDB_PROJECT:-gnaroshi-simvla-generation-loop}" \
+    --wandb-name "${SIMVLA_GENERATION_WANDB_NAME:-simvla_generation_ng2_benchmark200}"
 }
 
 offline_10k() {
@@ -178,14 +199,16 @@ online_10k() {
 }
 
 case "${MODE}" in
+  --benchmark-200) benchmark_200 ;;
   --train-10k) train_10k ;;
   --offline-10k) offline_10k ;;
   --all-10k) train_10k; offline_10k ;;
   --screen-10k) train_10k; offline_10k; online_10k ;;
+  --fast-track-10k) benchmark_200; train_10k; offline_10k ;;
   --online-10k) online_10k ;;
   --resume-30k) resume_30k ;;
   *)
-    echo "Usage: $0 [--train-10k|--offline-10k|--all-10k|--online-10k|--screen-10k|--resume-30k]" >&2
+    echo "Usage: $0 [--benchmark-200|--train-10k|--offline-10k|--all-10k|--online-10k|--screen-10k|--fast-track-10k|--resume-30k]" >&2
     exit 2
     ;;
 esac
