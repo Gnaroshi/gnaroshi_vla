@@ -96,6 +96,23 @@ benchmark_200() {
     --wandb-name "${SIMVLA_GENERATION_WANDB_NAME:-simvla_generation_ng2_benchmark200}"
 }
 
+check_benchmark_budget() {
+  local summary=${BENCH}/run_summary_step_000200.json
+  local max_hours=${SIMVLA_GENERATION_MAX_10K_HOURS:-6.0}
+  [[ -f "${summary}" ]] || { echo "Missing ${summary}" >&2; exit 1; }
+  "${PYTHON}" -c '
+import json, sys
+path, limit = sys.argv[1], float(sys.argv[2])
+payload = json.load(open(path, encoding="utf-8"))
+projected = float(payload["mean_step_seconds"]) * 10000.0 / 3600.0
+print(f"GENERATION_10K_PROJECTION_HOURS={projected:.3f} LIMIT_HOURS={limit:.3f}")
+if projected > limit:
+    raise SystemExit(
+        f"Generation 10K projection {projected:.3f} h exceeds limit {limit:.3f} h"
+    )
+' "${summary}" "${max_hours}"
+}
+
 offline_10k() {
   local checkpoint=${TRAIN}/checkpoints/generation_step_010000.pt
   [[ -f "${checkpoint}" ]] || { echo "Missing ${checkpoint}" >&2; exit 1; }
@@ -204,7 +221,7 @@ case "${MODE}" in
   --offline-10k) offline_10k ;;
   --all-10k) train_10k; offline_10k ;;
   --screen-10k) train_10k; offline_10k; online_10k ;;
-  --fast-track-10k) benchmark_200; train_10k; offline_10k ;;
+  --fast-track-10k) benchmark_200; check_benchmark_budget; train_10k; offline_10k ;;
   --online-10k) online_10k ;;
   --resume-30k) resume_30k ;;
   *)
