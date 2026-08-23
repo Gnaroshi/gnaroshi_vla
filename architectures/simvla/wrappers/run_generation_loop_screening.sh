@@ -114,18 +114,28 @@ benchmark_200() {
 check_benchmark_budget() {
   local summary=${BENCH}/run_summary_step_000200.json
   local max_hours=${SIMVLA_GENERATION_MAX_10K_HOURS:-6.0}
+  local max_reserved_gib=${SIMVLA_GENERATION_MAX_RESERVED_GIB:-0}
   [[ -f "${summary}" ]] || { echo "Missing ${summary}" >&2; exit 1; }
   "${PYTHON}" -c '
 import json, sys
-path, limit = sys.argv[1], float(sys.argv[2])
+path, limit, max_reserved_gib = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 payload = json.load(open(path, encoding="utf-8"))
 projected = float(payload["mean_step_seconds"]) * 10000.0 / 3600.0
-print(f"GENERATION_10K_PROJECTION_HOURS={projected:.3f} LIMIT_HOURS={limit:.3f}")
+reserved_gib = float(payload["peak_reserved_bytes"]) / (1024.0 ** 3)
+print(
+    f"GENERATION_10K_PROJECTION_HOURS={projected:.3f} LIMIT_HOURS={limit:.3f} "
+    f"PEAK_RESERVED_GIB={reserved_gib:.3f} MAX_RESERVED_GIB={max_reserved_gib:.3f}"
+)
 if projected > limit:
     raise SystemExit(
         f"Generation 10K projection {projected:.3f} h exceeds limit {limit:.3f} h"
     )
-' "${summary}" "${max_hours}"
+if max_reserved_gib > 0 and reserved_gib > max_reserved_gib:
+    raise SystemExit(
+        f"Generation peak reserved {reserved_gib:.3f} GiB exceeds "
+        f"limit {max_reserved_gib:.3f} GiB"
+    )
+' "${summary}" "${max_hours}" "${max_reserved_gib}"
 }
 
 offline_10k() {

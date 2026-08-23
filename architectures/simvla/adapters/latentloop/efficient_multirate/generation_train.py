@@ -431,6 +431,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "optimizer/grad_norm": float(grad_norm),
                 "throughput/mean_step_seconds": elapsed / max(1, step - start_step),
                 "memory/peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                "memory/peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
                 "query_age_in_window_mean": float(np.mean(query_ages)),
                 "query_age_in_window_min": int(min(query_ages)),
                 "query_age_in_window_max": int(max(query_ages)),
@@ -475,6 +476,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "trainable_parameters": trainable,
         "elapsed_seconds": elapsed,
         "mean_step_seconds": elapsed / max(1, args.stop_step - start_step),
+        "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+        "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+        "device_name": torch.cuda.get_device_name(device),
+        "device_total_memory_bytes": int(
+            torch.cuda.get_device_properties(device).total_memory
+        ),
         "source_combined_sha256": source["combined_sha256"],
     }
     if rank == 0:
