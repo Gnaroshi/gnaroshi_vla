@@ -58,6 +58,13 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_che
     load_generation_checkpoint,
     save_generation_checkpoint,
 )
+from architectures.simvla.adapters.latentloop.efficient_multirate.generation_train import (
+    RankDisjointStepSampler,
+    _query_batch,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.generation_offline import (
+    MEASURED_SCHEDULES,
+)
 from architectures.simvla.adapters.latentloop.efficient_multirate.lineage_bridge import (
     lineage_require_gate,
 )
@@ -70,6 +77,9 @@ from methods.latentloop.modules.simvla_generation_loop import (
     SimVLAGenerationLoop,
 )
 from methods.latentloop.training.native_simvla_v0 import lr_multiplier
+from architectures.simvla.wrappers.simvla_generation_gpu_guard import (
+    parse_generation_gpu_ids,
+)
 
 
 def test_source_gate_fails_closed(tmp_path: Path) -> None:
@@ -468,6 +478,64 @@ def test_generation_ng2_checkpoint_roundtrip(tmp_path: Path) -> None:
     assert loaded.parameter_audit()["trained_generator_ages"] == [1, 2, 3, 4]
     for expected, observed in zip(updater.parameters(), loaded.parameters()):
         assert torch.equal(expected, observed)
+
+
+def test_generation_one_gpu_batch_two_matches_two_gpu_sample_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = {
+        "dataset_size": 17,
+        "seed": 20260823,
+        "start_step": 0,
+        "stop_step": 12,
+    }
+    rank0 = list(
+        RankDisjointStepSampler(
+            **kwargs, rank=0, world_size=2, local_batch_size=1
+        )
+    )
+    rank1 = list(
+        RankDisjointStepSampler(
+            **kwargs, rank=1, world_size=2, local_batch_size=1
+        )
+    )
+    two_gpu_logical_order = [
+        value
+        for pair in zip(rank0, rank1, strict=True)
+        for value in pair
+    ]
+    one_gpu_logical_order = list(
+        RankDisjointStepSampler(
+            **kwargs, rank=0, world_size=1, local_batch_size=2
+        )
+    )
+    assert one_gpu_logical_order == two_gpu_logical_order
+    assert len(one_gpu_logical_order) == 24
+
+    sequence = {
+        key: torch.arange(6).reshape(2, 3, 1)
+        for key in (
+            "conditions",
+            "valid_masks",
+            "proprio",
+            "explicit_noises",
+            "teacher_actions",
+        )
+    }
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    one_gpu_query = _query_batch(sequence, optimizer_step=0, rank=0)
+    assert one_gpu_query["query_age_in_window"].tolist() == [1, 2]
+    assert one_gpu_query["condition"].flatten().tolist() == [0, 4]
+
+
+def test_generation_gpu_ids_accept_one_or_two_only() -> None:
+    assert MEASURED_SCHEDULES == (10, 5, 3, 2)
+    assert parse_generation_gpu_ids("0") == (0,)
+    assert parse_generation_gpu_ids("4, 5") == (4, 5)
+    with pytest.raises(ValueError, match="one or two"):
+        parse_generation_gpu_ids("0,1,2")
+    with pytest.raises(ValueError, match="distinct"):
+        parse_generation_gpu_ids("0,0")
 
 
 def test_stage_graph_and_fixed_500_episode_manifest() -> None:

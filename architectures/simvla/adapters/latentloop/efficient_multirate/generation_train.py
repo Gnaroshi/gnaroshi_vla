@@ -1,4 +1,4 @@
-"""Short-budget two-GPU trainer for the SimVLA Generation Loop."""
+"""Short-budget one- or two-GPU trainer for the SimVLA Generation Loop."""
 
 from __future__ import annotations
 
@@ -64,10 +64,16 @@ class RankDisjointStepSampler(Sampler[int]):
         seed: int,
         rank: int,
         world_size: int,
+        local_batch_size: int = 1,
         start_step: int,
         stop_step: int,
     ) -> None:
-        if dataset_size < 1 or world_size < 1 or not 0 <= rank < world_size:
+        if (
+            dataset_size < 1
+            or world_size < 1
+            or local_batch_size < 1
+            or not 0 <= rank < world_size
+        ):
             raise ValueError("invalid distributed sampler contract")
         if start_step < 0 or stop_step <= start_step:
             raise ValueError("invalid optimizer-step interval")
@@ -75,11 +81,19 @@ class RankDisjointStepSampler(Sampler[int]):
         self.seed = int(seed)
         self.rank = int(rank)
         self.world_size = int(world_size)
+        self.local_batch_size = int(local_batch_size)
+        self.global_unique_batch = self.world_size * self.local_batch_size
         self.start_step = int(start_step)
         self.stop_step = int(stop_step)
 
-    def index(self, optimizer_step: int) -> int:
-        logical = int(optimizer_step) * self.world_size + self.rank
+    def index(self, optimizer_step: int, local_offset: int = 0) -> int:
+        if not 0 <= int(local_offset) < self.local_batch_size:
+            raise ValueError("local_offset is outside the local batch")
+        logical = (
+            int(optimizer_step) * self.global_unique_batch
+            + self.rank * self.local_batch_size
+            + int(local_offset)
+        )
         epoch, offset = divmod(logical, self.dataset_size)
         generator = torch.Generator(device="cpu")
         generator.manual_seed(self.seed + epoch)
@@ -87,10 +101,11 @@ class RankDisjointStepSampler(Sampler[int]):
 
     def __iter__(self) -> Iterator[int]:
         for step in range(self.start_step, self.stop_step):
-            yield self.index(step)
+            for local_offset in range(self.local_batch_size):
+                yield self.index(step, local_offset)
 
     def __len__(self) -> int:
-        return self.stop_step - self.start_step
+        return (self.stop_step - self.start_step) * self.local_batch_size
 
 
 class ExactTeacherGenerationDataset(ExactTeacherSequenceDataset):
@@ -143,16 +158,31 @@ def _seed_everything(seed: int) -> None:
 
 
 def _query_batch(sequence: dict[str, Any], *, optimizer_step: int, rank: int) -> dict[str, torch.Tensor]:
-    age_index = (int(optimizer_step) * dist.get_world_size() + int(rank)) % 3
+    local_batch_size = int(sequence["conditions"].shape[0])
+    global_unique_batch = dist.get_world_size() * local_batch_size
+    age_indices = torch.tensor(
+        [
+            (
+                int(optimizer_step) * global_unique_batch
+                + int(rank) * local_batch_size
+                + local_offset
+            )
+            % 3
+            for local_offset in range(local_batch_size)
+        ],
+        device=sequence["conditions"].device,
+        dtype=torch.long,
+    )
+    batch_indices = torch.arange(
+        local_batch_size, device=sequence["conditions"].device
+    )
     return {
-        "condition": sequence["conditions"][:, age_index],
-        "valid_mask": sequence["valid_masks"][:, age_index],
-        "proprio": sequence["proprio"][:, age_index],
-        "initial_noise": sequence["explicit_noises"][:, age_index],
-        "teacher_action": sequence["teacher_actions"][:, age_index],
-        "query_age_in_window": torch.tensor(
-            age_index + 1, device=sequence["conditions"].device
-        ),
+        "condition": sequence["conditions"][batch_indices, age_indices],
+        "valid_mask": sequence["valid_masks"][batch_indices, age_indices],
+        "proprio": sequence["proprio"][batch_indices, age_indices],
+        "initial_noise": sequence["explicit_noises"][batch_indices, age_indices],
+        "teacher_action": sequence["teacher_actions"][batch_indices, age_indices],
+        "query_age_in_window": age_indices + 1,
     }
 
 
@@ -179,11 +209,22 @@ def _wandb(args: argparse.Namespace, rank: int, config: dict[str, Any]) -> Any |
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     world_size = int(os.environ.get("WORLD_SIZE", "0"))
-    if world_size != 2:
-        raise RuntimeError("Generation Loop screening requires torchrun WORLD_SIZE=2")
-    selected = tuple(int(value) for value in os.environ["SIMVLA_GPU_IDS"].split(","))
-    if len(selected) != 2 or os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(map(str, selected)):
-        raise RuntimeError("CUDA_VISIBLE_DEVICES must exactly match two SIMVLA_GPU_IDS")
+    if world_size not in (1, 2):
+        raise RuntimeError("Generation Loop screening supports torchrun WORLD_SIZE in {1,2}")
+    selected = tuple(
+        int(value.strip())
+        for value in os.environ["SIMVLA_GPU_IDS"].split(",")
+        if value.strip()
+    )
+    if len(selected) != world_size or os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(
+        map(str, selected)
+    ):
+        raise RuntimeError("CUDA_VISIBLE_DEVICES must exactly match SIMVLA_GPU_IDS and WORLD_SIZE")
+    if int(args.local_batch_size) * world_size != 2:
+        raise RuntimeError(
+            "Generation Loop screening fixes unique global batch to 2: "
+            "local_batch_size * WORLD_SIZE must equal 2"
+        )
     if args.n_g not in (2, 3):
         raise ValueError("short-budget screening supports only N_G=2 or N_G=3")
     if not 1 <= args.stop_step <= args.schedule_total_steps <= 30_000:
@@ -286,12 +327,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         seed=args.seed,
         rank=rank,
         world_size=world_size,
+        local_batch_size=args.local_batch_size,
         start_step=start_step,
         stop_step=args.stop_step,
     )
     loader_kwargs: dict[str, Any] = {
         "dataset": dataset,
-        "batch_size": 1,
+        "batch_size": args.local_batch_size,
         "sampler": sampler,
         "collate_fn": collate_generation_sequences,
         "num_workers": args.num_workers,
@@ -316,9 +358,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "peak_lr": float(args.peak_lr),
         "final_lr_ratio": float(args.final_lr_ratio),
         "weight_decay": float(args.weight_decay),
-        "global_unique_batch": 2,
-        "local_batch": 1,
-        "world_size": 2,
+        "global_unique_batch": int(args.local_batch_size) * world_size,
+        "local_batch": int(args.local_batch_size),
+        "world_size": world_size,
         "loss": {
             "primary": "layer_normalized_local_oracle_hidden_mse",
             "hidden_weight": 1.0,
@@ -379,6 +421,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         if rank == 0 and (step == 1 or step % args.log_interval == 0):
             elapsed = time.perf_counter() - started
+            query_ages = query["query_age_in_window"].detach().cpu().tolist()
             metrics = {
                 "step": step,
                 "loss/hidden_normalized_mse": float(loss.hidden_normalized_mse.item()),
@@ -388,7 +431,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "optimizer/grad_norm": float(grad_norm),
                 "throughput/mean_step_seconds": elapsed / max(1, step - start_step),
                 "memory/peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
-                "query_age_in_window": int(query["query_age_in_window"].item()),
+                "query_age_in_window_mean": float(np.mean(query_ages)),
+                "query_age_in_window_min": int(min(query_ages)),
+                "query_age_in_window_max": int(max(query_ages)),
                 "n_g": int(args.n_g),
             }
             append_jsonl(output / "train_metrics.jsonl", metrics)
@@ -450,6 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--norm-stats", required=True)
     parser.add_argument("--smolvlm-model", default=DEFAULT_SMOLVLM)
     parser.add_argument("--n-g", type=int, default=2)
+    parser.add_argument("--local-batch-size", type=int, default=1)
     parser.add_argument("--stop-step", type=int, default=10_000)
     parser.add_argument("--schedule-total-steps", type=int, default=30_000)
     parser.add_argument("--resume", default="")

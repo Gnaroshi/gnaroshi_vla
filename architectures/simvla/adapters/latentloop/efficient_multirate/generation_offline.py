@@ -43,6 +43,9 @@ from architectures.simvla.adapters.latentloop.native_v0_runtime import (
 from methods.latentloop.modules.simvla_generation_loop import SimVLAGenerationLoop
 
 
+MEASURED_SCHEDULES = (10, 5, 3, 2)
+
+
 def _summary(values: list[float]) -> dict[str, float | int]:
     array = np.asarray(values, dtype=np.float64)
     return {
@@ -96,11 +99,17 @@ def _decode(
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     world_size = int(os.environ.get("WORLD_SIZE", "0"))
-    if world_size != 2:
-        raise RuntimeError("offline Generation screening requires torchrun WORLD_SIZE=2")
-    selected = tuple(int(value) for value in os.environ["SIMVLA_GPU_IDS"].split(","))
-    if len(selected) != 2 or os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(map(str, selected)):
-        raise RuntimeError("CUDA_VISIBLE_DEVICES must exactly match two SIMVLA_GPU_IDS")
+    if world_size not in (1, 2):
+        raise RuntimeError("offline Generation screening supports WORLD_SIZE in {1,2}")
+    selected = tuple(
+        int(value.strip())
+        for value in os.environ["SIMVLA_GPU_IDS"].split(",")
+        if value.strip()
+    )
+    if len(selected) != world_size or os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(
+        map(str, selected)
+    ):
+        raise RuntimeError("CUDA_VISIBLE_DEVICES must exactly match SIMVLA_GPU_IDS and WORLD_SIZE")
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -154,7 +163,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         normalized_proprio = action_adapter.normalize_proprio(proprio)
         initial_noise = sequence["explicit_noises"][:, age_index]
         teacher = sequence["teacher_actions"][:, age_index]
-        for n_g in (3, 2):
+        for n_g in MEASURED_SCHEDULES:
             torch.cuda.synchronize(device)
             started = time.perf_counter()
             action = _decode(
@@ -192,7 +201,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             key=lambda row: (row["flat_query_index"], row["n_g"]),
         )
         summaries = {}
-        for n_g in (3, 2):
+        for n_g in MEASURED_SCHEDULES:
             selected_rows = [row for row in rows if row["n_g"] == n_g]
             summaries[str(n_g)] = {
                 name: _summary([float(row[name]) for row in selected_rows])
@@ -213,7 +222,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "checkpoint": str(Path(args.generation_checkpoint).resolve()),
             "optimizer_step": int(checkpoint["optimizer_step"]),
             "queries_per_schedule": total,
-            "paired_schedules": [3, 2],
+            "paired_schedules": list(MEASURED_SCHEDULES),
             "candidate_n_g": candidate,
             "candidate_rule": "N_G=2 only when mean<=1.10x and p95<=1.20x N_G=3 first5 L1",
             "summaries": summaries,

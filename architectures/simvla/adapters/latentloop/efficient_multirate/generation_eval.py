@@ -44,7 +44,9 @@ from architectures.simvla.wrappers.dcld_eval.rollout_runner import (
     save_episode_video,
     video_frame_from_obs,
 )
-from architectures.simvla.wrappers.simvla_two_gpu_guard import parse_selected_gpu_ids
+from architectures.simvla.wrappers.simvla_generation_gpu_guard import (
+    parse_generation_gpu_ids,
+)
 
 
 MANIFEST_SCHEMA = "simvla_generation_libero_long_v1"
@@ -56,7 +58,7 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
 
 
 def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
-    selected = parse_selected_gpu_ids(os.environ.get("SIMVLA_GPU_IDS"))
+    selected = parse_generation_gpu_ids(os.environ.get("SIMVLA_GPU_IDS"))
     destination = Path(args.output).expanduser().resolve()
     if destination.exists():
         raise FileExistsError(f"refusing existing manifest: {destination}")
@@ -66,6 +68,16 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
         norm_stats=args.norm_stats,
         exact_cache=args.cache,
     )
+    task_partitions = (
+        (tuple(range(10)),)
+        if len(selected) == 1
+        else (tuple(range(5)), tuple(range(5, 10)))
+    )
+    task_to_rank = {
+        task_id: rank
+        for rank, task_ids in enumerate(task_partitions)
+        for task_id in task_ids
+    }
     episodes = [
         {
             "suite": "libero_10",
@@ -73,7 +85,7 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "trial_id": trial_id,
             "init_state_index": trial_id,
             "environment_seed": int(args.environment_seed),
-            "physical_gpu_id": selected[0 if task_id <= 4 else 1],
+            "physical_gpu_id": selected[task_to_rank[task_id]],
         }
         for task_id in range(10)
         for trial_id in range(args.trials_per_task)
@@ -90,8 +102,14 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "tasks": 10,
         "trials_per_task": int(args.trials_per_task),
         "episodes_per_row": len(episodes),
-        "task_partition": {"rank0": [0, 1, 2, 3, 4], "rank1": [5, 6, 7, 8, 9]},
-        "task_iteration_order": {"rank0": [4, 3, 2, 1, 0], "rank1": [9, 8, 7, 6, 5]},
+        "task_partition": {
+            f"rank{rank}": list(task_ids)
+            for rank, task_ids in enumerate(task_partitions)
+        },
+        "task_iteration_order": {
+            f"rank{rank}": list(reversed(task_ids))
+            for rank, task_ids in enumerate(task_partitions)
+        },
         "action_horizon": 10,
         "execution_horizon": 5,
         "flow_steps": 10,
@@ -120,7 +138,7 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
-def _validate_manifest(manifest: dict[str, Any], selected: tuple[int, int]) -> None:
+def _validate_manifest(manifest: dict[str, Any], selected: tuple[int, ...]) -> None:
     if manifest.get("schema_version") != MANIFEST_SCHEMA:
         raise ValueError("unsupported Generation Loop evaluation manifest")
     if manifest.get("selected_physical_gpu_ids") != list(selected):
@@ -185,11 +203,12 @@ def _make_policy(
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
-    selected = parse_selected_gpu_ids(os.environ.get("SIMVLA_GPU_IDS"))
+    selected = parse_generation_gpu_ids(os.environ.get("SIMVLA_GPU_IDS"))
     if os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(map(str, selected)):
         raise RuntimeError("CUDA_VISIBLE_DEVICES must exactly match SIMVLA_GPU_IDS")
-    if int(os.environ.get("WORLD_SIZE", "0")) != 2:
-        raise RuntimeError("Generation Loop evaluation requires torchrun WORLD_SIZE=2")
+    world_size = int(os.environ.get("WORLD_SIZE", "0"))
+    if world_size != len(selected):
+        raise RuntimeError("Generation Loop evaluation WORLD_SIZE must match SIMVLA_GPU_IDS")
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -227,7 +246,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if rank == 0:
         output.mkdir(parents=True)
     dist.barrier()
-    shard = output / f"shard_rank{rank}_tasks_{0 if rank == 0 else 5}_{4 if rank == 0 else 9}"
+    task_ids = [int(value) for value in manifest["task_iteration_order"][f"rank{rank}"]]
+    shard = output / f"shard_rank{rank}_tasks_{min(task_ids)}_{max(task_ids)}"
     shard.mkdir()
     write_json(shard / "source_lock.json", source)
 
@@ -240,9 +260,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     from libero.libero import benchmark
 
     suite = benchmark.get_benchmark_dict()["libero_10"]()
-    task_ids = [4, 3, 2, 1, 0] if rank == 0 else [9, 8, 7, 6, 5]
     episode_rows: list[dict[str, Any]] = []
-    assigned_total = 5 * int(manifest["trials_per_task"])
+    assigned_total = len(task_ids) * int(manifest["trials_per_task"])
     progress = tqdm(
         total=assigned_total,
         desc=f"{args.row} rank{rank}",

@@ -28,6 +28,8 @@ DEFAULT_RELEVANT_PATHS = (
     "architectures/simvla/adapters/latentloop/efficient_multirate/generation_source_lock.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/generation_train.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/generation_offline.py",
+    "architectures/simvla/wrappers/simvla_generation_gpu_guard.py",
+    "architectures/simvla/wrappers/simvla_two_gpu_guard.py",
     "architectures/simvla/wrappers/run_generation_loop_screening.sh",
 )
 

@@ -6,7 +6,7 @@ if [[ "${SIMVLA_GENERATION_RUN:-0}" != "1" ]]; then
   exit 2
 fi
 if [[ -z "${SIMVLA_GPU_IDS:-}" ]]; then
-  echo "SIMVLA_GPU_IDS=<gpu_a>,<gpu_b> is required." >&2
+  echo "SIMVLA_GPU_IDS=<gpu> or <gpu_a>,<gpu_b> is required." >&2
   exit 2
 fi
 
@@ -30,11 +30,24 @@ BENCH=${EXP}/benchmark/ng2_200
 OFFLINE10=${EXP}/offline/step_010000_ng3_ng2
 ONLINE10=${EXP}/online/step_010000_long100
 PORT=${SIMVLA_GENERATION_PORT:-29723}
+GPU_IDS=${SIMVLA_GPU_IDS//[[:space:]]/}
+IFS=',' read -r -a GPU_ARRAY <<< "${GPU_IDS}"
+WORLD_SIZE=${#GPU_ARRAY[@]}
+if [[ "${WORLD_SIZE}" != "1" && "${WORLD_SIZE}" != "2" ]]; then
+  echo "Generation Loop requires exactly one or two physical GPUs." >&2
+  exit 2
+fi
+LOCAL_BATCH_SIZE=${SIMVLA_GENERATION_LOCAL_BATCH_SIZE:-$((2 / WORLD_SIZE))}
+if (( LOCAL_BATCH_SIZE * WORLD_SIZE != 2 )); then
+  echo "local batch (${LOCAL_BATCH_SIZE}) * world size (${WORLD_SIZE}) must equal 2." >&2
+  exit 2
+fi
 
 cd "${ROOT}"
 export PYTHONPATH="${ROOT}:${UPSTREAM}:${UPSTREAM}/evaluation/libero/LIBERO${PYTHONPATH:+:${PYTHONPATH}}"
 export SIMVLA_UPSTREAM_ROOT="${UPSTREAM}"
-export CUDA_VISIBLE_DEVICES=${SIMVLA_GPU_IDS//[[:space:]]/}
+export SIMVLA_GPU_IDS="${GPU_IDS}"
+export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 export HF_HOME=${HF_HOME:-/home/mingyujung/private/gnaroshi_vla/.cache/huggingface}
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -51,7 +64,7 @@ export NUMEXPR_NUM_THREADS=1
 
 guard() {
   local output=$1
-  "${PYTHON}" -m architectures.simvla.wrappers.simvla_two_gpu_guard \
+  "${PYTHON}" -m architectures.simvla.wrappers.simvla_generation_gpu_guard \
     --gpu-ids "${SIMVLA_GPU_IDS}" \
     --output "${output}" \
     --require-empty-output >/dev/null
@@ -60,7 +73,7 @@ guard() {
 train_10k() {
   guard "${TRAIN}"
   "${PYTHON}" -m torch.distributed.run \
-    --standalone --nnodes=1 --nproc-per-node=2 --master-port="${PORT}" \
+    --standalone --nnodes=1 --nproc-per-node="${WORLD_SIZE}" --master-port="${PORT}" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_train \
     --output "${TRAIN}" \
     --cache "${CACHE}" \
@@ -69,6 +82,7 @@ train_10k() {
     --norm-stats "${NORM}" \
     --smolvlm-model "${SMOLVLM}" \
     --n-g 2 \
+    --local-batch-size "${LOCAL_BATCH_SIZE}" \
     --stop-step 10000 \
     --schedule-total-steps 30000 \
     --save-interval 5000 \
@@ -79,7 +93,7 @@ train_10k() {
 benchmark_200() {
   guard "${BENCH}"
   "${PYTHON}" -m torch.distributed.run \
-    --standalone --nnodes=1 --nproc-per-node=2 --master-port="$((PORT + 4))" \
+    --standalone --nnodes=1 --nproc-per-node="${WORLD_SIZE}" --master-port="$((PORT + 4))" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_train \
     --output "${BENCH}" \
     --cache "${CACHE}" \
@@ -88,6 +102,7 @@ benchmark_200() {
     --norm-stats "${NORM}" \
     --smolvlm-model "${SMOLVLM}" \
     --n-g 2 \
+    --local-batch-size "${LOCAL_BATCH_SIZE}" \
     --stop-step 200 \
     --schedule-total-steps 30000 \
     --save-interval 200 \
@@ -118,7 +133,7 @@ offline_10k() {
   [[ -f "${checkpoint}" ]] || { echo "Missing ${checkpoint}" >&2; exit 1; }
   guard "${OFFLINE10}"
   "${PYTHON}" -m torch.distributed.run \
-    --standalone --nnodes=1 --nproc-per-node=2 --master-port="$((PORT + 1))" \
+    --standalone --nnodes=1 --nproc-per-node="${WORLD_SIZE}" --master-port="$((PORT + 1))" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_offline \
     --output "${OFFLINE10}" \
     --cache "${CACHE}" \
@@ -133,10 +148,10 @@ offline_10k() {
 resume_30k() {
   local checkpoint=${TRAIN}/checkpoints/generation_step_010000.pt
   [[ -f "${checkpoint}" ]] || { echo "Missing ${checkpoint}" >&2; exit 1; }
-  "${PYTHON}" -m architectures.simvla.wrappers.simvla_two_gpu_guard \
+  "${PYTHON}" -m architectures.simvla.wrappers.simvla_generation_gpu_guard \
     --gpu-ids "${SIMVLA_GPU_IDS}" >/dev/null
   "${PYTHON}" -m torch.distributed.run \
-    --standalone --nnodes=1 --nproc-per-node=2 --master-port="${PORT}" \
+    --standalone --nnodes=1 --nproc-per-node="${WORLD_SIZE}" --master-port="${PORT}" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_train \
     --output "${TRAIN}" \
     --cache "${CACHE}" \
@@ -145,6 +160,7 @@ resume_30k() {
     --norm-stats "${NORM}" \
     --smolvlm-model "${SMOLVLM}" \
     --n-g 2 \
+    --local-batch-size "${LOCAL_BATCH_SIZE}" \
     --stop-step 30000 \
     --schedule-total-steps 30000 \
     --resume "${checkpoint}" \
@@ -186,7 +202,7 @@ online_10k() {
 
   guard "${ONLINE10}/baseline_k1"
   "${PYTHON}" -m torch.distributed.run \
-    --standalone --nnodes=1 --nproc-per-node=2 --master-port="$((PORT + 2))" \
+    --standalone --nnodes=1 --nproc-per-node="${WORLD_SIZE}" --master-port="$((PORT + 2))" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_eval \
     evaluate \
     --row baseline_k1 \
@@ -200,7 +216,7 @@ online_10k() {
 
   guard "${ONLINE10}/generation_ng${candidate}"
   "${PYTHON}" -m torch.distributed.run \
-    --standalone --nnodes=1 --nproc-per-node=2 --master-port="$((PORT + 3))" \
+    --standalone --nnodes=1 --nproc-per-node="${WORLD_SIZE}" --master-port="$((PORT + 3))" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_eval \
     evaluate \
     --row "generation_ng${candidate}" \
