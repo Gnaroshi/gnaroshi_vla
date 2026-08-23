@@ -40,9 +40,9 @@ GENERATION_SCHEDULES: dict[int, tuple[int, ...]] = {
     10: tuple(range(10)),
     5: (0, 2, 4, 6, 8),
     3: (0, 4, 8),
+    2: (0, 5),
 }
 DISABLED_GENERATION_SCHEDULES: dict[int, tuple[int, ...]] = {
-    2: (0, 5),
     1: (0,),
 }
 

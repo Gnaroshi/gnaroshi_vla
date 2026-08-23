@@ -53,8 +53,8 @@ class SimVLAGenerationHiddenUpdater(nn.Module):
         gate_bias: float = -4.0,
     ) -> None:
         super().__init__()
-        if max_generator_age != 3:
-            raise ValueError("primary Generation Loop trains skipped ages 1, 2, and 3")
+        if max_generator_age < 1 or max_generator_age > 9:
+            raise ValueError("max_generator_age must be in [1,9]")
         self.hidden_dim = int(hidden_dim)
         self.condition_dim = int(condition_dim)
         self.action_dim = int(action_dim)
@@ -145,8 +145,15 @@ class SimVLAGenerationHiddenUpdater(nn.Module):
         )
         if age.ndim == 0:
             age = age.expand(batch)
-        if age.shape != (batch,) or bool((age < 1).any()) or bool((age > 3).any()):
-            raise ValueError("generator_age must be scalar or [B] with values 1..3")
+        if (
+            age.shape != (batch,)
+            or bool((age < 1).any())
+            or bool((age > self.max_generator_age).any())
+        ):
+            raise ValueError(
+                "generator_age must be scalar or [B] with values "
+                f"1..{self.max_generator_age}"
+            )
 
         action_features = torch.cat(
             (
@@ -195,7 +202,7 @@ class SimVLAGenerationHiddenUpdater(nn.Module):
             "uses_full_condition_q_j": True,
             "uses_condition_change_code_c_j": True,
             "schedule_independent": True,
-            "trained_generator_ages": [1, 2, 3],
+            "trained_generator_ages": list(range(1, self.max_generator_age + 1)),
         }
 
 
@@ -250,8 +257,12 @@ class SimVLAGenerationLoop(nn.Module):
                 if previous_hidden is None or previous_x is None:
                     raise RuntimeError("skipped flow step has no preceding full/predicted hidden")
                 age += 1
-                if age > 3:
-                    raise RuntimeError("primary Generation Loop supports skipped ages only through 3")
+                if age > self.updater.max_generator_age:
+                    raise RuntimeError(
+                        "Generation Loop schedule requires generator age "
+                        f"{age}, but updater supports only "
+                        f"1..{self.updater.max_generator_age}"
+                    )
                 update = self.updater(
                     previous_hidden,
                     previous_x,

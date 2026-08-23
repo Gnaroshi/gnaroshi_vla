@@ -53,6 +53,11 @@ from architectures.simvla.adapters.latentloop.native_v0_runtime import (
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_hidden import (
     hidden_hook_parity_report,
 )
+from architectures.simvla.adapters.latentloop.efficient_multirate.generation_checkpoint import (
+    GenerationLoopConfig,
+    load_generation_checkpoint,
+    save_generation_checkpoint,
+)
 from architectures.simvla.adapters.latentloop.efficient_multirate.lineage_bridge import (
     lineage_require_gate,
 )
@@ -420,6 +425,49 @@ def test_generator_hidden_hook_nfe_schedules_and_generation_ages() -> None:
     assert trace.skipped_ages == (1, 2, 3, 1, 2, 3, 1)
     assert updater.parameter_audit()["under_hard_cap"] is True
     assert all(not parameter.requires_grad for parameter in loop.decoder.parameters())
+
+    ng2_updater = SimVLAGenerationHiddenUpdater(
+        hidden_dim=8,
+        condition_dim=8,
+        condition_code_dim=4,
+        rank_dim=8,
+        max_generator_age=4,
+    )
+    ng2_loop = SimVLAGenerationLoop(ng2_updater, transformer.action_decoder)
+    ng2_trace = ng2_loop(
+        torch.zeros(2, 10, 7),
+        full_step=full_step,
+        full_step_indices=GENERATION_SCHEDULES[2],
+        proprio=torch.zeros(2, 8),
+        condition=torch.zeros(2, 3, 8),
+        condition_valid_mask=torch.ones(2, 3, dtype=torch.bool),
+        condition_change_code=torch.zeros(2, 4),
+    )
+    assert ng2_trace.skipped_ages == (1, 2, 3, 4, 1, 2, 3, 4)
+
+
+def test_generation_ng2_checkpoint_roundtrip(tmp_path: Path) -> None:
+    config = GenerationLoopConfig()
+    updater = config.build()
+    assert updater.parameter_audit()["trainable_parameters"] == 494_209
+    optimizer = torch.optim.AdamW(updater.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    checkpoint = tmp_path / "generation.pt"
+    save_generation_checkpoint(
+        checkpoint,
+        updater=updater,
+        config=config,
+        optimizer_step=10_000,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        source_lock={"combined_sha256": "source"},
+        training_config={"n_g": 2, "schedule_total_steps": 30_000},
+    )
+    loaded, payload = load_generation_checkpoint(checkpoint, device="cpu")
+    assert payload["optimizer_step"] == 10_000
+    assert loaded.parameter_audit()["trained_generator_ages"] == [1, 2, 3, 4]
+    for expected, observed in zip(updater.parameters(), loaded.parameters()):
+        assert torch.equal(expected, observed)
 
 
 def test_stage_graph_and_fixed_500_episode_manifest() -> None:
