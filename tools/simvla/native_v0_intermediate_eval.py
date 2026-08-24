@@ -1,8 +1,8 @@
-"""Intermediate-checkpoint LIBERO-Long diagnostics for native SimVLA V0.
+"""Bounded LIBERO-Long diagnostics for native SimVLA V0 checkpoints.
 
-This runner deliberately does not satisfy or bypass the final-150K scientific
-gate. It evaluates an immutable intermediate checkpoint on a paired 10x50
-manifest and labels every artifact as diagnostic-only.
+This runner never bypasses the scientific offline gate. It evaluates either an
+intermediate checkpoint or an explicitly marked final-checkpoint diagnostic on
+an immutable paired 10x50 manifest and labels every artifact diagnostic-only.
 """
 
 from __future__ import annotations
@@ -30,6 +30,9 @@ from architectures.simvla.adapters.latentloop.native_v0_long_eval import (
     _policy,
     _trajectory_metrics,
 )
+from architectures.simvla.adapters.latentloop.native_v0_policy import (
+    RealSimVLANativeV0Policy,
+)
 from architectures.simvla.adapters.latentloop.native_v0_runtime import (
     DEFAULT_CHECKPOINT,
     DEFAULT_SMOLVLM,
@@ -53,6 +56,81 @@ from architectures.simvla.wrappers.simvla_two_gpu_guard import parse_selected_gp
 
 MANIFEST_SCHEMA = "simvla_native_v0_intermediate_libero_long_500_v1"
 DIAGNOSTIC_CLASS = "INTERMEDIATE_CHECKPOINT_DIAGNOSTIC_ONLY"
+FINAL_MANIFEST_SCHEMA = "simvla_native_v0_final_gate_failure_diagnostic_libero_long_500_v1"
+FINAL_DIAGNOSTIC_CLASS = "FINAL_CHECKPOINT_GATE_FAILURE_DIAGNOSTIC_ONLY"
+
+
+class _NativeV0K2Policy(RealSimVLANativeV0Policy):
+    """Use the unchanged V0 updater for one predicted query between refreshes."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.mode = "native_v0_k2"
+        self.row_name = "native_v0_k2"
+        self.refresh_every = 2
+
+    def _refill_action_queue(self, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
+        self.metrics.counters["num_policy_queries"] += 1
+        query = int(self.query_index)
+        age = query % 2
+        if age == 0:
+            _, action_chunk, seed = self._full_refresh(
+                batch,
+                policy_query_index=query,
+            )
+            source = "full_refresh"
+            refreshed = True
+        else:
+            _, action_chunk, seed = self._v0_update(
+                batch,
+                age=1,
+                policy_query_index=query,
+            )
+            source = "native_v0"
+            refreshed = False
+        self.action_queue.clear()
+        for action in action_chunk[0, :5]:
+            self.action_queue.append((action.detach(), source))
+        self.query_trace.append(
+            {
+                "policy_query_index": query,
+                "age": age,
+                "source": source,
+                "full_vlm_called": refreshed,
+                "condition_updater_called": not refreshed,
+                "action_noise_seed": seed,
+                "action_horizon": 10,
+                "execution_horizon": 5,
+                "refresh_every": 2,
+            }
+        )
+        self.query_index += 1
+        return {
+            "refreshed": refreshed,
+            "age": age,
+            "queue_mode": source,
+            "action_noise_seed": seed,
+        }
+
+
+def _diagnostic_policy(**kwargs: Any) -> Any:
+    if kwargs["row"] != "native_v0_k2":
+        return _policy(**kwargs)
+    row = kwargs.pop("row")
+    if row != "native_v0_k2":
+        raise AssertionError(row)
+    return _NativeV0K2Policy(
+        model=kwargs["model"],
+        processor=kwargs["processor"],
+        adapter=kwargs["adapter"],
+        checkpoint_id=kwargs["checkpoint"],
+        device=kwargs["device"],
+        suite="libero_10",
+        task_id=kwargs["task_id"],
+        trial_id=kwargs["trial_id"],
+        action_noise_seed_base=kwargs["action_noise_seed_base"],
+        log_action_chunks=True,
+    )
 
 
 def _source_without_gpu_slots(source: dict[str, Any]) -> dict[str, Any]:
@@ -99,25 +177,42 @@ def require_source_compatible(
     )
 
 
-def _load_checkpoint_payload(path: str | Path) -> dict[str, Any]:
+def _load_checkpoint_payload(
+    path: str | Path,
+    *,
+    allow_final_diagnostic: bool = False,
+) -> dict[str, Any]:
     payload = torch.load(Path(path).expanduser().resolve(), map_location="cpu", weights_only=False)
     if payload.get("checkpoint_format") != CHECKPOINT_FORMAT:
         raise ValueError(f"unsupported native V0 checkpoint: {payload.get('checkpoint_format')}")
     step = int(payload.get("global_optimizer_step", -1))
-    if not 0 < step < 150_000:
-        raise ValueError(f"intermediate diagnostic requires 0 < step < 150000, got {step}")
-    if bool(payload.get("scientific_primary_checkpoint")):
-        raise ValueError("final scientific checkpoint must use the strict final evaluator")
+    is_final = bool(payload.get("scientific_primary_checkpoint"))
+    if allow_final_diagnostic:
+        if step != 150_000 or not is_final:
+            raise ValueError("final diagnostic requires the immutable scientific-primary 150K checkpoint")
+    else:
+        if is_final:
+            raise ValueError("final scientific checkpoint requires an explicit diagnostic declaration")
+        if not 0 < step < 150_000:
+            raise ValueError(f"intermediate diagnostic requires 0 < step < 150000, got {step}")
     return payload
 
 
 def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
     selected = parse_selected_gpu_ids(os.environ.get("SIMVLA_GPU_IDS"))
+    candidate_gpus = parse_selected_gpu_ids(args.candidate_gpu_ids) if args.candidate_gpu_ids else selected
+    baseline_gpus = parse_selected_gpu_ids(args.baseline_gpu_ids) if args.baseline_gpu_ids else selected
+    if candidate_gpus != selected:
+        raise RuntimeError("manifest creation must run with the declared candidate GPU pair")
     path = Path(args.output).expanduser().resolve()
     if path.exists():
         raise FileExistsError(f"refusing existing manifest: {path}")
     checkpoint_path = Path(args.v0_checkpoint).expanduser().resolve()
-    checkpoint_payload = _load_checkpoint_payload(checkpoint_path)
+    allow_final = bool(args.allow_final_diagnostic)
+    checkpoint_payload = _load_checkpoint_payload(
+        checkpoint_path,
+        allow_final_diagnostic=allow_final,
+    )
     checkpoint_source = checkpoint_payload["source_lock"]
     runtime_source = native_v0_source_manifest(
         checkpoint=args.checkpoint,
@@ -133,6 +228,16 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
         verdicts=("K1_HOOK_PARITY_PASS",),
         source_combined_sha256=checkpoint_source["combined_sha256"],
     )
+    offline_gate = None
+    if allow_final:
+        if not args.offline_gate:
+            raise ValueError("--offline-gate is required for a final-checkpoint diagnostic")
+        offline_gate_path = Path(args.offline_gate).expanduser().resolve()
+        offline_gate = json.loads(offline_gate_path.read_text(encoding="utf-8"))
+        if offline_gate.get("verdict") != "OFFLINE_K4_GATE_FAIL":
+            raise RuntimeError("this diagnostic route is only for an explicitly failed final offline gate")
+        if offline_gate.get("source_combined_sha256") != checkpoint_source["combined_sha256"]:
+            raise RuntimeError("offline gate source lock differs from the final checkpoint")
     episodes = []
     for task_id in range(10):
         physical_gpu = selected[0] if task_id <= 4 else selected[1]
@@ -178,19 +283,35 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
     }
     training_config = checkpoint_payload.get("training_config", {})
     payload: dict[str, Any] = {
-        "schema_version": MANIFEST_SCHEMA,
-        "evaluation_class": DIAGNOSTIC_CLASS,
+        "schema_version": FINAL_MANIFEST_SCHEMA if allow_final else MANIFEST_SCHEMA,
+        "evaluation_class": FINAL_DIAGNOSTIC_CLASS if allow_final else DIAGNOSTIC_CLASS,
         "scientific_claim_allowed": False,
-        "final_150k_required_for_scientific_evaluation": True,
+        "paper_table_eligible": False,
+        "diagnostic_reason": (
+            "separate age-1/K_C=2 behavior from recursive age-2/3 accumulation after the strict K_C=4 gate failed"
+            if allow_final
+            else "bounded intermediate-checkpoint diagnostic"
+        ),
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_step": int(checkpoint_payload["global_optimizer_step"]),
-        "checkpoint_scientific_primary": False,
+        "checkpoint_scientific_primary": bool(checkpoint_payload.get("scientific_primary_checkpoint")),
+        "diagnostic_tool_path": str(Path(__file__).resolve()),
+        "diagnostic_tool_sha256": sha256_file(Path(__file__).resolve()),
+        "offline_gate_path": str(Path(args.offline_gate).expanduser().resolve()) if args.offline_gate else None,
+        "offline_gate_sha256": sha256_file(args.offline_gate) if args.offline_gate else None,
+        "offline_gate_verdict": offline_gate.get("verdict") if offline_gate else None,
         "source_combined_sha256": checkpoint_source["combined_sha256"],
         "runtime_source_combined_sha256": runtime_source["combined_sha256"],
         "gpu_ordinal_only_source_difference_allowed": True,
         "checkpoint_source_lock": checkpoint_source,
         "runtime_source_lock": runtime_source,
         "selected_physical_gpu_ids": list(selected),
+        "row_runtime_gpu_ids": {
+            "native_v0_k2": list(candidate_gpus),
+            "native_v0_k4": list(candidate_gpus),
+            "baseline_k1": list(baseline_gpus),
+        },
+        "rows_run_concurrently": bool(args.rows_run_concurrently),
         "suite": "libero_10",
         "tasks": 10,
         "episodes_per_task": 50,
@@ -222,15 +343,32 @@ def create_manifest(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
-def _validate_manifest(manifest: dict[str, Any], selected: tuple[int, int]) -> None:
-    if manifest.get("schema_version") != MANIFEST_SCHEMA:
-        raise ValueError("unsupported intermediate manifest")
-    if manifest.get("evaluation_class") != DIAGNOSTIC_CLASS:
-        raise ValueError("manifest is not diagnostic-only")
+def _validate_manifest(
+    manifest: dict[str, Any],
+    selected: tuple[int, int],
+    *,
+    row: str | None = None,
+    allow_gpu_ordinal_remap: bool = False,
+) -> None:
+    supported = {
+        MANIFEST_SCHEMA: DIAGNOSTIC_CLASS,
+        FINAL_MANIFEST_SCHEMA: FINAL_DIAGNOSTIC_CLASS,
+    }
+    if manifest.get("schema_version") not in supported:
+        raise ValueError("unsupported bounded diagnostic manifest")
+    if manifest.get("evaluation_class") != supported[manifest["schema_version"]]:
+        raise ValueError("manifest diagnostic class does not match its schema")
     if manifest.get("scientific_claim_allowed") is not False:
         raise ValueError("intermediate manifest cannot permit a scientific claim")
-    if manifest.get("selected_physical_gpu_ids") != list(selected):
+    row_gpu_ids = manifest.get("row_runtime_gpu_ids", {})
+    expected_gpu_ids = row_gpu_ids.get(row, manifest.get("selected_physical_gpu_ids"))
+    if not allow_gpu_ordinal_remap and expected_gpu_ids != list(selected):
         raise RuntimeError("manifest and SIMVLA_GPU_IDS differ")
+    if manifest.get("diagnostic_tool_sha256") and sha256_file(Path(__file__).resolve()) != manifest["diagnostic_tool_sha256"]:
+        raise RuntimeError("diagnostic tool changed after manifest creation")
+    if manifest.get("offline_gate_path"):
+        if sha256_file(manifest["offline_gate_path"]) != manifest.get("offline_gate_sha256"):
+            raise RuntimeError("offline gate changed after manifest creation")
     mismatches = {
         name: (os.environ.get(name), value)
         for name, value in manifest["renderer"].items()
@@ -260,7 +398,12 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
     manifest_path = Path(args.manifest).expanduser().resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     configure_strict_torch_determinism(int(manifest["seed_base"]))
-    _validate_manifest(manifest, selected)
+    _validate_manifest(
+        manifest,
+        selected,
+        row=args.row,
+        allow_gpu_ordinal_remap=bool(args.allow_gpu_ordinal_remap),
+    )
     runtime_source = native_v0_source_manifest(
         checkpoint=args.checkpoint,
         norm_stats=args.norm_stats,
@@ -275,7 +418,10 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
         verdicts=("K1_HOOK_PARITY_PASS",),
         source_combined_sha256=manifest["source_combined_sha256"],
     )
-    checkpoint_payload = _load_checkpoint_payload(args.v0_checkpoint)
+    checkpoint_payload = _load_checkpoint_payload(
+        args.v0_checkpoint,
+        allow_final_diagnostic=bool(args.allow_final_diagnostic),
+    )
     if int(checkpoint_payload["global_optimizer_step"]) != int(manifest["checkpoint_step"]):
         raise RuntimeError("checkpoint step differs from frozen diagnostic manifest")
     require_source_compatible(
@@ -283,7 +429,7 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
         runtime_source=runtime_source,
     )
     adapter = None
-    if args.row == "native_v0_k4":
+    if args.row in {"native_v0_k2", "native_v0_k4"}:
         adapter, loaded = load_native_v0_checkpoint(
             args.v0_checkpoint,
             device=device,
@@ -306,7 +452,7 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
     write_json(
         shard / "source_lock.json",
         {
-            "evaluation_class": DIAGNOSTIC_CLASS,
+            "evaluation_class": manifest["evaluation_class"],
             "checkpoint_source_lock": checkpoint_payload["source_lock"],
             "runtime_source_lock": runtime_source,
         },
@@ -314,11 +460,13 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
     write_json(
         shard / "eval_contract.json",
         {
-            "evaluation_class": DIAGNOSTIC_CLASS,
+            "evaluation_class": manifest["evaluation_class"],
             "scientific_claim_allowed": False,
             "row": args.row,
             "rank": rank,
             "physical_gpu_id": selected[rank],
+            "manifest_physical_gpu_ids": manifest["selected_physical_gpu_ids"],
+            "gpu_ordinal_remap": bool(args.allow_gpu_ordinal_remap),
             "checkpoint_step": int(manifest["checkpoint_step"]),
             "manifest": str(manifest_path),
             "manifest_sha256": manifest["manifest_sha256"],
@@ -350,7 +498,7 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
                 obs = env.set_init_state(initial_states[int(episode_spec["init_state_index"]) % len(initial_states)])
                 for _ in range(10):
                     obs, _, _, _ = env.step([0.0] * 6 + [-1.0])
-                policy = _policy(
+                policy = _diagnostic_policy(
                     row=args.row,
                     model=model,
                     processor=processor,
@@ -455,12 +603,14 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
         for row in query_rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
     summary = {
-        "evaluation_class": DIAGNOSTIC_CLASS,
+        "evaluation_class": manifest["evaluation_class"],
         "scientific_claim_allowed": False,
         "checkpoint_step": int(manifest["checkpoint_step"]),
         "row": args.row,
         "rank": rank,
         "physical_gpu_id": selected[rank],
+        "manifest_physical_gpu_ids": manifest["selected_physical_gpu_ids"],
+        "gpu_ordinal_remap": bool(args.allow_gpu_ordinal_remap),
         "v0_module_parameters": int(adapter.parameter_audit()["total"]) if adapter is not None else 0,
         "tasks": task_ids,
         "episodes": len(episode_rows),
@@ -495,8 +645,9 @@ def compare_rows(args: argparse.Namespace) -> dict[str, Any]:
     baseline = json.loads(Path(args.baseline_summary).read_text(encoding="utf-8"))
     candidate = json.loads(Path(args.v0_summary).read_text(encoding="utf-8"))
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
-    if baseline["row"] != "baseline_k1" or candidate["row"] != "native_v0_k4":
-        raise ValueError("comparison requires baseline_k1 and native_v0_k4")
+    candidate_row = candidate["row"]
+    if baseline["row"] != "baseline_k1" or candidate_row not in {"native_v0_k2", "native_v0_k4"}:
+        raise ValueError("comparison requires baseline_k1 and one native V0 candidate")
     if baseline["manifest_sha256"] != candidate["manifest_sha256"]:
         raise RuntimeError("rows do not share the same manifest")
     if candidate["manifest_sha256"] != manifest["manifest_sha256"]:
@@ -523,15 +674,28 @@ def compare_rows(args: argparse.Namespace) -> dict[str, Any]:
         else:
             flips["both_fail"] += 1
     result = {
-        "verdict": "INTERMEDIATE_DIAGNOSTIC_COMPLETE",
-        "evaluation_class": DIAGNOSTIC_CLASS,
+        "verdict": (
+            "FINAL_GATE_FAILURE_KC_DIAGNOSTIC_COMPLETE"
+            if manifest["checkpoint_scientific_primary"]
+            else "INTERMEDIATE_DIAGNOSTIC_COMPLETE"
+        ),
+        "evaluation_class": manifest["evaluation_class"],
         "scientific_claim_allowed": False,
         "paper_table_eligible": False,
-        "final_150k_evaluation_still_required": True,
+        "checkpoint_scientific_primary": bool(manifest["checkpoint_scientific_primary"]),
+        "offline_gate_verdict": manifest.get("offline_gate_verdict"),
         "checkpoint_step": int(manifest["checkpoint_step"]),
         "checkpoint_path": manifest["checkpoint_path"],
         "norm_stats_sha256": manifest["norm_stats_sha256"],
         "manifest_sha256": candidate["manifest_sha256"],
+        "row_runtime_gpu_ids": manifest.get("row_runtime_gpu_ids"),
+        "rows_run_concurrently": bool(manifest.get("rows_run_concurrently")),
+        "latency_comparison_valid": not bool(manifest.get("rows_run_concurrently")),
+        "latency_comparison_note": (
+            "Rows ran concurrently on disjoint GPUs; retain raw latency logs but do not use their ratio as a paper number."
+            if manifest.get("rows_run_concurrently")
+            else "Rows ran without declared cross-row concurrency."
+        ),
         "baseline": {
             "successes": baseline["successes"],
             "episodes": baseline["episodes"],
@@ -539,7 +703,7 @@ def compare_rows(args: argparse.Namespace) -> dict[str, Any]:
             "full_vlm_calls": baseline["full_vlm_calls"],
             "latency": baseline["latency"],
         },
-        "native_v0_k4": {
+        candidate_row: {
             "successes": candidate["successes"],
             "episodes": candidate["episodes"],
             "success_rate": candidate["success_rate"],
@@ -568,9 +732,14 @@ def build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--seed-base", type=int, default=20260815)
     manifest.add_argument("--environment-seed", type=int, default=7)
     manifest.add_argument("--action-noise-seed-base", type=int, default=6828326409295398833)
+    manifest.add_argument("--allow-final-diagnostic", action="store_true")
+    manifest.add_argument("--offline-gate")
+    manifest.add_argument("--candidate-gpu-ids")
+    manifest.add_argument("--baseline-gpu-ids")
+    manifest.add_argument("--rows-run-concurrently", action="store_true")
     manifest.set_defaults(handler=create_manifest)
     evaluate = subparsers.add_parser("evaluate")
-    evaluate.add_argument("--row", choices=("baseline_k1", "native_v0_k4"), required=True)
+    evaluate.add_argument("--row", choices=("baseline_k1", "native_v0_k2", "native_v0_k4"), required=True)
     evaluate.add_argument("--output", required=True)
     evaluate.add_argument("--manifest", required=True)
     evaluate.add_argument("--cache", required=True)
@@ -583,6 +752,8 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--video-failures-only", action="store_true")
     evaluate.add_argument("--video-stride", type=int, default=2)
     evaluate.add_argument("--video-max-per-task", type=int, default=2)
+    evaluate.add_argument("--allow-final-diagnostic", action="store_true")
+    evaluate.add_argument("--allow-gpu-ordinal-remap", action="store_true")
     evaluate.set_defaults(handler=run_eval)
     compare = subparsers.add_parser("compare")
     compare.add_argument("--output", required=True)
