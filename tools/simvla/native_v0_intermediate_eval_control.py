@@ -29,32 +29,42 @@ from tools.simvla import native_v0_intermediate_eval as evaluator
 
 CONTROL_SCHEMA = "simvla_native_v0_intermediate_eval_control_v1"
 FINAL_RENDEZVOUS_TIMEOUT_SECONDS = 4 * 60 * 60
+EGL_RENDERER_CONTRACT: dict[str, str | None] = {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "GALLIUM_DRIVER": None,
+    "HF_HUB_OFFLINE": "1",
+    "LIBGL_ALWAYS_SOFTWARE": None,
+    "LP_NUM_THREADS": "0",
+    "MKL_NUM_THREADS": "1",
+    "MUJOCO_GL": "egl",
+    "NUMEXPR_NUM_THREADS": "1",
+    "NVIDIA_TF32_OVERRIDE": "0",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "PYOPENGL_PLATFORM": "egl",
+    "PYTHONHASHSEED": "20260815",
+    "TOKENIZERS_PARALLELISM": "false",
+    "TRANSFORMERS_OFFLINE": "1",
+}
 
 
 def _require_egl() -> None:
-    required = {
-        "MUJOCO_GL": "egl",
-        "PYOPENGL_PLATFORM": "egl",
-    }
     mismatches = {
-        key: os.environ.get(key)
-        for key, expected in required.items()
+        key: (os.environ.get(key), expected)
+        for key, expected in EGL_RENDERER_CONTRACT.items()
         if os.environ.get(key) != expected
     }
-    forbidden = {
-        key: os.environ.get(key)
-        for key in ("GALLIUM_DRIVER", "LIBGL_ALWAYS_SOFTWARE")
-        if os.environ.get(key)
-    }
-    if mismatches or forbidden:
-        raise RuntimeError(
-            f"EGL-only contract failed: mismatches={mismatches}, forbidden={forbidden}"
-        )
+    if mismatches:
+        raise RuntimeError(f"EGL-only contract failed: mismatches={mismatches}")
 
 
 def _augment_manifest(path: str | Path) -> dict[str, Any]:
     manifest_path = Path(path).expanduser().resolve()
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["superseded_original_diagnostic_renderer"] = payload["renderer"]
+    payload["renderer"] = dict(EGL_RENDERER_CONTRACT)
+    payload["evaluation_renderer_backend"] = "egl"
     payload["distributed_finalization"] = {
         "schema_version": CONTROL_SCHEMA,
         "control_path": str(Path(__file__).resolve()),
