@@ -22,11 +22,15 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_cont
     CONDITION_ROW,
     FROZEN_CONDITION_SOURCE_SHA256,
 )
+from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
+    COUPLED_ROW,
+)
 
 
 BASELINE_ROW = "full_nfe10"
 GENERATION_ROW = "generation_ng3"
 ROWS = (BASELINE_ROW, CONDITION_ROW, GENERATION_ROW, COMBINED_ROW)
+AGGREGATABLE_ROWS = (*ROWS, COUPLED_ROW)
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -84,7 +88,7 @@ def _expected_counts(row_name: str, queries: int) -> dict[str, int]:
         }
     if row_name == GENERATION_ROW:
         return {"vlm": queries, "condition": 0, "transformer": 3 * queries, "generation": 7 * queries}
-    if row_name == COMBINED_ROW:
+    if row_name in {COMBINED_ROW, COUPLED_ROW}:
         return {
             "vlm": (queries + 1) // 2,
             "condition": queries // 2,
@@ -192,10 +196,16 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
         "classification": shard_summary["classification"],
         "inference_seed": shard_summary["inference_seed"],
         "manifest_sha256": args.expected_manifest_sha256,
-        "source_combined_sha256": {
-            "condition": FROZEN_CONDITION_SOURCE_SHA256,
-            "generation": FROZEN_GENERATION_SOURCE_SHA256,
-        },
+        "source_combined_sha256": shard_summary.get(
+            "source_combined_sha256",
+            {
+                "condition": FROZEN_CONDITION_SOURCE_SHA256,
+                "generation": FROZEN_GENERATION_SOURCE_SHA256,
+            },
+        ),
+        "generation_checkpoint_sha256": shard_summary.get(
+            "generation_checkpoint_sha256"
+        ),
         "paper_runtime_match": bool(shard_summary["paper_runtime_match"]),
         **_summarize(args.row, rows),
     }
@@ -337,11 +347,78 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def compare_coupling(args: argparse.Namespace) -> dict[str, Any]:
+    output = Path(args.output).expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(f"refusing existing output: {output}")
+    roots = {
+        COMBINED_ROW: Path(args.uncoupled).expanduser().resolve(),
+        COUPLED_ROW: Path(args.coupled).expanduser().resolve(),
+    }
+    summaries = {name: load_json(root / "row_summary.json") for name, root in roots.items()}
+    for name, summary in summaries.items():
+        if summary.get("verdict") != "FIXED_2X2_ROW_PASS" or summary.get("row") != name:
+            raise RuntimeError(f"coupling comparison row gate mismatch: {name}")
+    if summaries[COMBINED_ROW].get("manifest_sha256") != summaries[COUPLED_ROW].get(
+        "manifest_sha256"
+    ):
+        raise RuntimeError("uncoupled and coupled rows use different manifests")
+    rows = {name: _read_csv(root / "episode_metrics.csv") for name, root in roots.items()}
+    for name, table in rows.items():
+        _validate_episode_table(name, table)
+    by_key = {name: {_key(row): row for row in table} for name, table in rows.items()}
+    uncoupled = _summarize(COMBINED_ROW, rows[COMBINED_ROW])
+    coupled = _summarize(COUPLED_ROW, rows[COUPLED_ROW])
+    result = {
+        "verdict": "COUPLED_VS_UNCOUPLED_COMPARISON_COMPLETE",
+        "paper_table_eligible": False,
+        "classification": "fixed-seed paired mechanism screening",
+        "manifest_sha256": summaries[COMBINED_ROW]["manifest_sha256"],
+        "rows": {COMBINED_ROW: uncoupled, COUPLED_ROW: coupled},
+        "success_rate_delta_percentage_points": 100.0
+        * (coupled["success_rate"] - uncoupled["success_rate"]),
+        "latency_per_policy_query_delta_ms": coupled["latency_per_policy_query_ms"]
+        - uncoupled["latency_per_policy_query_ms"],
+        "paired_outcomes": _paired(by_key[COMBINED_ROW], by_key[COUPLED_ROW]),
+        "same_compute_schedule": {
+            "full_vlm_calls": uncoupled["full_vlm_calls"] == coupled["full_vlm_calls"],
+            "condition_updater_calls": uncoupled["condition_updater_calls"]
+            == coupled["condition_updater_calls"],
+            "full_action_transformer_evaluations": uncoupled[
+                "full_action_transformer_evaluations"
+            ]
+            == coupled["full_action_transformer_evaluations"],
+            "generation_loop_updates": uncoupled["generation_loop_updates"]
+            == coupled["generation_loop_updates"],
+        },
+    }
+    output.mkdir(parents=True)
+    atomic_write_json(output / "coupled_vs_uncoupled_summary.json", result)
+    comparison_rows = []
+    for key in sorted(by_key[COMBINED_ROW]):
+        comparison_rows.append(
+            {
+                "task_id": key[0],
+                "trial_id": key[1],
+                "uncoupled_success": _int(by_key[COMBINED_ROW][key], "success"),
+                "coupled_success": _int(by_key[COUPLED_ROW][key], "success"),
+                "uncoupled_episode_length": _int(
+                    by_key[COMBINED_ROW][key], "episode_length"
+                ),
+                "coupled_episode_length": _int(
+                    by_key[COUPLED_ROW][key], "episode_length"
+                ),
+            }
+        )
+    _write_csv(output / "paired_episode_outcomes.csv", comparison_rows)
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     row = subparsers.add_parser("aggregate-row")
-    row.add_argument("--row", choices=ROWS, required=True)
+    row.add_argument("--row", choices=AGGREGATABLE_ROWS, required=True)
     row.add_argument("--output", required=True)
     row.add_argument("--shard", required=True)
     row.add_argument("--expected-manifest-sha256", required=True)
@@ -353,6 +430,11 @@ def build_parser() -> argparse.ArgumentParser:
     comparison.add_argument("--generation", required=True)
     comparison.add_argument("--combined", required=True)
     comparison.set_defaults(handler=compare)
+    coupling = subparsers.add_parser("compare-coupling")
+    coupling.add_argument("--output", required=True)
+    coupling.add_argument("--uncoupled", required=True)
+    coupling.add_argument("--coupled", required=True)
+    coupling.set_defaults(handler=compare_coupling)
     return parser
 
 

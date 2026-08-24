@@ -18,6 +18,15 @@ from tqdm.auto import tqdm
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_checkpoint import (
     load_generation_checkpoint,
 )
+from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
+    COUPLED_CHECKPOINT_SCHEMA,
+    COUPLED_ROW,
+    audit_projection_only_state,
+    condition_update_with_code,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_source_lock import (
+    verify_coupled_source_lock,
+)
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_contracts import (
     FROZEN_CHECKPOINT_REVISION,
     FROZEN_EXACT_CACHE_MANIFEST_SHA256,
@@ -38,6 +47,9 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_con
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_policy import (
     RealSimVLAGenerationPolicy,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.generation_hidden import (
+    full_generation_step_with_hidden,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_eval import (
     SynchronizedGenerationN_G3Policy,
@@ -76,6 +88,7 @@ from architectures.simvla.wrappers.dcld_eval.rollout_runner import (
 from methods.latentloop.modules.simvla_generation_loop import (
     SimVLAGenerationLoop,
 )
+from methods.latentloop.modules.native_simvla_v0 import NativeV0ObservationPair
 
 
 ROOT = Path(__file__).resolve().parents[5]
@@ -86,7 +99,7 @@ AGGREGATE_SOURCE = (
     "architectures/simvla/adapters/latentloop/efficient_multirate/"
     "generation_control_aggregate.py"
 )
-EVAL_ROWS = (FULL_ROW, CONDITION_ROW, GENERATION_ROW, COMBINED_ROW)
+EVAL_ROWS = (FULL_ROW, CONDITION_ROW, GENERATION_ROW, COMBINED_ROW, COUPLED_ROW)
 
 
 def _ensure_generation_latency_schema() -> None:
@@ -202,6 +215,148 @@ class SynchronizedCombinedK_C2N_G3Policy(SynchronizedConditionK_C2Policy):
         )
 
 
+class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_C2N_G3Policy):
+    """K_C=2 and N_G=3 with the Condition updater's real 128-D c_j."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.mode = COUPLED_ROW
+        self.row_name = COUPLED_ROW
+        self._active_condition_change_code: torch.Tensor | None = None
+        self.condition_change_code_norms: list[float] = []
+
+    def reset(self) -> None:
+        super().reset()
+        self._active_condition_change_code = None
+        self.condition_change_code_norms = []
+
+    def _full_refresh(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        policy_query_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int | None]:
+        self._active_condition_change_code = None
+        return super()._full_refresh(
+            batch, policy_query_index=policy_query_index
+        )
+
+    def _v0_update(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        age: int,
+        policy_query_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int | None]:
+        if self.cached_condition is None or self.cached_raw_rgb is None or self.cached_proprio is None:
+            raise RuntimeError("coupled update requires the preceding query state")
+        if self.condition_layout is None:
+            raise RuntimeError("coupled update requires the full-refresh token layout")
+        if age != 1:
+            raise ValueError("fixed K_C=2 coupling has exactly one update age")
+        pair = NativeV0ObservationPair(
+            previous_images=self.cached_raw_rgb,
+            current_images=batch["raw_rgb"],
+            previous_proprio=self.cached_proprio,
+            current_proprio=batch["proprio"],
+        )
+        self._sync()
+        started = time.perf_counter()
+        with torch.no_grad():
+            exposed = condition_update_with_code(
+                self.native_v0,
+                self.cached_condition,
+                pair,
+                valid_mask=self.condition_layout.valid_mask,
+                group_ids=self.condition_layout.group_ids,
+                age=1,
+            )
+        self._sync()
+        self.metrics.latencies.setdefault("condition_updater_ms", []).append(
+            (time.perf_counter() - started) * 1000.0
+        )
+        self.metrics.counters["num_condition_updater_calls"] += 1
+        self.metrics.counters["num_observation_encoder_calls"] += 1
+        code = exposed.condition_change_code.detach()
+        if not bool((code.float().norm(dim=-1) > 0).all()):
+            raise RuntimeError("online Condition updater produced a zero c_j")
+        self._active_condition_change_code = code
+        self.condition_change_code_norms.extend(
+            code.float().norm(dim=-1).detach().cpu().tolist()
+        )
+        action, seed = self._decode(
+            exposed.update.condition,
+            batch["proprio"],
+            policy_query_index=policy_query_index,
+        )
+        self.cached_condition = exposed.update.condition.detach()
+        self.cached_raw_rgb = batch["raw_rgb"].detach()
+        self.cached_proprio = batch["proprio"].detach()
+        self.cached_action_chunk = action.detach()
+        return exposed.update.condition, action, seed
+
+    def _decode(
+        self,
+        condition: torch.Tensor,
+        proprio: torch.Tensor,
+        *,
+        policy_query_index: int,
+    ) -> tuple[torch.Tensor, int | None]:
+        initial_noise, seed = self._paired_initial_noise(
+            condition, proprio, policy_query_index
+        )
+        if initial_noise is None:
+            raise RuntimeError("coupled evaluation requires explicit paired noise")
+        normalized_proprio = self.action_adapter.normalize_proprio(proprio)
+        code = self._active_condition_change_code
+        if code is None:
+            code = condition.new_zeros(
+                (condition.shape[0], self.generation_loop.updater.condition_code_dim)
+            )
+        if code.shape != (
+            condition.shape[0],
+            self.generation_loop.updater.condition_code_dim,
+        ):
+            raise RuntimeError("online c_j shape changed")
+
+        def full_step(
+            noisy_action: torch.Tensor, tau: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            output = full_generation_step_with_hidden(
+                self.model.transformer,
+                condition=condition,
+                noisy_action=noisy_action,
+                proprio=normalized_proprio,
+                tau=tau,
+                dt=-0.1,
+            )
+            return output.action_hidden, output.velocity
+
+        self._sync()
+        started = time.perf_counter()
+        with torch.no_grad():
+            trace = self.generation_loop(
+                initial_noise,
+                full_step=full_step,
+                full_step_indices=self.full_step_indices,
+                proprio=normalized_proprio,
+                condition=condition,
+                condition_valid_mask=None,
+                condition_change_code=code,
+            )
+            action = self.action_adapter.action_space.postprocess(
+                trace.final_noisy_action
+            )
+        self._sync()
+        elapsed = (time.perf_counter() - started) * 1000.0
+        self.metrics.latencies["action_transformer_ms"].append(elapsed)
+        self.metrics.latencies["generation_loop_ms"].append(elapsed)
+        self.metrics.counters["num_action_transformer_calls"] += self.n_g
+        self.metrics.counters["num_action_transformer_decodes"] += 1
+        self.metrics.counters["num_generation_decoder_only_steps"] += 10 - self.n_g
+        return action, seed
+
+
 def _git(root: Path, *args: str) -> str:
     return subprocess.check_output(
         ("git", "-C", str(root), *args), text=True, stderr=subprocess.STDOUT
@@ -214,7 +369,12 @@ def _verify_provenance(args: argparse.Namespace) -> dict[str, Any]:
     fixed_source_lock_path = Path(args.fixed_2x2_source_lock).expanduser().resolve()
     source_lock_path = bundle / "metadata" / "source_lock.json"
     source_lock = load_json(source_lock_path)
-    transfer_manifest = load_json(bundle / "transfer_manifest.json")
+    control_manifest_path = (
+        Path(args.control_manifest).expanduser().resolve()
+        if getattr(args, "control_manifest", "")
+        else bundle / "transfer_manifest.json"
+    )
+    transfer_manifest = load_json(control_manifest_path)
     fixed_source_lock = load_json(fixed_source_lock_path)
     failures: list[str] = []
 
@@ -351,6 +511,7 @@ def _verify_provenance(args: argparse.Namespace) -> dict[str, Any]:
             AGGREGATE_SOURCE: "locked by fixed_2x2_source_lock"
         },
         "fixed_2x2_source_lock": str(fixed_source_lock_path),
+        "control_manifest": str(control_manifest_path),
         "fixed_2x2_file_report": fixed_file_report,
         "failures": failures,
     }
@@ -466,6 +627,15 @@ def _make_policy(
             **condition_common,
             generation_updater=generation_updater,
         )
+    if row == COUPLED_ROW:
+        if condition_updater is None:
+            raise RuntimeError("coupled row requires the frozen Condition updater")
+        if generation_updater is None:
+            raise RuntimeError("coupled row requires the trained c_j projection")
+        return SynchronizedCoupledK_C2N_G3Policy(
+            **condition_common,
+            generation_updater=generation_updater,
+        )
     raise ValueError(f"unsupported row: {row}")
 
 
@@ -481,8 +651,8 @@ def _validate_fixed_2x2_counters(
     if row not in EVAL_ROWS:
         raise ValueError(f"unknown fixed 2x2 row: {row}")
     queries = int(policy_queries)
-    uses_condition = row in CONDITION_ROWS
-    uses_generation = row in {GENERATION_ROW, COMBINED_ROW}
+    uses_condition = row in CONDITION_ROWS or row == COUPLED_ROW
+    uses_generation = row in {GENERATION_ROW, COMBINED_ROW, COUPLED_ROW}
     expected = {
         "full_vlm_calls": (queries + 1) // 2 if uses_condition else queries,
         "condition_updater_calls": queries // 2 if uses_condition else 0,
@@ -648,7 +818,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
     freeze_module(model)
     condition_updater = None
     condition_payload = None
-    if args.row in CONDITION_ROWS:
+    if args.row in CONDITION_ROWS or args.row == COUPLED_ROW:
         condition_updater, condition_payload = load_native_v0_checkpoint(
             args.condition_checkpoint,
             device=device,
@@ -667,6 +837,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
 
     generation_updater = None
     generation_payload = None
+    coupled_checkpoint_report = None
     if args.row in {GENERATION_ROW, COMBINED_ROW}:
         generation_updater, generation_payload = load_generation_checkpoint(
             generation_checkpoint, device=device
@@ -677,6 +848,59 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         if int(generation_payload["optimizer_step"]) != 30_000:
             raise RuntimeError("Generation checkpoint is not optimizer step 30,000")
         freeze_module(generation_updater)
+    elif args.row == COUPLED_ROW:
+        if not args.coupled_generation_checkpoint:
+            raise ValueError("coupled row requires --coupled-generation-checkpoint")
+        generation_updater, generation_payload = load_generation_checkpoint(
+            args.coupled_generation_checkpoint, device=device
+        )
+        training = generation_payload.get("training_config", {})
+        if training.get("schema_version") != COUPLED_CHECKPOINT_SCHEMA:
+            raise RuntimeError("coupled checkpoint schema changed")
+        if int(generation_payload.get("optimizer_step", -1)) != 10_000:
+            raise RuntimeError("coupled checkpoint is not optimizer step 10,000")
+        coupled_checkpoint_report = verify_coupled_source_lock(
+            generation_payload["source_lock"],
+            parent_generation_checkpoint=generation_checkpoint,
+            condition_checkpoint=args.condition_checkpoint,
+            norm_stats=norm_stats,
+            exact_cache=bundle / "exact_cache_contract",
+        )
+        if coupled_checkpoint_report["verdict"] != "COUPLED_SOURCE_LOCK_PASS":
+            raise RuntimeError(
+                json.dumps(coupled_checkpoint_report, indent=2, sort_keys=True)
+            )
+        expected_trainable = training.get("projection_audit", {}).get(
+            "trainable_parameter_names"
+        )
+        if expected_trainable != ["condition_code_projection.weight"]:
+            raise RuntimeError("coupled checkpoint is not projection-only")
+        projection_audit = training.get("projection_audit", {})
+        if (
+            int(projection_audit.get("condition_code_dim", -1)) != 128
+            or int(projection_audit.get("rank_dim", -1)) != 128
+            or int(projection_audit.get("trainable_parameters", -1)) != 16_384
+        ):
+            raise RuntimeError("coupled checkpoint projection dimensions changed")
+        parent_updater, _ = load_generation_checkpoint(
+            generation_checkpoint, device=device
+        )
+        projection_state = audit_projection_only_state(
+            parent_updater, generation_updater
+        )
+        if projection_state["verdict"] != "PROJECTION_ONLY_STATE_PASS":
+            raise RuntimeError(
+                json.dumps(projection_state, indent=2, sort_keys=True)
+            )
+        coupled_checkpoint_report["projection_only_state_audit"] = projection_state
+        del parent_updater
+        freeze_module(generation_updater)
+
+    if coupled_checkpoint_report is not None:
+        atomic_write_json(
+            output / "coupled_checkpoint_validation.json",
+            coupled_checkpoint_report,
+        )
 
     from libero.libero import benchmark
 
@@ -782,6 +1006,9 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
                 generation_loop_ms = policy.metrics.latencies.get(
                     "generation_loop_ms", []
                 )
+                condition_code_norms = getattr(
+                    policy, "condition_change_code_norms", []
+                )
                 row = {
                     "row": args.row,
                     "classification": args.classification,
@@ -815,6 +1042,11 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
                     "model_generation_loop_per_query_ms": (
                         float(np.mean(generation_loop_ms))
                         if generation_loop_ms
+                        else 0.0
+                    ),
+                    "condition_change_code_norm_mean": (
+                        float(np.mean(condition_code_norms))
+                        if condition_code_norms
                         else 0.0
                     ),
                     "policy_wall_time_seconds": float(sum(policy_ms) / 1000.0),
@@ -883,10 +1115,23 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         "manifest_sha256": manifest["manifest_sha256"],
         "source_combined_sha256": {
             "condition": FROZEN_CONDITION_SOURCE_SHA256,
-            "generation": FROZEN_GENERATION_SOURCE_SHA256,
+            "generation": (
+                generation_payload["source_lock"]["combined_sha256"]
+                if args.row == COUPLED_ROW and generation_payload is not None
+                else FROZEN_GENERATION_SOURCE_SHA256
+            ),
         },
         "condition_checkpoint_sha256": FROZEN_CONDITION_CHECKPOINT_SHA256,
-        "generation_checkpoint_sha256": FROZEN_GENERATION_CHECKPOINT_SHA256,
+        "generation_checkpoint_sha256": (
+            sha256_file(args.coupled_generation_checkpoint)
+            if args.row == COUPLED_ROW
+            else FROZEN_GENERATION_CHECKPOINT_SHA256
+        ),
+        "coupled_checkpoint_validation": (
+            coupled_checkpoint_report["verdict"]
+            if coupled_checkpoint_report is not None
+            else None
+        ),
         "paper_runtime_match": provenance["paper_runtime_match"],
         "all_episode_counter_gates_pass": all(
             item["counter_gate"] == "FIXED_2X2_COUNTER_PASS"
@@ -923,7 +1168,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-manifest-sha256", default="")
     parser.add_argument("--bundle-root", required=True)
     parser.add_argument("--condition-checkpoint", required=True)
+    parser.add_argument("--coupled-generation-checkpoint", default="")
     parser.add_argument("--fixed-2x2-source-lock", required=True)
+    parser.add_argument("--control-manifest", default="")
     parser.add_argument("--fixed-2x2-parity-gate", required=True)
     parser.add_argument("--egl-preflight", required=True)
     parser.add_argument("--physical-gpu-id", type=int, required=True)

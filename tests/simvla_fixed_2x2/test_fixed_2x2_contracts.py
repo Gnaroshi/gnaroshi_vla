@@ -13,6 +13,9 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval
     _validate_sd1_fixed_shard,
     _validate_fixed_2x2_counters,
 )
+from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
+    COUPLED_ROW,
+)
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_aggregate import (
     _load_npz_records,
 )
@@ -54,7 +57,15 @@ def test_fixed_2x2_counter_contracts() -> None:
             full_action_transformer_calls=3 * queries,
             generation_loop_updates=7 * queries,
         )
-        for gate in (full_gate, condition_gate, generation_gate, combined_gate):
+        coupled_gate = _validate_fixed_2x2_counters(
+            COUPLED_ROW,
+            policy_queries=queries,
+            full_vlm_calls=full_vlm,
+            condition_updater_calls=condition,
+            full_action_transformer_calls=3 * queries,
+            generation_loop_updates=7 * queries,
+        )
+        for gate in (full_gate, condition_gate, generation_gate, combined_gate, coupled_gate):
             assert gate["verdict"] == "FIXED_2X2_COUNTER_PASS"
 
 
@@ -91,11 +102,11 @@ def _rows(row_name: str) -> list[dict[str, int | float | str]]:
 
 
 def test_all_four_rows_aggregate_exact_10x50() -> None:
-    for row_name in (BASELINE_ROW, CONDITION_ROW, GENERATION_ROW, COMBINED_ROW):
+    for row_name in (BASELINE_ROW, CONDITION_ROW, GENERATION_ROW, COMBINED_ROW, COUPLED_ROW):
         summary = _summarize(row_name, _rows(row_name))
         assert summary["episodes"] == 500
         assert summary["integration_updates"] == 10 * summary["policy_queries"]
-        if row_name in {CONDITION_ROW, COMBINED_ROW}:
+        if row_name in {CONDITION_ROW, COMBINED_ROW, COUPLED_ROW}:
             assert 1.0 < summary["effective_k_c"] <= 2.0
         else:
             assert summary["effective_k_c"] == 1.0
