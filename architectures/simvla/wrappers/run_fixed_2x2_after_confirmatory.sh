@@ -36,7 +36,7 @@ aggregate_control_row() {
     return
   fi
   test -f "$row_root/shard_rank0_tasks_0_9/shard_summary.json"
-  CUDA_VISIBLE_DEVICES='' "$PYTHON" \
+  PYTHONPATH="$ROOT:${PYTHONPATH:-}" CUDA_VISIBLE_DEVICES='' "$PYTHON" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_aggregate \
     aggregate-row \
     --row naive_nfe3 \
@@ -124,7 +124,7 @@ PY
   fi
 
   test ! -e "$CONTROL/confirmatory_verdict"
-  CUDA_VISIBLE_DEVICES='' "$PYTHON" \
+  PYTHONPATH="$ROOT:${PYTHONPATH:-}" CUDA_VISIBLE_DEVICES='' "$PYTHON" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_aggregate \
     confirmatory \
     --output "$CONTROL/confirmatory_verdict" \
