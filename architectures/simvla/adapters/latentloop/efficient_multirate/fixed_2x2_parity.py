@@ -17,7 +17,6 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_cont
     FROZEN_CONDITION_SOURCE_SHA256,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval import (
-    _ensure_generation_latency_schema,
     _make_policy,
     _validate_fixed_2x2_counters,
     _verify_provenance,
@@ -30,19 +29,15 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_con
     FROZEN_GENERATION_CHECKPOINT_SHA256,
     FROZEN_GENERATION_SOURCE_SHA256,
     FROZEN_NORM_STATS_SHA256,
+    FULL_ROW,
+    GENERATION_ROW,
     atomic_write_json,
     load_json,
     require_egl_preflight,
     validate_manifest_identity,
 )
-from architectures.simvla.adapters.latentloop.efficient_multirate.generation_policy import (
-    RealSimVLAGenerationPolicy,
-)
 from architectures.simvla.adapters.latentloop.native_v0_checkpoint import (
     load_native_v0_checkpoint,
-)
-from architectures.simvla.adapters.latentloop.native_v0_long_eval import (
-    _SynchronizedFullPolicy,
 )
 from architectures.simvla.adapters.latentloop.native_v0_runtime import (
     DEFAULT_CHECKPOINT,
@@ -158,37 +153,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     image10, image11, proprio1 = build_env_obs(observation1)
     seed_base = int(manifest["action_noise_seed_base"])
 
-    full = _SynchronizedFullPolicy(
+    full = _make_policy(
+        row=FULL_ROW,
         model=model,
         processor=processor,
-        dcld_core=None,
-        mode="full",
-        refresh_every=1,
-        flow_steps=10,
-        image_size=384,
-        replan_steps=5,
-        client_resize_size=224,
+        condition_updater=None,
+        generation_updater=None,
         device=device,
         suite=str(manifest["suite"]),
-        row_name="full_nfe10",
         task_id=task_id,
         trial_id=trial_id,
-        paired_action_noise=True,
         action_noise_seed_base=seed_base,
-        log_action_chunks=True,
     )
-    _ensure_generation_latency_schema()
-    generation = RealSimVLAGenerationPolicy(
+    generation = _make_policy(
+        row=GENERATION_ROW,
         model=model,
         processor=processor,
-        updater=generation_updater,
-        n_g=3,
+        condition_updater=None,
+        generation_updater=generation_updater,
         device=device,
         suite=str(manifest["suite"]),
         task_id=task_id,
         trial_id=trial_id,
         action_noise_seed_base=seed_base,
-        log_action_chunks=True,
     )
     condition = _make_policy(
         row=CONDITION_ROW,
