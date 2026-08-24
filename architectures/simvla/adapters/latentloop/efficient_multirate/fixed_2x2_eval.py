@@ -1,4 +1,4 @@
-"""Fixed K_C=2 x N_G={10,3} EGL evaluation for SimVLA LatentLoop."""
+"""Fixed K_C={1,2} x N_G={10,3} EGL evaluation for SimVLA LatentLoop."""
 
 from __future__ import annotations
 
@@ -26,26 +26,33 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_con
     FROZEN_NORM_STATS_SHA256,
     FROZEN_ROOT_COMMIT,
     FROZEN_UPSTREAM_COMMIT,
+    FULL_ROW,
+    GENERATION_ROW,
     atomic_write_json,
     load_json,
     require_egl_preflight,
     runtime_versions,
     sha256_file,
     validate_manifest_identity,
-    validate_sd1_shard,
     verify_file_hashes,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_policy import (
     RealSimVLAGenerationPolicy,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_eval import (
+    SynchronizedGenerationN_G3Policy,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_contracts import (
     COMBINED_ROW,
     CONDITION_ROW,
     FROZEN_CONDITION_CHECKPOINT_SHA256,
     FROZEN_CONDITION_SOURCE_SHA256,
-    ROWS,
+    ROWS as CONDITION_ROWS,
 )
-from architectures.simvla.adapters.latentloop.native_v0_long_eval import _trajectory_metrics
+from architectures.simvla.adapters.latentloop.native_v0_long_eval import (
+    _SynchronizedFullPolicy,
+    _trajectory_metrics,
+)
 from architectures.simvla.adapters.latentloop.native_v0_checkpoint import (
     load_native_v0_checkpoint,
 )
@@ -79,6 +86,7 @@ AGGREGATE_SOURCE = (
     "architectures/simvla/adapters/latentloop/efficient_multirate/"
     "generation_control_aggregate.py"
 )
+EVAL_ROWS = (FULL_ROW, CONDITION_ROW, GENERATION_ROW, COMBINED_ROW)
 
 
 def _ensure_generation_latency_schema() -> None:
@@ -360,6 +368,24 @@ def _parse_task_ids(text: str) -> tuple[int, ...]:
     return values
 
 
+def _validate_sd1_fixed_shard(
+    physical_gpu_id: int, task_ids: Sequence[int]
+) -> dict[str, Any]:
+    gpu = int(physical_gpu_id)
+    tasks = tuple(int(value) for value in task_ids)
+    checks = {
+        "allowed_gpu": gpu in {2, 3, 4, 5, 6, 7},
+        "gpu_0_1_excluded": gpu not in {0, 1},
+        "full_task_set_exact": tasks == tuple(range(10)),
+    }
+    return {
+        "verdict": "SD1_FIXED_SHARD_PASS" if all(checks.values()) else "SD1_FIXED_SHARD_FAIL",
+        "physical_gpu_id": gpu,
+        "task_ids": list(tasks),
+        "checks": checks,
+    }
+
+
 def _make_policy(
     *,
     row: str,
@@ -373,7 +399,24 @@ def _make_policy(
     trial_id: int,
     action_noise_seed_base: int,
 ) -> Any:
-    common = {
+    full_common = {
+        "model": model,
+        "processor": processor,
+        "dcld_core": None,
+        "mode": "full",
+        "refresh_every": 1,
+        "image_size": 384,
+        "replan_steps": 5,
+        "client_resize_size": 224,
+        "device": device,
+        "suite": suite,
+        "task_id": task_id,
+        "trial_id": trial_id,
+        "paired_action_noise": True,
+        "action_noise_seed_base": action_noise_seed_base,
+        "log_action_chunks": True,
+    }
+    condition_common = {
         "model": model,
         "processor": processor,
         "adapter": condition_updater,
@@ -388,13 +431,39 @@ def _make_policy(
         "flow_steps": 10,
         "log_action_chunks": True,
     }
+    if row == FULL_ROW:
+        return _SynchronizedFullPolicy(
+            **full_common,
+            flow_steps=10,
+            row_name=FULL_ROW,
+        )
     if row == CONDITION_ROW:
-        return SynchronizedConditionK_C2Policy(**common)
+        if condition_updater is None:
+            raise RuntimeError("condition row requires the frozen Condition updater")
+        return SynchronizedConditionK_C2Policy(**condition_common)
+    if row == GENERATION_ROW:
+        if generation_updater is None:
+            raise RuntimeError("Generation row requires the frozen Generation updater")
+        _ensure_generation_latency_schema()
+        return SynchronizedGenerationN_G3Policy(
+            model=model,
+            processor=processor,
+            updater=generation_updater,
+            n_g=3,
+            device=device,
+            suite=suite,
+            task_id=task_id,
+            trial_id=trial_id,
+            action_noise_seed_base=action_noise_seed_base,
+            log_action_chunks=True,
+        )
     if row == COMBINED_ROW:
+        if condition_updater is None:
+            raise RuntimeError("combined row requires the frozen Condition updater")
         if generation_updater is None:
             raise RuntimeError("combined row requires the frozen Generation updater")
         return SynchronizedCombinedK_C2N_G3Policy(
-            **common,
+            **condition_common,
             generation_updater=generation_updater,
         )
     raise ValueError(f"unsupported row: {row}")
@@ -409,14 +478,16 @@ def _validate_fixed_2x2_counters(
     full_action_transformer_calls: int,
     generation_loop_updates: int,
 ) -> dict[str, Any]:
-    if row not in ROWS:
+    if row not in EVAL_ROWS:
         raise ValueError(f"unknown fixed 2x2 row: {row}")
     queries = int(policy_queries)
+    uses_condition = row in CONDITION_ROWS
+    uses_generation = row in {GENERATION_ROW, COMBINED_ROW}
     expected = {
-        "full_vlm_calls": (queries + 1) // 2,
-        "condition_updater_calls": queries // 2,
-        "full_action_transformer_calls": queries * (10 if row == CONDITION_ROW else 3),
-        "generation_loop_updates": queries * (0 if row == CONDITION_ROW else 7),
+        "full_vlm_calls": (queries + 1) // 2 if uses_condition else queries,
+        "condition_updater_calls": queries // 2 if uses_condition else 0,
+        "full_action_transformer_calls": queries * (3 if uses_generation else 10),
+        "generation_loop_updates": queries * (7 if uses_generation else 0),
         "integration_updates": queries * 10,
     }
     observed = {
@@ -477,8 +548,8 @@ def _save_action_chunks(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
-    if args.row not in ROWS:
-        raise ValueError(f"row must be one of {ROWS}")
+    if args.row not in EVAL_ROWS:
+        raise ValueError(f"row must be one of {EVAL_ROWS}")
     physical_gpu_id = int(args.physical_gpu_id)
     if os.environ.get("CUDA_VISIBLE_DEVICES") != str(physical_gpu_id):
         raise RuntimeError("CUDA_VISIBLE_DEVICES must equal exactly one physical GPU ID")
@@ -488,8 +559,8 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("scientific Generation control evaluation is EGL-only")
     task_ids = _parse_task_ids(args.task_ids)
     if args.classification == "HOST_LOCAL_EGL_DIAGNOSTIC":
-        shard_contract = validate_sd1_shard(physical_gpu_id, task_ids)
-        if shard_contract["verdict"] != "SD1_SHARD_PASS":
+        shard_contract = _validate_sd1_fixed_shard(physical_gpu_id, task_ids)
+        if shard_contract["verdict"] != "SD1_FIXED_SHARD_PASS":
             raise RuntimeError(json.dumps(shard_contract, indent=2, sort_keys=True))
     else:
         shard_contract = {
@@ -575,25 +646,28 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         device=device,
     )
     freeze_module(model)
-    condition_updater, condition_payload = load_native_v0_checkpoint(
-        args.condition_checkpoint,
-        device=device,
-        require_final_150k=True,
-    )
-    if int(condition_payload.get("global_optimizer_step", -1)) != 150_000:
-        raise RuntimeError("Condition V0 checkpoint is not optimizer step 150,000")
-    condition_source = condition_payload.get("source_lock", {})
-    if condition_source.get("combined_sha256") != FROZEN_CONDITION_SOURCE_SHA256:
-        raise RuntimeError("Condition V0 checkpoint source lock changed")
-    if condition_source.get("norm_stats_sha256") != FROZEN_NORM_STATS_SHA256:
-        raise RuntimeError("Condition V0 checkpoint norm-statistics lock changed")
-    if condition_source.get("checkpoint", {}).get("revision") != FROZEN_CHECKPOINT_REVISION:
-        raise RuntimeError("Condition V0 checkpoint SimVLA revision changed")
-    freeze_module(condition_updater)
+    condition_updater = None
+    condition_payload = None
+    if args.row in CONDITION_ROWS:
+        condition_updater, condition_payload = load_native_v0_checkpoint(
+            args.condition_checkpoint,
+            device=device,
+            require_final_150k=True,
+        )
+        if int(condition_payload.get("global_optimizer_step", -1)) != 150_000:
+            raise RuntimeError("Condition V0 checkpoint is not optimizer step 150,000")
+        condition_source = condition_payload.get("source_lock", {})
+        if condition_source.get("combined_sha256") != FROZEN_CONDITION_SOURCE_SHA256:
+            raise RuntimeError("Condition V0 checkpoint source lock changed")
+        if condition_source.get("norm_stats_sha256") != FROZEN_NORM_STATS_SHA256:
+            raise RuntimeError("Condition V0 checkpoint norm-statistics lock changed")
+        if condition_source.get("checkpoint", {}).get("revision") != FROZEN_CHECKPOINT_REVISION:
+            raise RuntimeError("Condition V0 checkpoint SimVLA revision changed")
+        freeze_module(condition_updater)
 
     generation_updater = None
     generation_payload = None
-    if args.row == COMBINED_ROW:
+    if args.row in {GENERATION_ROW, COMBINED_ROW}:
         generation_updater, generation_payload = load_generation_checkpoint(
             generation_checkpoint, device=device
         )
@@ -843,7 +917,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--row", choices=ROWS, required=True)
+    parser.add_argument("--row", choices=EVAL_ROWS, required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--expected-manifest-sha256", default="")

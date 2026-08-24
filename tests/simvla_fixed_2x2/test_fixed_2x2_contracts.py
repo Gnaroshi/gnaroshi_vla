@@ -10,6 +10,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggr
     _summarize,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval import (
+    _validate_sd1_fixed_shard,
     _validate_fixed_2x2_counters,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_aggregate import (
@@ -21,6 +22,14 @@ def test_fixed_2x2_counter_contracts() -> None:
     for queries in (1, 2, 5, 18):
         full_vlm = (queries + 1) // 2
         condition = queries // 2
+        full_gate = _validate_fixed_2x2_counters(
+            BASELINE_ROW,
+            policy_queries=queries,
+            full_vlm_calls=queries,
+            condition_updater_calls=0,
+            full_action_transformer_calls=10 * queries,
+            generation_loop_updates=0,
+        )
         condition_gate = _validate_fixed_2x2_counters(
             CONDITION_ROW,
             policy_queries=queries,
@@ -28,6 +37,14 @@ def test_fixed_2x2_counter_contracts() -> None:
             condition_updater_calls=condition,
             full_action_transformer_calls=10 * queries,
             generation_loop_updates=0,
+        )
+        generation_gate = _validate_fixed_2x2_counters(
+            GENERATION_ROW,
+            policy_queries=queries,
+            full_vlm_calls=queries,
+            condition_updater_calls=0,
+            full_action_transformer_calls=3 * queries,
+            generation_loop_updates=7 * queries,
         )
         combined_gate = _validate_fixed_2x2_counters(
             COMBINED_ROW,
@@ -37,8 +54,8 @@ def test_fixed_2x2_counter_contracts() -> None:
             full_action_transformer_calls=3 * queries,
             generation_loop_updates=7 * queries,
         )
-        assert condition_gate["verdict"] == "FIXED_2X2_COUNTER_PASS"
-        assert combined_gate["verdict"] == "FIXED_2X2_COUNTER_PASS"
+        for gate in (full_gate, condition_gate, generation_gate, combined_gate):
+            assert gate["verdict"] == "FIXED_2X2_COUNTER_PASS"
 
 
 def _rows(row_name: str) -> list[dict[str, int | float | str]]:
@@ -82,6 +99,14 @@ def test_all_four_rows_aggregate_exact_10x50() -> None:
             assert 1.0 < summary["effective_k_c"] <= 2.0
         else:
             assert summary["effective_k_c"] == 1.0
+
+
+def test_sd1_fixed_rows_use_gpus_2_through_7_and_all_tasks() -> None:
+    for gpu in range(2, 8):
+        gate = _validate_sd1_fixed_shard(gpu, tuple(range(10)))
+        assert gate["verdict"] == "SD1_FIXED_SHARD_PASS"
+    assert _validate_sd1_fixed_shard(1, tuple(range(10)))["verdict"] == "SD1_FIXED_SHARD_FAIL"
+    assert _validate_sd1_fixed_shard(2, tuple(range(5)))["verdict"] == "SD1_FIXED_SHARD_FAIL"
 
 
 def test_action_chunk_npz_is_loaded_once_and_indexed_correctly(tmp_path) -> None:

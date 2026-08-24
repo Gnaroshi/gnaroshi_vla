@@ -246,17 +246,23 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
     }
     summaries = {name: load_json(root / "row_summary.json") for name, root in roots.items()}
     accepted = {
-        BASELINE_ROW: "GENERATION_CONTROL_ROW_PASS",
-        GENERATION_ROW: "GENERATION_CONTROL_ROW_PASS",
-        CONDITION_ROW: "FIXED_2X2_ROW_PASS",
-        COMBINED_ROW: "FIXED_2X2_ROW_PASS",
+        BASELINE_ROW: {"GENERATION_CONTROL_ROW_PASS", "FIXED_2X2_ROW_PASS"},
+        GENERATION_ROW: {"GENERATION_CONTROL_ROW_PASS", "FIXED_2X2_ROW_PASS"},
+        CONDITION_ROW: {"FIXED_2X2_ROW_PASS"},
+        COMBINED_ROW: {"FIXED_2X2_ROW_PASS"},
     }
     for name, summary in summaries.items():
-        if summary.get("verdict") != accepted[name] or summary.get("row") != name:
+        if summary.get("verdict") not in accepted[name] or summary.get("row") != name:
             raise RuntimeError(f"row gate mismatch: {name}")
     manifest_hashes = {summary.get("manifest_sha256") for summary in summaries.values()}
     if len(manifest_hashes) != 1:
         raise RuntimeError("2x2 rows do not share one immutable manifest")
+    classifications = {summary.get("classification") for summary in summaries.values()}
+    if len(classifications) != 1:
+        raise RuntimeError("2x2 rows do not share one runtime classification")
+    inference_seeds = {summary.get("inference_seed") for summary in summaries.values()}
+    if len(inference_seeds) != 1:
+        raise RuntimeError("2x2 rows do not share one inference seed")
     rows = {name: _read_csv(root / "episode_metrics.csv") for name, root in roots.items()}
     for name, table in rows.items():
         _validate_episode_table(name, table)
@@ -309,9 +315,12 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
         "verdict": "FIXED_2X2_DIAGNOSTIC_COMPLETE",
         "paper_table_eligible": False,
         "interpretation": (
-            "Predeclared fixed seed02 mechanism diagnostic. K_C=2 was selected after "
+            f"Predeclared fixed {next(iter(inference_seeds))} mechanism diagnostic. "
+            "K_C=2 was selected after "
             "the strict K_C=4 offline gate failed; promote only after independent confirmation."
         ),
+        "classification": next(iter(classifications)),
+        "inference_seed": next(iter(inference_seeds)),
         "manifest_sha256": next(iter(manifest_hashes)),
         "rows": metrics,
         "success_rate_effects_percentage_points": effects_pp,
@@ -332,7 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     row = subparsers.add_parser("aggregate-row")
-    row.add_argument("--row", choices=(CONDITION_ROW, COMBINED_ROW), required=True)
+    row.add_argument("--row", choices=ROWS, required=True)
     row.add_argument("--output", required=True)
     row.add_argument("--shard", required=True)
     row.add_argument("--expected-manifest-sha256", required=True)

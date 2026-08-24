@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one fixed K_C x N_G row over the immutable rb2 Long-500 manifest.
+# Run one fixed K_C x N_G row over an immutable LIBERO-Long manifest.
 
 set -uo pipefail
 
@@ -20,6 +20,9 @@ CONDITION_CHECKPOINT=
 SOURCE_LOCK=
 PARITY_GATE=
 GPU=
+CLASSIFICATION=RB2_CONFIRMATORY_EGL
+INFERENCE_SEED=seed02
+TASK_IDS=0,1,2,3,4,5,6,7,8,9
 
 while (($#)); do
   case "$1" in
@@ -32,13 +35,24 @@ while (($#)); do
     --source-lock) SOURCE_LOCK=$2; shift 2 ;;
     --parity-gate) PARITY_GATE=$2; shift 2 ;;
     --physical-gpu-id) GPU=$2; shift 2 ;;
+    --classification) CLASSIFICATION=$2; shift 2 ;;
+    --inference-seed) INFERENCE_SEED=$2; shift 2 ;;
+    --task-ids) TASK_IDS=$2; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 case "$ROW" in
-  condition_kc2_ng10|condition_kc2_ng3) ;;
+  full_nfe10|condition_kc2_ng10|generation_ng3|condition_kc2_ng3) ;;
   *) echo "Invalid --row: $ROW" >&2; exit 2 ;;
+esac
+case "$CLASSIFICATION" in
+  HOST_LOCAL_EGL_DIAGNOSTIC|RB2_CONFIRMATORY_EGL) ;;
+  *) echo "Invalid --classification: $CLASSIFICATION" >&2; exit 2 ;;
+esac
+case "$INFERENCE_SEED" in
+  seed01|seed02|seed03) ;;
+  *) echo "Invalid --inference-seed: $INFERENCE_SEED" >&2; exit 2 ;;
 esac
 for value in "$OUTPUT" "$MANIFEST" "$MANIFEST_SHA" "$BUNDLE" \
   "$CONDITION_CHECKPOINT" "$SOURCE_LOCK" "$PARITY_GATE" "$GPU"; do
@@ -94,9 +108,9 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" \
   --fixed-2x2-parity-gate "$PARITY_GATE" \
   --egl-preflight "$PREFLIGHT" \
   --physical-gpu-id "$GPU" \
-  --task-ids 0,1,2,3,4,5,6,7,8,9 \
-  --classification RB2_CONFIRMATORY_EGL \
-  --inference-seed seed02 \
+  --task-ids "$TASK_IDS" \
+  --classification "$CLASSIFICATION" \
+  --inference-seed "$INFERENCE_SEED" \
   2>&1 | tee "$OUTPUT/logs/evaluate.log"
 eval_rc=${PIPESTATUS[0]}
 ((eval_rc == 0)) || exit "$eval_rc"

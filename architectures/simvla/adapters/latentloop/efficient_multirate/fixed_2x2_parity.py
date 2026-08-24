@@ -272,7 +272,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--egl-preflight", required=True)
     parser.add_argument("--physical-gpu-id", type=int, required=True)
     parser.add_argument(
-        "--classification", choices=("RB2_CONFIRMATORY_EGL",), required=True
+        "--classification",
+        choices=("HOST_LOCAL_EGL_DIAGNOSTIC", "RB2_CONFIRMATORY_EGL"),
+        required=True,
     )
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--smolvlm-model", default=DEFAULT_SMOLVLM)
