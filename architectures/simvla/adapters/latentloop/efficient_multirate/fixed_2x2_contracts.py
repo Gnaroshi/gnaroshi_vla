@@ -1,0 +1,12 @@
+"""Immutable identities and row names for the fixed SimVLA 2x2 diagnostic."""
+
+CONDITION_ROW = "condition_kc2_ng10"
+COMBINED_ROW = "condition_kc2_ng3"
+ROWS = (CONDITION_ROW, COMBINED_ROW)
+
+FROZEN_CONDITION_SOURCE_SHA256 = (
+    "65b94b40479bab9a71b9460915b1d36c04154056a77cc9f3372586e5629957e8"
+)
+FROZEN_CONDITION_CHECKPOINT_SHA256 = (
+    "d19057768a99f8130bbce279d694a1a9aa9896a7953ad613aadc88d1e8b194db"
+)

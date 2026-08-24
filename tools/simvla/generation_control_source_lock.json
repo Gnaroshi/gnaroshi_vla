@@ -1,0 +1,23 @@
+{
+  "files": {
+    "architectures/simvla/adapters/dcld/simvla_action_adapter.py": "06be94de845bec9d19ac7502863f63f1bafab70f09441254a99a8d4a22a5405a",
+    "architectures/simvla/adapters/dcld/simvla_condition_adapter.py": "f99f336250606070a52729f5f8afe5437c708ed871b85a21aed1d84d8fbb6636",
+    "architectures/simvla/adapters/latentloop/efficient_multirate/generation_control_aggregate.py": "b8118d8badc8bbfeca228a5b4c1d2ec7a05b02335ea1c8a68dc8ca49ae70e661",
+    "architectures/simvla/adapters/latentloop/efficient_multirate/generation_control_contracts.py": "d53d606edd9cb5720deef447717c7c1fe3a65ff998f231122eca24fdba5d314b",
+    "architectures/simvla/adapters/latentloop/efficient_multirate/generation_control_eval.py": "3a0d58082b5cbe3b14e61bccfcb33896ebb0ec9a97df450dc876488c3797bf3d",
+    "architectures/simvla/adapters/latentloop/efficient_multirate/generation_control_offline.py": "3697626b38ca3e51a2783b20621eef1a5c137cc48aff9f1eebb919a48b599b7f",
+    "architectures/simvla/adapters/latentloop/efficient_multirate/generation_control_parity.py": "e8bf16333deb1ba6f984bba15ed2a4eb9b21c43f3f30e3f02531e47f3e8bb4f9",
+    "architectures/simvla/adapters/latentloop/native_v0_long_eval.py": "857c49d7b2430ccafc5f341a20f80e4632a5ac3950d63de24c7123be87552d12",
+    "architectures/simvla/adapters/latentloop/native_v0_runtime.py": "10eecb4607b8811f4d397d8f504cfc6ff1c822a267aa0dbf01876b3600d85c1e",
+    "architectures/simvla/wrappers/run_generation_control_parity.sh": "228253592bb7bd7315bb86379c63b72ad1e877b23ae6df16c3c55a6013b86da3",
+    "architectures/simvla/wrappers/run_generation_control_single_gpu_row.sh": "2e3f95a21cfb8a8261fc67bd8dc67c03dae2b1abba873a685dd22a82c152ef79",
+    "architectures/simvla/wrappers/run_generation_control_wave.sh": "0d18ea3875aea4b9e164110f4650bef1a01c59eadda3d4f343a739880f610283",
+    "architectures/simvla/wrappers/run_sd1_generation_control_three_rows.sh": "31b4ab85f1eebe9d1be1a635af4964590582edf59d55349f0e13fcb8039eebc0",
+    "architectures/simvla/wrappers/dcld_eval/rollout_runner.py": "1f4e92b1d52de57f4d1343bb054304599bf79045e3437961b683807f5205b7d8",
+    "tools/simvla/generation_control_manifest.py": "823333c6ea2bd078b228628a4aa507e676035f84c8bfef902028c2c3b22b655a",
+    "tools/simvla/simvla_egl_preflight.py": "ff2853d01b8a01acd9c20b6d948040ad523861d0014486a2031b353251897ae2"
+  },
+  "root_commit": "f73ec564cfc9784366903d62047ca80cd115ac56",
+  "schema_version": "simvla_generation_control_source_lock_v1",
+  "upstream_commit": "32700d0ad8991996e123e4b685abe370ce6e9aab"
+}

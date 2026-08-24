@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggregate import (
+    BASELINE_ROW,
+    COMBINED_ROW,
+    CONDITION_ROW,
+    GENERATION_ROW,
+    _summarize,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval import (
+    _validate_fixed_2x2_counters,
+)
+
+
+def test_fixed_2x2_counter_contracts() -> None:
+    for queries in (1, 2, 5, 18):
+        full_vlm = (queries + 1) // 2
+        condition = queries // 2
+        condition_gate = _validate_fixed_2x2_counters(
+            CONDITION_ROW,
+            policy_queries=queries,
+            full_vlm_calls=full_vlm,
+            condition_updater_calls=condition,
+            full_action_transformer_calls=10 * queries,
+            generation_loop_updates=0,
+        )
+        combined_gate = _validate_fixed_2x2_counters(
+            COMBINED_ROW,
+            policy_queries=queries,
+            full_vlm_calls=full_vlm,
+            condition_updater_calls=condition,
+            full_action_transformer_calls=3 * queries,
+            generation_loop_updates=7 * queries,
+        )
+        assert condition_gate["verdict"] == "FIXED_2X2_COUNTER_PASS"
+        assert combined_gate["verdict"] == "FIXED_2X2_COUNTER_PASS"
+
+
+def _rows(row_name: str) -> list[dict[str, int | float | str]]:
+    output = []
+    for task_id in range(10):
+        for trial_id in range(50):
+            queries = 3 + trial_id % 3
+            full_vlm = queries if row_name in {BASELINE_ROW, GENERATION_ROW} else (queries + 1) // 2
+            condition = 0 if row_name in {BASELINE_ROW, GENERATION_ROW} else queries // 2
+            transformer = queries * (10 if row_name in {BASELINE_ROW, CONDITION_ROW} else 3)
+            generation = queries * (0 if row_name in {BASELINE_ROW, CONDITION_ROW} else 7)
+            output.append(
+                {
+                    "row": row_name,
+                    "task_id": task_id,
+                    "trial_id": trial_id,
+                    "success": int((task_id + trial_id) % 7 != 0),
+                    "episode_length": queries * 5,
+                    "num_policy_queries": queries,
+                    "num_full_vlm_calls": full_vlm,
+                    "num_condition_updater_calls": condition,
+                    "num_full_action_transformer_evaluations": transformer,
+                    "num_generation_loop_updates": generation,
+                    "num_integration_updates": transformer + generation,
+                    "latency_per_policy_query_ms": 100.0,
+                    "model_vlm_encoder_per_query_ms": 50.0,
+                    "model_condition_updater_per_update_ms": 5.0,
+                    "model_action_generation_per_query_ms": 40.0,
+                    "policy_wall_time_seconds": queries * 0.1,
+                }
+            )
+    return output
+
+
+def test_all_four_rows_aggregate_exact_10x50() -> None:
+    for row_name in (BASELINE_ROW, CONDITION_ROW, GENERATION_ROW, COMBINED_ROW):
+        summary = _summarize(row_name, _rows(row_name))
+        assert summary["episodes"] == 500
+        assert summary["integration_updates"] == 10 * summary["policy_queries"]
+        if row_name in {CONDITION_ROW, COMBINED_ROW}:
+            assert 1.0 < summary["effective_k_c"] <= 2.0
+        else:
+            assert summary["effective_k_c"] == 1.0
