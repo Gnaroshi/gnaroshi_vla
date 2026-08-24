@@ -75,6 +75,11 @@ ROOT = Path(__file__).resolve().parents[5]
 UPSTREAM = Path(
     os.environ.get("SIMVLA_UPSTREAM_ROOT", ROOT / "architectures" / "simvla" / "upstream")
 ).expanduser().resolve()
+AGGREGATE_SOURCE = (
+    "architectures/simvla/adapters/latentloop/efficient_multirate/"
+    "generation_control_aggregate.py"
+)
+
 
 def _ensure_generation_latency_schema() -> None:
     if "generation_loop_ms" not in rollout_runner_runtime.LATENCY_FIELDS:
@@ -244,10 +249,14 @@ def _verify_provenance(args: argparse.Namespace) -> dict[str, Any]:
     file_report = verify_file_hashes(ROOT, source_lock["relevant_file_sha256"])
     if file_report["verdict"] != "FILE_HASHES_PASS":
         failures.append("one or more locked Generation source files changed")
-    control_file_report = verify_file_hashes(
-        ROOT, transfer_manifest.get("control_file_sha256", {})
-    )
-    if not transfer_manifest.get("control_file_sha256"):
+    control_file_hashes = transfer_manifest.get("control_file_sha256", {})
+    inference_control_file_hashes = {
+        path: digest
+        for path, digest in control_file_hashes.items()
+        if path != AGGREGATE_SOURCE
+    }
+    control_file_report = verify_file_hashes(ROOT, inference_control_file_hashes)
+    if not control_file_hashes:
         failures.append("transfer manifest does not lock control evaluator files")
     elif control_file_report["verdict"] != "FILE_HASHES_PASS":
         failures.append("one or more control evaluator files changed")
@@ -259,6 +268,8 @@ def _verify_provenance(args: argparse.Namespace) -> dict[str, Any]:
         failures.append("fixed 2x2 source lock is empty")
     elif fixed_file_report["verdict"] != "FILE_HASHES_PASS":
         failures.append("one or more fixed 2x2 source files changed")
+    if AGGREGATE_SOURCE not in fixed_source_lock.get("file_sha256", {}):
+        failures.append("fixed 2x2 source lock does not lock the aggregate implementation")
     if (
         fixed_source_lock.get("generation_source_combined_sha256")
         != FROZEN_GENERATION_SOURCE_SHA256
@@ -328,6 +339,9 @@ def _verify_provenance(args: argparse.Namespace) -> dict[str, Any]:
         "runtime_mismatches": runtime_mismatches,
         "locked_file_report": file_report,
         "control_file_report": control_file_report,
+        "control_file_exceptions": {
+            AGGREGATE_SOURCE: "locked by fixed_2x2_source_lock"
+        },
         "fixed_2x2_source_lock": str(fixed_source_lock_path),
         "fixed_2x2_file_report": fixed_file_report,
         "failures": failures,

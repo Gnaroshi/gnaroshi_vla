@@ -78,19 +78,27 @@ def _quantiles(values: Iterable[float]) -> dict[str, float | int]:
 
 
 def _load_npz_records(path: Path) -> dict[tuple[int, int, int], tuple[int, np.ndarray]]:
-    data = np.load(path)
+    # Accessing an array through NpzFile inside the loop re-decompresses the
+    # complete member each time and keeps each backing allocation alive.
+    # Materialize every member exactly once before constructing record views.
+    with np.load(path) as data:
+        task_ids = np.asarray(data["task_id"])
+        trial_ids = np.asarray(data["trial_id"])
+        query_indices = np.asarray(data["policy_query_index"])
+        noise_seeds = np.asarray(data["action_noise_seed"])
+        action_chunks = np.asarray(data["action_chunk"], dtype=np.float32)
     output: dict[tuple[int, int, int], tuple[int, np.ndarray]] = {}
-    for index in range(len(data["task_id"])):
+    for index in range(len(task_ids)):
         key = (
-            int(data["task_id"][index]),
-            int(data["trial_id"][index]),
-            int(data["policy_query_index"][index]),
+            int(task_ids[index]),
+            int(trial_ids[index]),
+            int(query_indices[index]),
         )
         if key in output:
             raise RuntimeError(f"duplicate action-chunk key in {path}: {key}")
         output[key] = (
-            int(data["action_noise_seed"][index]),
-            np.asarray(data["action_chunk"][index], dtype=np.float32),
+            int(noise_seeds[index]),
+            action_chunks[index],
         )
     return output
 
