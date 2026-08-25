@@ -403,7 +403,13 @@ def compare_coupling(args: argparse.Namespace) -> dict[str, Any]:
         "latency_per_policy_query_delta_ms": coupled["latency_per_policy_query_ms"]
         - uncoupled["latency_per_policy_query_ms"],
         "paired_outcomes": _paired(by_key[uncoupled_name], by_key[coupled_name]),
-        "same_compute_schedule": {
+        "same_declared_compute_schedule": True,
+        "declared_compute_schedule": {
+            "k_c": coupled_spec.k_c,
+            "n_g": coupled_spec.n_g,
+            "integration_updates_per_query": 10,
+        },
+        "same_realized_total_call_counts": {
             "full_vlm_calls": uncoupled["full_vlm_calls"] == coupled["full_vlm_calls"],
             "condition_updater_calls": uncoupled["condition_updater_calls"]
             == coupled["condition_updater_calls"],
