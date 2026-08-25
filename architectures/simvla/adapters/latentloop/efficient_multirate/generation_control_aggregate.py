@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -568,6 +569,66 @@ def _legacy_row_summary(root: Path, row: str, inference_seed: str) -> dict[str, 
     }
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def materialize_legacy_row(args: argparse.Namespace) -> dict[str, Any]:
+    """Convert a validated legacy generation row into the strict row schema."""
+
+    source = Path(args.source).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(f"refusing existing compatibility output: {output}")
+
+    payload = _legacy_row_summary(source, args.row, args.inference_seed)
+    if (
+        args.expected_manifest_sha256
+        and payload["manifest_sha256"] != args.expected_manifest_sha256
+    ):
+        raise RuntimeError("legacy row manifest does not match the requested manifest")
+
+    rows = payload["rows"]
+    for item in rows:
+        item["row"] = args.row
+        item["classification"] = args.classification
+
+    source_summary = source / "row_summary.json"
+    source_csv = _discover_episode_csv(source)
+    compatibility = {
+        "verdict": "LEGACY_GENERATION_ROW_MATERIALIZED",
+        "adapter": "generation_control_aggregate.materialize-legacy-row",
+        "source_root": str(source),
+        "source_row": payload["recorded_summary"]["row"],
+        "canonical_row": args.row,
+        "source_row_summary_sha256": _sha256_file(source_summary),
+        "source_episode_metrics_sha256": _sha256_file(source_csv),
+        "manifest_sha256": payload["manifest_sha256"],
+        "source_combined_sha256": FROZEN_GENERATION_SOURCE_SHA256,
+        "source_artifacts_modified": False,
+    }
+    summary = {
+        "verdict": "GENERATION_CONTROL_ROW_PASS",
+        "classification": args.classification,
+        "inference_seed": args.inference_seed,
+        "manifest_sha256": payload["manifest_sha256"],
+        "source_combined_sha256": FROZEN_GENERATION_SOURCE_SHA256,
+        "paper_runtime_match": bool(args.paper_runtime_match),
+        "compatibility_provenance": compatibility,
+        **payload["summary"],
+    }
+
+    output.mkdir(parents=True)
+    _write_csv(output / "episode_metrics.csv", rows)
+    atomic_write_json(output / "row_summary.json", summary)
+    atomic_write_json(output / "compatibility_provenance.json", compatibility)
+    return summary
+
+
 def confirmatory(args: argparse.Namespace) -> dict[str, Any]:
     output = Path(args.output).expanduser().resolve()
     if output.exists():
@@ -807,6 +868,16 @@ def build_parser() -> argparse.ArgumentParser:
     final.add_argument("--learned-offline-screen", default="")
     final.add_argument("--naive-offline-audit", default="")
     final.set_defaults(handler=confirmatory)
+
+    legacy = commands.add_parser("materialize-legacy-row")
+    legacy.add_argument("--source", required=True)
+    legacy.add_argument("--output", required=True)
+    legacy.add_argument("--row", choices=(FULL_ROW, GENERATION_ROW), required=True)
+    legacy.add_argument("--inference-seed", required=True)
+    legacy.add_argument("--classification", required=True)
+    legacy.add_argument("--expected-manifest-sha256", default="")
+    legacy.add_argument("--paper-runtime-match", action="store_true")
+    legacy.set_defaults(handler=materialize_legacy_row)
     return parser
 
 
