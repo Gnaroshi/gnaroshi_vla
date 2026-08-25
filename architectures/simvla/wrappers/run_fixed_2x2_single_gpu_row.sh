@@ -48,7 +48,9 @@ done
 
 case "$ROW" in
   full_nfe10|generation_ng3|condition_kc2_ng10|condition_kc2_ng3|\
-  condition_kc3_ng10|condition_kc3_ng3|condition_kc4_ng10|condition_kc4_ng3) ;;
+  condition_kc3_ng10|condition_kc3_ng3|condition_kc4_ng10|condition_kc4_ng3|\
+  condition_kc2_ng2|condition_kc2_naive_nfe3|condition_kc2_naive_nfe2|\
+  condition_kc3_naive_nfe3) ;;
   *) echo "Invalid --row: $ROW" >&2; exit 2 ;;
 esac
 case "$CLASSIFICATION" in
@@ -101,6 +103,17 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" tools/simvla/simvla_egl_preflight.py \
   --output "$PREFLIGHT" --gpu-id "$GPU" --suite "$SUITE" || exit $?
 
 mkdir -p "$OUTPUT/logs"
+recover_and_merge() {
+  CUDA_VISIBLE_DEVICES='' "$PYTHON" \
+    -m architectures.simvla.adapters.latentloop.efficient_multirate.row_postprocess_recovery \
+    --row "$ROW" \
+    --shard "$OUTPUT/shard_rank0_tasks_0_9" \
+    --merged "$OUTPUT/merged" \
+    --expected-manifest-sha256 "$MANIFEST_SHA" \
+    2>&1 | tee "$OUTPUT/logs/postprocess_recovery.log"
+  return "${PIPESTATUS[0]}"
+}
+
 control_args=()
 if [[ -n "$CONTROL_MANIFEST" ]]; then
   control_args=(--control-manifest "$CONTROL_MANIFEST")
@@ -128,7 +141,12 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" \
   "${video_args[@]}" \
   2>&1 | tee "$OUTPUT/logs/evaluate.log"
 eval_rc=${PIPESTATUS[0]}
-((eval_rc == 0)) || exit "$eval_rc"
+if ((eval_rc != 0)); then
+  echo "Evaluation exited rc=$eval_rc; validating bounded postprocess recovery." >&2
+  recover_and_merge || exit "$eval_rc"
+  echo "ROW_RECOVERED_AFTER_EVAL_FAILURE row=$ROW output=$OUTPUT/merged"
+  exit 0
+fi
 
 CUDA_VISIBLE_DEVICES='' "$PYTHON" \
   -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggregate \
@@ -139,5 +157,8 @@ CUDA_VISIBLE_DEVICES='' "$PYTHON" \
   --expected-manifest-sha256 "$MANIFEST_SHA" \
   2>&1 | tee "$OUTPUT/logs/aggregate.log"
 aggregate_rc=${PIPESTATUS[0]}
-((aggregate_rc == 0)) || exit "$aggregate_rc"
+if ((aggregate_rc != 0)); then
+  echo "Aggregation exited rc=$aggregate_rc; rebuilding validated merged artifacts." >&2
+  recover_and_merge || exit "$aggregate_rc"
+fi
 echo "FIXED_2X2_ROW_PASS row=$ROW output=$OUTPUT/merged"

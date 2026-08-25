@@ -186,8 +186,9 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("fixed 2x2 shard manifest mismatch")
     rows = _read_csv(shard / "episode_metrics.csv")
     spec = row_spec(args.row)
+    is_frontier = spec.k_c > 2 or spec.n_g == 2 or spec.naive_nfe
     summary = {
-        "verdict": "KC_FRONTIER_ROW_PASS" if spec.k_c > 2 else "FIXED_2X2_ROW_PASS",
+        "verdict": "KC_FRONTIER_ROW_PASS" if is_frontier else "FIXED_2X2_ROW_PASS",
         "classification": shard_summary["classification"],
         "inference_seed": shard_summary["inference_seed"],
         "manifest_sha256": args.expected_manifest_sha256,
@@ -204,6 +205,13 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
         "paper_runtime_match": bool(shard_summary["paper_runtime_match"]),
         "condition_refresh_interval": spec.k_c,
         "full_generation_evaluations": spec.n_g,
+        "generation_mode": (
+            "naive_nfe"
+            if spec.naive_nfe
+            else "learned_hidden_update"
+            if spec.uses_generation
+            else "native_full_nfe"
+        ),
         **_summarize(args.row, rows),
     }
     output.mkdir(parents=True)

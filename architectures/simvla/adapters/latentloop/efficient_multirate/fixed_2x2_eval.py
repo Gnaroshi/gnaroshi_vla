@@ -18,6 +18,9 @@ from tqdm.auto import tqdm
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_checkpoint import (
     load_generation_checkpoint,
 )
+from architectures.simvla.adapters.latentloop.efficient_multirate.contracts import (
+    GENERATION_SCHEDULES,
+)
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
     COUPLED_CHECKPOINT_SCHEMA,
     COUPLED_ROW,
@@ -192,22 +195,69 @@ class SynchronizedConditionK_CPolicy(RealSimVLANativeV0Policy):
         }
 
 
-class SynchronizedCombinedK_CN_G3Policy(SynchronizedConditionK_CPolicy):
-    """Uncoupled K_C condition loop and N_G=3 generation loop."""
+class SynchronizedConditionNaiveNFEPolicy(SynchronizedConditionK_CPolicy):
+    """Condition updater plus native SimVLA Euler integration at reduced NFE."""
+
+    def __init__(self, *, nfe: int, **kwargs: Any) -> None:
+        if int(nfe) not in {2, 3}:
+            raise ValueError("naive control requires NFE in {2,3}")
+        super().__init__(**kwargs)
+        self.nfe = int(nfe)
+
+    def _decode(
+        self,
+        condition: torch.Tensor,
+        proprio: torch.Tensor,
+        *,
+        policy_query_index: int,
+    ) -> tuple[torch.Tensor, int | None]:
+        self._sync()
+        started = time.perf_counter()
+        initial_noise, seed = self._paired_initial_noise(
+            condition, proprio, policy_query_index
+        )
+        if initial_noise is None:
+            raise RuntimeError("naive NFE control requires explicit paired noise")
+        decoded = self.action_adapter.decode_action_from_condition(
+            condition,
+            proprio,
+            steps=self.nfe,
+            initial_noise=initial_noise,
+            return_debug=True,
+        )
+        self._sync()
+        self.metrics.latencies["action_transformer_ms"].append(
+            (time.perf_counter() - started) * 1000.0
+        )
+        iterations = int(decoded.debug.get("iterations", 0))
+        if iterations != self.nfe:
+            raise RuntimeError(
+                f"naive NFE counter drift: observed={iterations} expected={self.nfe}"
+            )
+        self.metrics.counters["num_action_transformer_calls"] += iterations
+        self.metrics.counters["num_action_transformer_decodes"] += 1
+        return decoded.action, seed
+
+
+class SynchronizedCombinedK_CN_GPolicy(SynchronizedConditionK_CPolicy):
+    """Uncoupled K_C condition loop and learned reduced-N_G generation loop."""
 
     def __init__(
         self,
         *,
         generation_updater: Any,
+        n_g: int = 3,
         k_c: int = 2,
         row_name: str | None = None,
         **kwargs: Any,
     ) -> None:
+        if int(n_g) not in {2, 3}:
+            raise ValueError("combined learned generation requires N_G in {2,3}")
         _ensure_generation_latency_schema()
-        combined_row = row_name or f"condition_kc{int(k_c)}_ng3"
+        combined_row = row_name or f"condition_kc{int(k_c)}_ng{int(n_g)}"
         super().__init__(k_c=k_c, row_name=combined_row, **kwargs)
-        self.n_g = 3
-        self.full_step_indices = (0, 4, 8)
+        self.n_g = int(n_g)
+        self.full_step_indices = GENERATION_SCHEDULES[self.n_g]
         self.generation_loop = SimVLAGenerationLoop(
             generation_updater.eval(), self.model.transformer.action_decoder
         ).to(self.device)
@@ -230,7 +280,7 @@ class SynchronizedCombinedK_CN_G3Policy(SynchronizedConditionK_CPolicy):
         )
 
 
-class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_CN_G3Policy):
+class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_CN_GPolicy):
     """K_C=2 and N_G=3 with the Condition updater's real 128-D c_j."""
 
     def __init__(self, **kwargs: Any) -> None:
@@ -374,7 +424,8 @@ class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_CN_G3Policy):
 
 # Preserve the fixed-2x2 public imports while making the generic implementation explicit.
 SynchronizedConditionK_C2Policy = SynchronizedConditionK_CPolicy
-SynchronizedCombinedK_C2N_G3Policy = SynchronizedCombinedK_CN_G3Policy
+SynchronizedCombinedK_CN_G3Policy = SynchronizedCombinedK_CN_GPolicy
+SynchronizedCombinedK_C2N_G3Policy = SynchronizedCombinedK_CN_GPolicy
 
 
 def _git(root: Path, *args: str) -> str:
@@ -619,6 +670,15 @@ def _make_policy(
             flow_steps=10,
             row_name=FULL_ROW,
         )
+    if spec.naive_nfe:
+        if condition_updater is None:
+            raise RuntimeError("naive condition row requires the frozen Condition updater")
+        return SynchronizedConditionNaiveNFEPolicy(
+            **condition_common,
+            k_c=spec.k_c,
+            nfe=spec.n_g,
+            row_name=row,
+        )
     if spec.uses_condition and not spec.uses_generation:
         if condition_updater is None:
             raise RuntimeError("condition row requires the frozen Condition updater")
@@ -648,9 +708,10 @@ def _make_policy(
             raise RuntimeError("combined row requires the frozen Condition updater")
         if generation_updater is None:
             raise RuntimeError("combined row requires the frozen Generation updater")
-        return SynchronizedCombinedK_CN_G3Policy(
+        return SynchronizedCombinedK_CN_GPolicy(
             **condition_common,
             generation_updater=generation_updater,
+            n_g=spec.n_g,
             k_c=spec.k_c,
             row_name=row,
         )
@@ -687,7 +748,7 @@ def _validate_fixed_2x2_counters(
         + int(generation_loop_updates),
     }
     checks = {name: observed[name] == value for name, value in expected.items()}
-    is_fixed_row = spec.k_c <= 2
+    is_fixed_row = not (spec.k_c > 2 or spec.n_g == 2 or spec.naive_nfe)
     prefix = "FIXED_2X2" if is_fixed_row else "KC_FRONTIER"
     return {
         "verdict": f"{prefix}_COUNTER_PASS" if all(checks.values()) else f"{prefix}_COUNTER_FAIL",
@@ -838,8 +899,8 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
     freeze_module(model)
     condition_updater = None
     condition_payload = None
-    spec = row_spec(args.row)
-    if spec.uses_condition:
+    row_contract = row_spec(args.row)
+    if row_contract.uses_condition:
         condition_updater, condition_payload = load_native_v0_checkpoint(
             args.condition_checkpoint,
             device=device,
@@ -859,7 +920,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
     generation_updater = None
     generation_payload = None
     coupled_checkpoint_report = None
-    if spec.uses_generation and not spec.coupled:
+    if row_contract.uses_generation and not row_contract.coupled:
         generation_updater, generation_payload = load_generation_checkpoint(
             generation_checkpoint, device=device
         )
@@ -943,12 +1004,14 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
             task, int(manifest["environment_resolution"]), int(manifest["environment_seed"])
         )
         try:
-            for spec in specs_by_task[task_id]:
-                trial_id = int(spec["trial_id"])
+            for episode_spec in specs_by_task[task_id]:
+                trial_id = int(episode_spec["trial_id"])
                 episode_started = time.perf_counter()
                 env.reset()
                 observation = env.set_init_state(
-                    initial_states[int(spec["init_state_index"]) % len(initial_states)]
+                    initial_states[
+                        int(episode_spec["init_state_index"]) % len(initial_states)
+                    ]
                 )
                 environment_ms = 0.0
                 for _ in range(int(manifest["num_wait_steps"])):
@@ -1036,7 +1099,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
                     "inference_seed": args.inference_seed,
                     "task_id": task_id,
                     "trial_id": trial_id,
-                    "init_state_index": int(spec["init_state_index"]),
+                    "init_state_index": int(episode_spec["init_state_index"]),
                     "success": int(success),
                     "episode_length": len(actions),
                     "num_policy_queries": policy_queries,
@@ -1123,7 +1186,11 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         writer.writeheader()
         writer.writerows(episode_rows)
     _save_action_chunks(output / "action_chunks.npz", action_chunk_rows)
-    is_frontier = spec.k_c > 2
+    is_frontier = (
+        row_contract.k_c > 2
+        or row_contract.n_g == 2
+        or row_contract.naive_nfe
+    )
     summary = {
         "verdict": "KC_FRONTIER_SHARD_PASS" if is_frontier else "FIXED_2X2_SHARD_PASS",
         "row": args.row,
@@ -1140,14 +1207,22 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
             "generation": (
                 generation_payload["source_lock"]["combined_sha256"]
                 if args.row == COUPLED_ROW and generation_payload is not None
-                else FROZEN_GENERATION_SOURCE_SHA256
+                else (
+                    FROZEN_GENERATION_SOURCE_SHA256
+                    if row_contract.uses_generation
+                    else None
+                )
             ),
         },
         "condition_checkpoint_sha256": FROZEN_CONDITION_CHECKPOINT_SHA256,
         "generation_checkpoint_sha256": (
             sha256_file(args.coupled_generation_checkpoint)
             if args.row == COUPLED_ROW
-            else FROZEN_GENERATION_CHECKPOINT_SHA256
+            else (
+                FROZEN_GENERATION_CHECKPOINT_SHA256
+                if row_contract.uses_generation
+                else None
+            )
         ),
         "coupled_checkpoint_validation": (
             coupled_checkpoint_report["verdict"]
@@ -1155,8 +1230,15 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
             else None
         ),
         "paper_runtime_match": provenance["paper_runtime_match"],
-        "condition_refresh_interval": spec.k_c,
-        "full_generation_evaluations": spec.n_g,
+        "condition_refresh_interval": row_contract.k_c,
+        "full_generation_evaluations": row_contract.n_g,
+        "generation_mode": (
+            "naive_nfe"
+            if row_contract.naive_nfe
+            else "learned_hidden_update"
+            if row_contract.uses_generation
+            else "native_full_nfe"
+        ),
         "all_episode_counter_gates_pass": all(
             item["counter_gate"].endswith("_COUNTER_PASS") for item in episode_rows
         ),

@@ -137,6 +137,7 @@ unset LIBGL_ALWAYS_SOFTWARE
 echo "[6/7] Same-manifest 500-episode coupled online evaluation"
 $PYTHON tools/simvla/simvla_egl_preflight.py \
   --output "$OUTPUT/gates/coupled_online_egl.json" --gpu-id "$GPU" --suite libero_10
+set +e
 $PYTHON -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval \
   --row condition_kc2_ng3_coupled \
   --output "$ONLINE/shard_rank0_tasks_0_9" \
@@ -155,15 +156,41 @@ $PYTHON -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x
   --inference-seed "$INFERENCE_SEED" \
   --save-video --video-failures-only \
   2>&1 | tee "$OUTPUT/logs/online_500.log"
+online_rc=${PIPESTATUS[0]}
+set -e
+if ((online_rc != 0)); then
+  echo "Coupled evaluation exited rc=$online_rc; validating bounded postprocess recovery." >&2
+  CUDA_VISIBLE_DEVICES='' $PYTHON \
+    -m architectures.simvla.adapters.latentloop.efficient_multirate.row_postprocess_recovery \
+    --row condition_kc2_ng3_coupled \
+    --shard "$ONLINE/shard_rank0_tasks_0_9" \
+    --merged "$ONLINE/merged" \
+    --expected-manifest-sha256 "$MANIFEST_SHA" \
+    --generation-checkpoint "$CHECKPOINT"
+fi
 
 echo "[7/7] Aggregate and paired uncoupled-vs-coupled comparison"
-CUDA_VISIBLE_DEVICES='' $PYTHON \
-  -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggregate \
-  aggregate-row \
-  --row condition_kc2_ng3_coupled \
-  --output "$ONLINE/merged" \
-  --shard "$ONLINE/shard_rank0_tasks_0_9" \
-  --expected-manifest-sha256 "$MANIFEST_SHA"
+if [[ ! -f "$ONLINE/merged/row_summary.json" ]]; then
+  set +e
+  CUDA_VISIBLE_DEVICES='' $PYTHON \
+    -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggregate \
+    aggregate-row \
+    --row condition_kc2_ng3_coupled \
+    --output "$ONLINE/merged" \
+    --shard "$ONLINE/shard_rank0_tasks_0_9" \
+    --expected-manifest-sha256 "$MANIFEST_SHA"
+  aggregate_rc=$?
+  set -e
+  if ((aggregate_rc != 0)); then
+    CUDA_VISIBLE_DEVICES='' $PYTHON \
+      -m architectures.simvla.adapters.latentloop.efficient_multirate.row_postprocess_recovery \
+      --row condition_kc2_ng3_coupled \
+      --shard "$ONLINE/shard_rank0_tasks_0_9" \
+      --merged "$ONLINE/merged" \
+      --expected-manifest-sha256 "$MANIFEST_SHA" \
+      --generation-checkpoint "$CHECKPOINT"
+  fi
+fi
 CUDA_VISIBLE_DEVICES='' $PYTHON \
   -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggregate \
   compare-coupling \

@@ -19,6 +19,10 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condit
 
 FRONTIER_K_C_VALUES = (2, 3, 4)
 FRONTIER_N_G_VALUES = (10, 3)
+LEARNED_CONFIGS = tuple(
+    (k_c, n_g) for k_c in FRONTIER_K_C_VALUES for n_g in FRONTIER_N_G_VALUES
+) + ((2, 2),)
+NAIVE_CONFIGS = ((2, 3), (2, 2), (3, 3))
 
 
 @dataclass(frozen=True)
@@ -29,14 +33,21 @@ class EfficiencyRowSpec:
     uses_condition: bool
     uses_generation: bool
     coupled: bool = False
+    naive_nfe: bool = False
 
 
 def condition_row_name(k_c: int, n_g: int) -> str:
-    if int(k_c) not in FRONTIER_K_C_VALUES:
-        raise ValueError(f"K_C must be one of {FRONTIER_K_C_VALUES}")
-    if int(n_g) not in FRONTIER_N_G_VALUES:
-        raise ValueError(f"N_G must be one of {FRONTIER_N_G_VALUES}")
+    pair = (int(k_c), int(n_g))
+    if pair not in LEARNED_CONFIGS:
+        raise ValueError(f"unsupported learned (K_C, N_G): {pair}")
     return f"condition_kc{int(k_c)}_ng{int(n_g)}"
+
+
+def naive_condition_row_name(k_c: int, nfe: int) -> str:
+    pair = (int(k_c), int(nfe))
+    if pair not in NAIVE_CONFIGS:
+        raise ValueError(f"unsupported naive (K_C, NFE): {pair}")
+    return f"condition_kc{int(k_c)}_naive_nfe{int(nfe)}"
 
 
 ROW_SPECS = {
@@ -44,10 +55,21 @@ ROW_SPECS = {
     GENERATION_ROW: EfficiencyRowSpec(GENERATION_ROW, 1, 3, False, True),
     **{
         condition_row_name(k_c, n_g): EfficiencyRowSpec(
-            condition_row_name(k_c, n_g), k_c, n_g, True, n_g == 3
+            condition_row_name(k_c, n_g), k_c, n_g, True, n_g in {2, 3}
         )
-        for k_c in FRONTIER_K_C_VALUES
-        for n_g in FRONTIER_N_G_VALUES
+        for k_c, n_g in LEARNED_CONFIGS
+    },
+    **{
+        naive_condition_row_name(k_c, nfe): EfficiencyRowSpec(
+            naive_condition_row_name(k_c, nfe),
+            k_c,
+            nfe,
+            True,
+            False,
+            False,
+            True,
+        )
+        for k_c, nfe in NAIVE_CONFIGS
     },
     COUPLED_ROW: EfficiencyRowSpec(COUPLED_ROW, 2, 3, True, True, True),
 }
@@ -68,6 +90,12 @@ FRONTIER_ROWS = tuple(
     condition_row_name(k_c, n_g)
     for k_c in (3, 4)
     for n_g in FRONTIER_N_G_VALUES
+)
+JOINT_NFE_ROWS = (
+    naive_condition_row_name(2, 3),
+    condition_row_name(2, 2),
+    naive_condition_row_name(2, 2),
+    naive_condition_row_name(3, 3),
 )
 
 
