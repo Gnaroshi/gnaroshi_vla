@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
+from types import SimpleNamespace
+
 import numpy as np
+import torch
 
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggregate import (
     BASELINE_ROW,
@@ -10,6 +14,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggr
     _summarize,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval import (
+    SynchronizedConditionK_C2Policy,
     _validate_sd1_fixed_shard,
     _validate_fixed_2x2_counters,
 )
@@ -18,6 +23,10 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condit
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_aggregate import (
     _load_npz_records,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
+    condition_row_name,
+    expected_call_counts,
 )
 
 
@@ -67,6 +76,107 @@ def test_fixed_2x2_counter_contracts() -> None:
         )
         for gate in (full_gate, condition_gate, generation_gate, combined_gate, coupled_gate):
             assert gate["verdict"] == "FIXED_2X2_COUNTER_PASS"
+
+
+def test_kc3_kc4_counter_contracts() -> None:
+    for k_c in (3, 4):
+        for n_g in (10, 3):
+            row = condition_row_name(k_c, n_g)
+            for queries in (1, 2, 3, 4, 5, 8):
+                counts = expected_call_counts(row, queries)
+                gate = _validate_fixed_2x2_counters(
+                    row,
+                    policy_queries=queries,
+                    full_vlm_calls=counts["full_vlm_calls"],
+                    condition_updater_calls=counts["condition_updater_calls"],
+                    full_action_transformer_calls=counts[
+                        "full_action_transformer_calls"
+                    ],
+                    generation_loop_updates=counts["generation_loop_updates"],
+                )
+                assert gate["verdict"] == "KC_FRONTIER_COUNTER_PASS"
+                assert counts["integration_updates"] == 10 * queries
+
+
+def test_condition_policy_uses_recursive_age_schedule() -> None:
+    for k_c in (3, 4):
+        policy = object.__new__(SynchronizedConditionK_C2Policy)
+        policy.k_c = k_c
+        policy.query_index = 0
+        policy.action_queue = deque()
+        policy.query_trace = []
+        policy.action_chunk_records = []
+        policy.log_action_chunks = False
+        policy.suite = "libero_10"
+        policy.task_id = 0
+        policy.trial_id = 0
+        policy.row_name = condition_row_name(k_c, 10)
+        policy.mode = policy.row_name
+        policy.metrics = SimpleNamespace(counters=defaultdict(int))
+        observed: list[tuple[str, int]] = []
+
+        def full_refresh(batch, *, policy_query_index):  # type: ignore[no-untyped-def]
+            del batch
+            observed.append(("full", policy_query_index % k_c))
+            policy.metrics.counters["num_full_vlm_calls"] += 1
+            return None, torch.zeros(1, 10, 7), policy_query_index
+
+        def update(batch, *, age, policy_query_index):  # type: ignore[no-untyped-def]
+            del batch
+            observed.append(("update", age))
+            policy.metrics.counters["num_condition_updater_calls"] += 1
+            return None, torch.zeros(1, 10, 7), policy_query_index
+
+        policy._full_refresh = full_refresh
+        policy._v0_update = update
+        for _ in range(2 * k_c):
+            policy._refill_action_queue({})
+        expected = [
+            ("full", 0) if query % k_c == 0 else ("update", query % k_c)
+            for query in range(2 * k_c)
+        ]
+        assert observed == expected
+
+
+def test_kc_frontier_aggregate_exact_10x50() -> None:
+    for k_c in (3, 4):
+        for n_g in (10, 3):
+            row_name = condition_row_name(k_c, n_g)
+            rows = []
+            for task_id in range(10):
+                for trial_id in range(50):
+                    queries = 3 + trial_id % 5
+                    counts = expected_call_counts(row_name, queries)
+                    rows.append(
+                        {
+                            "row": row_name,
+                            "task_id": task_id,
+                            "trial_id": trial_id,
+                            "success": int((task_id + trial_id) % 7 != 0),
+                            "episode_length": queries * 5,
+                            "num_policy_queries": queries,
+                            "num_full_vlm_calls": counts["full_vlm_calls"],
+                            "num_condition_updater_calls": counts[
+                                "condition_updater_calls"
+                            ],
+                            "num_full_action_transformer_evaluations": counts[
+                                "full_action_transformer_calls"
+                            ],
+                            "num_generation_loop_updates": counts[
+                                "generation_loop_updates"
+                            ],
+                            "num_integration_updates": counts["integration_updates"],
+                            "latency_per_policy_query_ms": 100.0,
+                            "model_vlm_encoder_per_query_ms": 50.0,
+                            "model_condition_updater_per_update_ms": 5.0,
+                            "model_action_generation_per_query_ms": 40.0,
+                            "policy_wall_time_seconds": queries * 0.1,
+                        }
+                    )
+            summary = _summarize(row_name, rows)
+            assert summary["episodes"] == 500
+            assert summary["integration_updates"] == 10 * summary["policy_queries"]
+            assert 1.0 < summary["effective_k_c"] <= float(k_c)
 
 
 def _rows(row_name: str) -> list[dict[str, int | float | str]]:

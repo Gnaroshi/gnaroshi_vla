@@ -18,6 +18,7 @@ MANIFEST_SHA=
 BUNDLE=
 CONDITION_CHECKPOINT=
 SOURCE_LOCK=
+CONTROL_MANIFEST=
 PARITY_GATE=
 GPU=
 CLASSIFICATION=RB2_CONFIRMATORY_EGL
@@ -33,6 +34,7 @@ while (($#)); do
     --bundle-root) BUNDLE=$2; shift 2 ;;
     --condition-checkpoint) CONDITION_CHECKPOINT=$2; shift 2 ;;
     --source-lock) SOURCE_LOCK=$2; shift 2 ;;
+    --control-manifest) CONTROL_MANIFEST=$2; shift 2 ;;
     --parity-gate) PARITY_GATE=$2; shift 2 ;;
     --physical-gpu-id) GPU=$2; shift 2 ;;
     --classification) CLASSIFICATION=$2; shift 2 ;;
@@ -43,7 +45,8 @@ while (($#)); do
 done
 
 case "$ROW" in
-  full_nfe10|condition_kc2_ng10|generation_ng3|condition_kc2_ng3) ;;
+  full_nfe10|generation_ng3|condition_kc2_ng10|condition_kc2_ng3|\
+  condition_kc3_ng10|condition_kc3_ng3|condition_kc4_ng10|condition_kc4_ng3) ;;
   *) echo "Invalid --row: $ROW" >&2; exit 2 ;;
 esac
 case "$CLASSIFICATION" in
@@ -96,6 +99,10 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" tools/simvla/simvla_egl_preflight.py \
   --output "$PREFLIGHT" --gpu-id "$GPU" --suite "$SUITE" || exit $?
 
 mkdir -p "$OUTPUT/logs"
+control_args=()
+if [[ -n "$CONTROL_MANIFEST" ]]; then
+  control_args=(--control-manifest "$CONTROL_MANIFEST")
+fi
 CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" \
   -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval \
   --row "$ROW" \
@@ -105,6 +112,7 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" \
   --bundle-root "$BUNDLE" \
   --condition-checkpoint "$CONDITION_CHECKPOINT" \
   --fixed-2x2-source-lock "$SOURCE_LOCK" \
+  "${control_args[@]}" \
   --fixed-2x2-parity-gate "$PARITY_GATE" \
   --egl-preflight "$PREFLIGHT" \
   --physical-gpu-id "$GPU" \

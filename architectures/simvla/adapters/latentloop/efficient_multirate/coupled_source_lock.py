@@ -29,7 +29,11 @@ SOURCE_FILES = (
     "architectures/simvla/adapters/latentloop/efficient_multirate/coupled_source_lock.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/fixed_2x2_aggregate.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/fixed_2x2_eval.py",
+    "architectures/simvla/adapters/latentloop/efficient_multirate/kc_frontier_aggregate.py",
+    "architectures/simvla/adapters/latentloop/efficient_multirate/kc_frontier_contracts.py",
     "architectures/simvla/wrappers/run_coupled_condition_generation.sh",
+    "architectures/simvla/wrappers/run_fixed_2x2_single_gpu_row.sh",
+    "architectures/simvla/wrappers/run_kc_efficiency_frontier_sd1.sh",
 )
 
 

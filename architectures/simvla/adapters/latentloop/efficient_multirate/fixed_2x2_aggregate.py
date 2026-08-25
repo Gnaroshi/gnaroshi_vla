@@ -25,12 +25,17 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_cont
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
     COUPLED_ROW,
 )
+from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
+    EVAL_ROWS,
+    expected_call_counts,
+    row_spec,
+)
 
 
 BASELINE_ROW = "full_nfe10"
 GENERATION_ROW = "generation_ng3"
 ROWS = (BASELINE_ROW, CONDITION_ROW, GENERATION_ROW, COMBINED_ROW)
-AGGREGATABLE_ROWS = (*ROWS, COUPLED_ROW)
+AGGREGATABLE_ROWS = EVAL_ROWS
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -77,25 +82,13 @@ def _weighted_mean(
 
 
 def _expected_counts(row_name: str, queries: int) -> dict[str, int]:
-    if row_name == BASELINE_ROW:
-        return {"vlm": queries, "condition": 0, "transformer": 10 * queries, "generation": 0}
-    if row_name == CONDITION_ROW:
-        return {
-            "vlm": (queries + 1) // 2,
-            "condition": queries // 2,
-            "transformer": 10 * queries,
-            "generation": 0,
-        }
-    if row_name == GENERATION_ROW:
-        return {"vlm": queries, "condition": 0, "transformer": 3 * queries, "generation": 7 * queries}
-    if row_name in {COMBINED_ROW, COUPLED_ROW}:
-        return {
-            "vlm": (queries + 1) // 2,
-            "condition": queries // 2,
-            "transformer": 3 * queries,
-            "generation": 7 * queries,
-        }
-    raise ValueError(f"unknown row: {row_name}")
+    counts = expected_call_counts(row_name, queries)
+    return {
+        "vlm": counts["full_vlm_calls"],
+        "condition": counts["condition_updater_calls"],
+        "transformer": counts["full_action_transformer_calls"],
+        "generation": counts["generation_loop_updates"],
+    }
 
 
 def _validate_episode_table(row_name: str, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -184,15 +177,17 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
     if output.exists():
         raise FileExistsError(f"refusing existing output: {output}")
     shard_summary = load_json(shard / "shard_summary.json")
-    if shard_summary.get("verdict") != "FIXED_2X2_SHARD_PASS":
-        raise RuntimeError("fixed 2x2 shard gate did not pass")
+    accepted_shard_verdicts = {"FIXED_2X2_SHARD_PASS", "KC_FRONTIER_SHARD_PASS"}
+    if shard_summary.get("verdict") not in accepted_shard_verdicts:
+        raise RuntimeError("efficiency-row shard gate did not pass")
     if shard_summary.get("row") != args.row:
         raise RuntimeError("fixed 2x2 shard row mismatch")
     if shard_summary.get("manifest_sha256") != args.expected_manifest_sha256:
         raise RuntimeError("fixed 2x2 shard manifest mismatch")
     rows = _read_csv(shard / "episode_metrics.csv")
+    spec = row_spec(args.row)
     summary = {
-        "verdict": "FIXED_2X2_ROW_PASS",
+        "verdict": "KC_FRONTIER_ROW_PASS" if spec.k_c > 2 else "FIXED_2X2_ROW_PASS",
         "classification": shard_summary["classification"],
         "inference_seed": shard_summary["inference_seed"],
         "manifest_sha256": args.expected_manifest_sha256,
@@ -207,6 +202,8 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
             "generation_checkpoint_sha256"
         ),
         "paper_runtime_match": bool(shard_summary["paper_runtime_match"]),
+        "condition_refresh_interval": spec.k_c,
+        "full_generation_evaluations": spec.n_g,
         **_summarize(args.row, rows),
     }
     output.mkdir(parents=True)

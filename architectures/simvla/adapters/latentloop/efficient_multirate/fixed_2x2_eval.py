@@ -55,11 +55,13 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_con
     SynchronizedGenerationN_G3Policy,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_contracts import (
-    COMBINED_ROW,
-    CONDITION_ROW,
     FROZEN_CONDITION_CHECKPOINT_SHA256,
     FROZEN_CONDITION_SOURCE_SHA256,
-    ROWS as CONDITION_ROWS,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
+    EVAL_ROWS,
+    expected_call_counts,
+    row_spec,
 )
 from architectures.simvla.adapters.latentloop.native_v0_long_eval import (
     _SynchronizedFullPolicy,
@@ -99,27 +101,33 @@ AGGREGATE_SOURCE = (
     "architectures/simvla/adapters/latentloop/efficient_multirate/"
     "generation_control_aggregate.py"
 )
-EVAL_ROWS = (FULL_ROW, CONDITION_ROW, GENERATION_ROW, COMBINED_ROW, COUPLED_ROW)
-
-
 def _ensure_generation_latency_schema() -> None:
     if "generation_loop_ms" not in rollout_runner_runtime.LATENCY_FIELDS:
         rollout_runner_runtime.LATENCY_FIELDS.append("generation_loop_ms")
 
 
 class SynchronizedConditionK_C2Policy(RealSimVLANativeV0Policy):
-    """Use one learned condition update between full VLM condition refreshes."""
+    """Use learned recursive condition updates between full VLM refreshes."""
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        k_c: int = 2,
+        row_name: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if int(k_c) not in {2, 3, 4}:
+            raise ValueError("condition refresh interval must be 2, 3, or 4")
         super().__init__(**kwargs)
-        self.mode = CONDITION_ROW
-        self.row_name = CONDITION_ROW
-        self.refresh_every = 2
+        self.k_c = int(k_c)
+        self.mode = row_name or f"condition_kc{self.k_c}_ng10"
+        self.row_name = self.mode
+        self.refresh_every = self.k_c
 
     def _refill_action_queue(self, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
         self.metrics.counters["num_policy_queries"] += 1
         query = int(self.query_index)
-        age = query % 2
+        age = query % self.k_c
         if age == 0:
             _, action_chunk, seed = self._full_refresh(
                 batch, policy_query_index=query
@@ -128,7 +136,7 @@ class SynchronizedConditionK_C2Policy(RealSimVLANativeV0Policy):
             refreshed = True
         else:
             _, action_chunk, seed = self._v0_update(
-                batch, age=1, policy_query_index=query
+                batch, age=age, policy_query_index=query
             )
             source = "native_v0"
             refreshed = False
@@ -145,7 +153,7 @@ class SynchronizedConditionK_C2Policy(RealSimVLANativeV0Policy):
                 "action_noise_seed": seed,
                 "action_horizon": 10,
                 "execution_horizon": 5,
-                "k_c": 2,
+                "k_c": self.k_c,
             }
         )
         if self.log_action_chunks:
@@ -158,7 +166,7 @@ class SynchronizedConditionK_C2Policy(RealSimVLANativeV0Policy):
                     "policy_query_index": query,
                     "row_name": self.row_name,
                     "mode": self.mode,
-                    "k": 2,
+                    "k": self.k_c,
                     "queue_mode": source,
                     "refreshed": bool(refreshed),
                     "full_vlm_called": bool(refreshed),
@@ -173,8 +181,9 @@ class SynchronizedConditionK_C2Policy(RealSimVLANativeV0Policy):
         queries = int(self.metrics.counters["num_policy_queries"])
         full_calls = int(self.metrics.counters["num_full_vlm_calls"])
         update_calls = int(self.metrics.counters["num_condition_updater_calls"])
-        if full_calls != (queries + 1) // 2 or update_calls != queries // 2:
-            raise RuntimeError("K_C=2 condition-call counter drift")
+        expected_full = (queries + self.k_c - 1) // self.k_c
+        if full_calls != expected_full or update_calls != queries - expected_full:
+            raise RuntimeError(f"K_C={self.k_c} condition-call counter drift")
         return {
             "refreshed": refreshed,
             "age": age,
@@ -184,13 +193,19 @@ class SynchronizedConditionK_C2Policy(RealSimVLANativeV0Policy):
 
 
 class SynchronizedCombinedK_C2N_G3Policy(SynchronizedConditionK_C2Policy):
-    """Uncoupled fixed 2x2 row: K_C=2 condition loop and N_G=3 generation loop."""
+    """Uncoupled K_C condition loop and N_G=3 generation loop."""
 
-    def __init__(self, *, generation_updater: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        generation_updater: Any,
+        k_c: int = 2,
+        row_name: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         _ensure_generation_latency_schema()
-        super().__init__(**kwargs)
-        self.mode = COMBINED_ROW
-        self.row_name = COMBINED_ROW
+        combined_row = row_name or f"condition_kc{int(k_c)}_ng3"
+        super().__init__(k_c=k_c, row_name=combined_row, **kwargs)
         self.n_g = 3
         self.full_step_indices = (0, 4, 8)
         self.generation_loop = SimVLAGenerationLoop(
@@ -560,6 +575,7 @@ def _make_policy(
     trial_id: int,
     action_noise_seed_base: int,
 ) -> Any:
+    spec = row_spec(row)
     full_common = {
         "model": model,
         "processor": processor,
@@ -598,10 +614,14 @@ def _make_policy(
             flow_steps=10,
             row_name=FULL_ROW,
         )
-    if row == CONDITION_ROW:
+    if spec.uses_condition and not spec.uses_generation:
         if condition_updater is None:
             raise RuntimeError("condition row requires the frozen Condition updater")
-        return SynchronizedConditionK_C2Policy(**condition_common)
+        return SynchronizedConditionK_C2Policy(
+            **condition_common,
+            k_c=spec.k_c,
+            row_name=row,
+        )
     if row == GENERATION_ROW:
         if generation_updater is None:
             raise RuntimeError("Generation row requires the frozen Generation updater")
@@ -618,7 +638,7 @@ def _make_policy(
             action_noise_seed_base=action_noise_seed_base,
             log_action_chunks=True,
         )
-    if row == COMBINED_ROW:
+    if spec.uses_condition and spec.uses_generation and not spec.coupled:
         if condition_updater is None:
             raise RuntimeError("combined row requires the frozen Condition updater")
         if generation_updater is None:
@@ -626,6 +646,8 @@ def _make_policy(
         return SynchronizedCombinedK_C2N_G3Policy(
             **condition_common,
             generation_updater=generation_updater,
+            k_c=spec.k_c,
+            row_name=row,
         )
     if row == COUPLED_ROW:
         if condition_updater is None:
@@ -648,18 +670,9 @@ def _validate_fixed_2x2_counters(
     full_action_transformer_calls: int,
     generation_loop_updates: int,
 ) -> dict[str, Any]:
-    if row not in EVAL_ROWS:
-        raise ValueError(f"unknown fixed 2x2 row: {row}")
     queries = int(policy_queries)
-    uses_condition = row in CONDITION_ROWS or row == COUPLED_ROW
-    uses_generation = row in {GENERATION_ROW, COMBINED_ROW, COUPLED_ROW}
-    expected = {
-        "full_vlm_calls": (queries + 1) // 2 if uses_condition else queries,
-        "condition_updater_calls": queries // 2 if uses_condition else 0,
-        "full_action_transformer_calls": queries * (3 if uses_generation else 10),
-        "generation_loop_updates": queries * (7 if uses_generation else 0),
-        "integration_updates": queries * 10,
-    }
+    spec = row_spec(row)
+    expected = expected_call_counts(row, queries)
     observed = {
         "full_vlm_calls": int(full_vlm_calls),
         "condition_updater_calls": int(condition_updater_calls),
@@ -669,8 +682,10 @@ def _validate_fixed_2x2_counters(
         + int(generation_loop_updates),
     }
     checks = {name: observed[name] == value for name, value in expected.items()}
+    is_fixed_row = spec.k_c <= 2
+    prefix = "FIXED_2X2" if is_fixed_row else "KC_FRONTIER"
     return {
-        "verdict": "FIXED_2X2_COUNTER_PASS" if all(checks.values()) else "FIXED_2X2_COUNTER_FAIL",
+        "verdict": f"{prefix}_COUNTER_PASS" if all(checks.values()) else f"{prefix}_COUNTER_FAIL",
         "row": row,
         "policy_queries": queries,
         "expected": expected,
@@ -818,7 +833,8 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
     freeze_module(model)
     condition_updater = None
     condition_payload = None
-    if args.row in CONDITION_ROWS or args.row == COUPLED_ROW:
+    spec = row_spec(args.row)
+    if spec.uses_condition:
         condition_updater, condition_payload = load_native_v0_checkpoint(
             args.condition_checkpoint,
             device=device,
@@ -838,7 +854,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
     generation_updater = None
     generation_payload = None
     coupled_checkpoint_report = None
-    if args.row in {GENERATION_ROW, COMBINED_ROW}:
+    if spec.uses_generation and not spec.coupled:
         generation_updater, generation_payload = load_generation_checkpoint(
             generation_checkpoint, device=device
         )
@@ -991,7 +1007,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
                     full_action_transformer_calls=full_calls,
                     generation_loop_updates=generation_updates,
                 )
-                if counter_gate["verdict"] != "FIXED_2X2_COUNTER_PASS":
+                if not counter_gate["verdict"].endswith("_COUNTER_PASS"):
                     raise RuntimeError(json.dumps(counter_gate, indent=2, sort_keys=True))
 
                 trajectory = _trajectory_metrics(actions)
@@ -1102,8 +1118,9 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         writer.writeheader()
         writer.writerows(episode_rows)
     _save_action_chunks(output / "action_chunks.npz", action_chunk_rows)
+    is_frontier = spec.k_c > 2
     summary = {
-        "verdict": "FIXED_2X2_SHARD_PASS",
+        "verdict": "KC_FRONTIER_SHARD_PASS" if is_frontier else "FIXED_2X2_SHARD_PASS",
         "row": args.row,
         "classification": args.classification,
         "inference_seed": args.inference_seed,
@@ -1133,9 +1150,10 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
             else None
         ),
         "paper_runtime_match": provenance["paper_runtime_match"],
+        "condition_refresh_interval": spec.k_c,
+        "full_generation_evaluations": spec.n_g,
         "all_episode_counter_gates_pass": all(
-            item["counter_gate"] == "FIXED_2X2_COUNTER_PASS"
-            for item in episode_rows
+            item["counter_gate"].endswith("_COUNTER_PASS") for item in episode_rows
         ),
         "total_policy_queries": sum(
             int(item["num_policy_queries"]) for item in episode_rows
