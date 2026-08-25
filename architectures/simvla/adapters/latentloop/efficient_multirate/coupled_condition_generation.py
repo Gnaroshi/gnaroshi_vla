@@ -18,7 +18,17 @@ from methods.latentloop.modules.simvla_generation_loop import (
 )
 
 
-COUPLED_ROW = "condition_kc2_ng3_coupled"
+def coupled_row_name(k_c: int, n_g: int = 3) -> str:
+    if int(k_c) not in {2, 3}:
+        raise ValueError("coupled condition refresh interval must be 2 or 3")
+    if int(n_g) != 3:
+        raise ValueError("coupled generation currently requires N_G=3")
+    return f"condition_kc{int(k_c)}_ng{int(n_g)}_coupled"
+
+
+COUPLED_ROW = coupled_row_name(2)
+COUPLED_KC3_ROW = coupled_row_name(3)
+COUPLED_ROWS = (COUPLED_ROW, COUPLED_KC3_ROW)
 COUPLED_CHECKPOINT_SCHEMA = "simvla_condition_generation_coupling_v1"
 
 
@@ -52,19 +62,19 @@ def condition_update_with_code(
     return ConditionUpdateWithCode(update=update, condition_change_code=code)
 
 
-def build_kc2_coupled_query(
+def build_coupled_query(
     adapter: NativeSimVLAV0,
     sequence: dict[str, Any],
     *,
     query_ages: Tensor,
+    k_c: int,
 ) -> dict[str, Tensor]:
-    """Build K_C=2 queries from exact q0-q1-q2-q3 cache windows.
-
-    Ages 1 and 3 use the Condition updater and its real 128-D delta code. Age 2
-    is the intervening full-refresh query and therefore carries a zero code.
-    """
+    """Build coupled queries from exact q0-q1-q2-q3 cache windows."""
 
     batch = int(sequence["anchor_condition"].shape[0])
+    k_c = int(k_c)
+    if k_c not in {2, 3}:
+        raise ValueError("coupled query construction requires K_C in {2,3}")
     if query_ages.shape != (batch,):
         raise ValueError(f"query_ages must be {(batch,)}, got {tuple(query_ages.shape)}")
     if bool((query_ages < 1).any()) or bool((query_ages > 3).any()):
@@ -74,42 +84,50 @@ def build_kc2_coupled_query(
     codes: list[Tensor] = []
     for index, raw_age in enumerate(query_ages.detach().cpu().tolist()):
         age = int(raw_age)
-        if age == 2:
-            conditions.append(sequence["teacher_conditions"][index : index + 1, 1])
+        local_age = age % k_c
+        if local_age == 0:
+            conditions.append(
+                sequence["teacher_conditions"][index : index + 1, age - 1]
+            )
             codes.append(
                 sequence["anchor_condition"].new_zeros((1, adapter.delta_dim))
             )
             continue
 
-        previous_index, current_index = (0, 1) if age == 1 else (2, 3)
-        previous_condition = (
+        refresh_age = age - local_age
+        condition = (
             sequence["anchor_condition"][index : index + 1]
-            if age == 1
-            else sequence["teacher_conditions"][index : index + 1, 1]
+            if refresh_age == 0
+            else sequence["teacher_conditions"][index : index + 1, refresh_age - 1]
         )
-        pair = NativeV0ObservationPair(
-            previous_images=sequence["image_sequence"][
-                index : index + 1, previous_index
-            ],
-            current_images=sequence["image_sequence"][
-                index : index + 1, current_index
-            ],
-            previous_proprio=sequence["proprio_sequence"][
-                index : index + 1, previous_index
-            ],
-            current_proprio=sequence["proprio_sequence"][
-                index : index + 1, current_index
-            ],
-        )
-        exposed = condition_update_with_code(
-            adapter,
-            previous_condition,
-            pair,
-            valid_mask=sequence["valid_mask"][index : index + 1],
-            group_ids=sequence["group_ids"][index : index + 1],
-            age=1,
-        )
-        conditions.append(exposed.update.condition)
+        exposed: ConditionUpdateWithCode | None = None
+        for current_age in range(refresh_age + 1, age + 1):
+            pair = NativeV0ObservationPair(
+                previous_images=sequence["image_sequence"][
+                    index : index + 1, current_age - 1
+                ],
+                current_images=sequence["image_sequence"][
+                    index : index + 1, current_age
+                ],
+                previous_proprio=sequence["proprio_sequence"][
+                    index : index + 1, current_age - 1
+                ],
+                current_proprio=sequence["proprio_sequence"][
+                    index : index + 1, current_age
+                ],
+            )
+            exposed = condition_update_with_code(
+                adapter,
+                condition,
+                pair,
+                valid_mask=sequence["valid_mask"][index : index + 1],
+                group_ids=sequence["group_ids"][index : index + 1],
+                age=current_age - refresh_age,
+            )
+            condition = exposed.update.condition
+        if exposed is None:
+            raise RuntimeError("updated coupled query produced no Condition update")
+        conditions.append(condition)
         codes.append(exposed.condition_change_code)
 
     batch_indices = torch.arange(batch, device=query_ages.device)
@@ -123,6 +141,22 @@ def build_kc2_coupled_query(
         "teacher_action": sequence["teacher_actions"][batch_indices, target_indices],
         "query_age_in_window": query_ages,
     }
+
+
+def build_kc2_coupled_query(
+    adapter: NativeSimVLAV0,
+    sequence: dict[str, Any],
+    *,
+    query_ages: Tensor,
+) -> dict[str, Tensor]:
+    """Compatibility wrapper for the original K_C=2 coupling lane."""
+
+    return build_coupled_query(
+        adapter,
+        sequence,
+        query_ages=query_ages,
+        k_c=2,
+    )
 
 
 def prepare_projection_only_coupling(

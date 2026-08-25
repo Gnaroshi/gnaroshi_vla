@@ -22,7 +22,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.contracts impo
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
     COUPLED_CHECKPOINT_SCHEMA,
     audit_projection_only_state,
-    build_kc2_coupled_query,
+    build_coupled_query,
     prepare_projection_only_coupling,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_source_lock import (
@@ -65,9 +65,19 @@ from architectures.simvla.adapters.latentloop.native_v0_runtime import (
 from methods.latentloop.modules.simvla_generation_loop import SimVLAGenerationLoop
 
 
-def _query_ages(step: int, local_batch_size: int, device: torch.device) -> torch.Tensor:
+def _query_ages(
+    step: int,
+    local_batch_size: int,
+    device: torch.device,
+    *,
+    k_c: int,
+) -> torch.Tensor:
+    updated_ages = tuple(age for age in (1, 2, 3) if age % int(k_c) != 0)
     return torch.tensor(
-        [1 if (step * local_batch_size + offset) % 2 == 0 else 3 for offset in range(local_batch_size)],
+        [
+            updated_ages[(step * local_batch_size + offset) % len(updated_ages)]
+            for offset in range(local_batch_size)
+        ],
         device=device,
         dtype=torch.long,
     )
@@ -129,6 +139,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("exactly one physical GPU must match SIMVLA_GPU_IDS")
     if not 1 <= args.stop_step <= 10_000:
         raise ValueError("coupled screening budget must be in [1,10000]")
+    if args.k_c not in {2, 3}:
+        raise ValueError("coupled screening requires K_C in {2,3}")
     if args.n_g != 3:
         raise ValueError("the fixed coupled screening row is N_G=3")
 
@@ -231,12 +243,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     training_config = {
         "schema_version": COUPLED_CHECKPOINT_SCHEMA,
         "classification": "projection_only_10k_screening",
-        "k_c": 2,
+        "k_c": args.k_c,
         "n_g": 3,
         "full_step_indices": list(GENERATION_SCHEDULES[3]),
-        "condition_change_code": "NativeV0DeltaEncoder output used by the same K_C=2 condition update",
-        "training_query_ages": [1, 3],
-        "full_refresh_zero_code_age": 2,
+        "condition_change_code": (
+            "NativeV0DeltaEncoder output from the same recursive Condition update"
+        ),
+        "training_query_ages": [
+            age for age in (1, 2, 3) if age % args.k_c != 0
+        ],
+        "full_refresh_zero_code_ages": [
+            age for age in (1, 2, 3) if age % args.k_c == 0
+        ],
         "stop_step": args.stop_step,
         "global_unique_batch": args.local_batch_size,
         "peak_lr": args.peak_lr,
@@ -260,14 +278,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     for zero_step, host_sequence in enumerate(loader):
         sequence = move_batch(host_sequence, device)
-        ages = _query_ages(zero_step, args.local_batch_size, device)
+        ages = _query_ages(
+            zero_step,
+            args.local_batch_size,
+            device,
+            k_c=args.k_c,
+        )
         with torch.no_grad():
-            query = build_kc2_coupled_query(
-                condition_adapter, sequence, query_ages=ages
+            query = build_coupled_query(
+                condition_adapter,
+                sequence,
+                query_ages=ages,
+                k_c=args.k_c,
             )
         code_norm = query["condition_change_code"].float().norm(dim=-1)
         if not bool((code_norm > 0).all()):
-            raise RuntimeError("updated K_C=2 queries produced a zero condition code")
+            raise RuntimeError(
+                f"updated K_C={args.k_c} queries produced a zero condition code"
+            )
         normalized_proprio = action_adapter.normalize_proprio(query["proprio"])
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.bf16):
@@ -378,6 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--norm-stats", required=True)
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--smolvlm-model", default=DEFAULT_SMOLVLM)
+    parser.add_argument("--k-c", type=int, choices=(2, 3), default=2)
     parser.add_argument("--n-g", type=int, default=3)
     parser.add_argument("--stop-step", type=int, default=10_000)
     parser.add_argument("--local-batch-size", type=int, default=2)

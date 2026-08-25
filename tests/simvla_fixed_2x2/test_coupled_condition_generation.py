@@ -5,13 +5,17 @@ from torch import nn
 
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
     audit_projection_only_state,
+    build_coupled_query,
     build_kc2_coupled_query,
     prepare_projection_only_coupling,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_checkpoint import (
     GenerationLoopConfig,
 )
-from methods.latentloop.modules.native_simvla_v0 import NativeV0UpdateOutput
+from methods.latentloop.modules.native_simvla_v0 import (
+    NativeV0ObservationPair,
+    NativeV0UpdateOutput,
+)
 from methods.latentloop.modules.simvla_generation_loop import (
     SimVLAGenerationHiddenUpdater,
 )
@@ -87,6 +91,51 @@ def test_full_refresh_age_uses_zero_code_and_exact_teacher_condition() -> None:
     )
     assert torch.count_nonzero(query["condition_change_code"]) == 0
     assert torch.equal(query["condition"], sequence["teacher_conditions"][:, 1])
+
+
+def test_kc3_age2_recursively_updates_condition_and_exposes_latest_code() -> None:
+    adapter = _Adapter()
+    sequence = _sequence()
+    query = build_coupled_query(
+        adapter,
+        sequence,
+        query_ages=torch.tensor([2, 2]),
+        k_c=3,
+    )
+    first_pair_code = adapter.delta_encoder(
+        NativeV0ObservationPair(
+            previous_images=sequence["image_sequence"][:, 0],
+            current_images=sequence["image_sequence"][:, 1],
+            previous_proprio=sequence["proprio_sequence"][:, 0],
+            current_proprio=sequence["proprio_sequence"][:, 1],
+        )
+    )
+    second_pair_code = adapter.delta_encoder(
+        NativeV0ObservationPair(
+            previous_images=sequence["image_sequence"][:, 1],
+            current_images=sequence["image_sequence"][:, 2],
+            previous_proprio=sequence["proprio_sequence"][:, 1],
+            current_proprio=sequence["proprio_sequence"][:, 2],
+        )
+    )
+    expected = sequence["anchor_condition"]
+    expected = expected + first_pair_code[:, None, :]
+    expected = expected + second_pair_code[:, None, :]
+    assert torch.equal(query["condition"], expected)
+    assert torch.equal(query["condition_change_code"], second_pair_code)
+
+
+def test_kc3_age3_is_full_refresh_with_zero_code() -> None:
+    adapter = _Adapter()
+    sequence = _sequence()
+    query = build_coupled_query(
+        adapter,
+        sequence,
+        query_ages=torch.tensor([3, 3]),
+        k_c=3,
+    )
+    assert torch.count_nonzero(query["condition_change_code"]) == 0
+    assert torch.equal(query["condition"], sequence["teacher_conditions"][:, 2])
 
 
 def test_projection_only_setup_matches_synthetic_dimensions() -> None:

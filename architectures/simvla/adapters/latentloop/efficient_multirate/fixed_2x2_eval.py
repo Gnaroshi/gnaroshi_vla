@@ -23,7 +23,6 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.contracts impo
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
     COUPLED_CHECKPOINT_SCHEMA,
-    COUPLED_ROW,
     audit_projection_only_state,
     condition_update_with_code,
 )
@@ -280,13 +279,17 @@ class SynchronizedCombinedK_CN_GPolicy(SynchronizedConditionK_CPolicy):
         )
 
 
-class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_CN_GPolicy):
-    """K_C=2 and N_G=3 with the Condition updater's real 128-D c_j."""
+class SynchronizedCoupledK_CN_G3Policy(SynchronizedCombinedK_CN_GPolicy):
+    """K_C in {2,3} and N_G=3 with the Condition updater's real c_j."""
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.mode = COUPLED_ROW
-        self.row_name = COUPLED_ROW
+    def __init__(
+        self,
+        *,
+        k_c: int,
+        row_name: str,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(k_c=k_c, n_g=3, row_name=row_name, **kwargs)
         self._active_condition_change_code: torch.Tensor | None = None
         self.condition_change_code_norms: list[float] = []
 
@@ -317,8 +320,10 @@ class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_CN_GPolicy):
             raise RuntimeError("coupled update requires the preceding query state")
         if self.condition_layout is None:
             raise RuntimeError("coupled update requires the full-refresh token layout")
-        if age != 1:
-            raise ValueError("fixed K_C=2 coupling has exactly one update age")
+        if not 1 <= age < self.k_c:
+            raise ValueError(
+                f"K_C={self.k_c} coupling received invalid update age {age}"
+            )
         pair = NativeV0ObservationPair(
             previous_images=self.cached_raw_rgb,
             current_images=batch["raw_rgb"],
@@ -334,7 +339,7 @@ class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_CN_GPolicy):
                 pair,
                 valid_mask=self.condition_layout.valid_mask,
                 group_ids=self.condition_layout.group_ids,
-                age=1,
+                age=age,
             )
         self._sync()
         self.metrics.latencies.setdefault("condition_updater_ms", []).append(
@@ -715,14 +720,16 @@ def _make_policy(
             k_c=spec.k_c,
             row_name=row,
         )
-    if row == COUPLED_ROW:
+    if spec.coupled:
         if condition_updater is None:
             raise RuntimeError("coupled row requires the frozen Condition updater")
         if generation_updater is None:
             raise RuntimeError("coupled row requires the trained c_j projection")
-        return SynchronizedCoupledK_C2N_G3Policy(
+        return SynchronizedCoupledK_CN_G3Policy(
             **condition_common,
             generation_updater=generation_updater,
+            k_c=spec.k_c,
+            row_name=row,
         )
     raise ValueError(f"unsupported row: {row}")
 
@@ -930,7 +937,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         if int(generation_payload["optimizer_step"]) != 30_000:
             raise RuntimeError("Generation checkpoint is not optimizer step 30,000")
         freeze_module(generation_updater)
-    elif args.row == COUPLED_ROW:
+    elif row_contract.coupled:
         if not args.coupled_generation_checkpoint:
             raise ValueError("coupled row requires --coupled-generation-checkpoint")
         generation_updater, generation_payload = load_generation_checkpoint(
@@ -939,6 +946,10 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         training = generation_payload.get("training_config", {})
         if training.get("schema_version") != COUPLED_CHECKPOINT_SCHEMA:
             raise RuntimeError("coupled checkpoint schema changed")
+        if int(training.get("k_c", -1)) != row_contract.k_c:
+            raise RuntimeError("coupled checkpoint K_C does not match the evaluation row")
+        if int(training.get("n_g", -1)) != row_contract.n_g:
+            raise RuntimeError("coupled checkpoint N_G does not match the evaluation row")
         if int(generation_payload.get("optimizer_step", -1)) != 10_000:
             raise RuntimeError("coupled checkpoint is not optimizer step 10,000")
         coupled_checkpoint_report = verify_coupled_source_lock(
@@ -1206,7 +1217,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
             "condition": FROZEN_CONDITION_SOURCE_SHA256,
             "generation": (
                 generation_payload["source_lock"]["combined_sha256"]
-                if args.row == COUPLED_ROW and generation_payload is not None
+                if row_contract.coupled and generation_payload is not None
                 else (
                     FROZEN_GENERATION_SOURCE_SHA256
                     if row_contract.uses_generation
@@ -1217,7 +1228,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         "condition_checkpoint_sha256": FROZEN_CONDITION_CHECKPOINT_SHA256,
         "generation_checkpoint_sha256": (
             sha256_file(args.coupled_generation_checkpoint)
-            if args.row == COUPLED_ROW
+            if row_contract.coupled
             else (
                 FROZEN_GENERATION_CHECKPOINT_SHA256
                 if row_contract.uses_generation

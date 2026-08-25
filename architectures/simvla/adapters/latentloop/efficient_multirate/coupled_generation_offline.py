@@ -20,7 +20,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.contracts impo
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
     COUPLED_CHECKPOINT_SCHEMA,
     audit_projection_only_state,
-    build_kc2_coupled_query,
+    build_coupled_query,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_source_lock import (
     verify_coupled_source_lock,
@@ -133,6 +133,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if coupled_payload.get("training_config", {}).get("schema_version") != COUPLED_CHECKPOINT_SCHEMA:
         raise RuntimeError("checkpoint is not a real condition-code coupling checkpoint")
+    checkpoint_k_c = int(coupled_payload["training_config"].get("k_c", -1))
+    if checkpoint_k_c != args.k_c:
+        raise RuntimeError(
+            f"coupled checkpoint K_C mismatch: {checkpoint_k_c} != {args.k_c}"
+        )
+    if int(coupled_payload["training_config"].get("n_g", -1)) != 3:
+        raise RuntimeError("coupled checkpoint N_G is not 3")
     source_report = verify_coupled_source_lock(
         coupled_payload["source_lock"],
         parent_generation_checkpoint=args.parent_generation_checkpoint,
@@ -166,19 +173,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         heldout_fraction=args.heldout_fraction,
         split_seed=args.split_seed,
     )
-    total = min(int(args.queries), len(dataset) * 2)
+    updated_ages = tuple(age for age in (1, 2, 3) if age % args.k_c != 0)
+    total = min(int(args.queries), len(dataset) * len(updated_ages))
     rows: list[dict[str, Any]] = []
     zero_code_equal = True
     for flat_index in range(total):
-        sequence_index, odd_index = divmod(flat_index, 2)
-        age = 1 if odd_index == 0 else 3
+        sequence_index, age_index = divmod(flat_index, len(updated_ages))
+        age = updated_ages[age_index]
         sequence = move_batch(
             collate_exact_teacher_sequences([dataset[sequence_index]]), device
         )
-        query = build_kc2_coupled_query(
+        query = build_coupled_query(
             condition_adapter,
             sequence,
             query_ages=torch.tensor([age], device=device),
+            k_c=args.k_c,
         )
         normalized_proprio = action_adapter.normalize_proprio(query["proprio"])
         zero = torch.zeros_like(query["condition_change_code"])
@@ -296,8 +305,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "verdict": "COUPLED_OFFLINE_INTEGRITY_PASS" if all(checks.values()) else "COUPLED_OFFLINE_INTEGRITY_FAIL",
         "paper_result": False,
         "requires_online_validation": True,
+        "k_c": args.k_c,
         "queries": len(rows),
-        "updated_query_ages": [1, 3],
+        "updated_query_ages": list(updated_ages),
         "checks": checks,
         "condition_code_norm": _summary([float(row["condition_code_norm"]) for row in rows]),
         "condition_teacher_cosine": _summary([float(row["condition_teacher_cosine"]) for row in rows]),
@@ -327,6 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--norm-stats", required=True)
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--smolvlm-model", default=DEFAULT_SMOLVLM)
+    parser.add_argument("--k-c", type=int, choices=(2, 3), default=2)
     parser.add_argument("--queries", type=int, default=512)
     parser.add_argument("--heldout-fraction", type=float, default=0.2)
     parser.add_argument("--split-seed", type=int, default=20260822)

@@ -13,6 +13,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_con
     GENERATION_ROW,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
+    COUPLED_KC3_ROW,
     COUPLED_ROW,
 )
 
@@ -72,6 +73,9 @@ ROW_SPECS = {
         for k_c, nfe in NAIVE_CONFIGS
     },
     COUPLED_ROW: EfficiencyRowSpec(COUPLED_ROW, 2, 3, True, True, True),
+    COUPLED_KC3_ROW: EfficiencyRowSpec(
+        COUPLED_KC3_ROW, 3, 3, True, True, True
+    ),
 }
 
 if condition_row_name(2, 10) != CONDITION_ROW:

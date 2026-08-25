@@ -25,6 +25,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval
     _validate_fixed_2x2_counters,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
+    COUPLED_KC3_ROW,
     COUPLED_ROW,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_aggregate import (
@@ -106,6 +107,20 @@ def test_kc3_kc4_counter_contracts() -> None:
                 )
                 assert gate["verdict"] == "KC_FRONTIER_COUNTER_PASS"
                 assert counts["integration_updates"] == 10 * queries
+
+
+def test_kc3_coupled_counter_contract() -> None:
+    for queries in (1, 2, 3, 4, 5, 8):
+        counts = expected_call_counts(COUPLED_KC3_ROW, queries)
+        gate = _validate_fixed_2x2_counters(
+            COUPLED_KC3_ROW,
+            policy_queries=queries,
+            full_vlm_calls=counts["full_vlm_calls"],
+            condition_updater_calls=counts["condition_updater_calls"],
+            full_action_transformer_calls=counts["full_action_transformer_calls"],
+            generation_loop_updates=counts["generation_loop_updates"],
+        )
+        assert gate["verdict"] == "KC_FRONTIER_COUNTER_PASS"
 
 
 def test_joint_learned_and_naive_nfe_counter_contracts() -> None:

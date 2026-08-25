@@ -22,9 +22,6 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_cont
     CONDITION_ROW,
     FROZEN_CONDITION_SOURCE_SHA256,
 )
-from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
-    COUPLED_ROW,
-)
 from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
     EVAL_ROWS,
     expected_call_counts,
@@ -356,15 +353,34 @@ def compare_coupling(args: argparse.Namespace) -> dict[str, Any]:
     output = Path(args.output).expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"refusing existing output: {output}")
-    roots = {
-        COMBINED_ROW: Path(args.uncoupled).expanduser().resolve(),
-        COUPLED_ROW: Path(args.coupled).expanduser().resolve(),
-    }
+    uncoupled_root = Path(args.uncoupled).expanduser().resolve()
+    coupled_root = Path(args.coupled).expanduser().resolve()
+    uncoupled_summary = load_json(uncoupled_root / "row_summary.json")
+    coupled_summary = load_json(coupled_root / "row_summary.json")
+    uncoupled_name = str(uncoupled_summary.get("row", ""))
+    coupled_name = str(coupled_summary.get("row", ""))
+    uncoupled_spec = row_spec(uncoupled_name)
+    coupled_spec = row_spec(coupled_name)
+    if (
+        uncoupled_spec.coupled
+        or not uncoupled_spec.uses_condition
+        or not uncoupled_spec.uses_generation
+    ):
+        raise RuntimeError("reference row is not an uncoupled combined policy")
+    if not coupled_spec.coupled:
+        raise RuntimeError("candidate row is not a coupled policy")
+    if (uncoupled_spec.k_c, uncoupled_spec.n_g) != (
+        coupled_spec.k_c,
+        coupled_spec.n_g,
+    ):
+        raise RuntimeError("uncoupled and coupled rows use different K_C/N_G")
+    roots = {uncoupled_name: uncoupled_root, coupled_name: coupled_root}
     summaries = {name: load_json(root / "row_summary.json") for name, root in roots.items()}
+    accepted_verdicts = {"FIXED_2X2_ROW_PASS", "KC_FRONTIER_ROW_PASS"}
     for name, summary in summaries.items():
-        if summary.get("verdict") != "FIXED_2X2_ROW_PASS" or summary.get("row") != name:
+        if summary.get("verdict") not in accepted_verdicts or summary.get("row") != name:
             raise RuntimeError(f"coupling comparison row gate mismatch: {name}")
-    if summaries[COMBINED_ROW].get("manifest_sha256") != summaries[COUPLED_ROW].get(
+    if summaries[uncoupled_name].get("manifest_sha256") != summaries[coupled_name].get(
         "manifest_sha256"
     ):
         raise RuntimeError("uncoupled and coupled rows use different manifests")
@@ -372,19 +388,21 @@ def compare_coupling(args: argparse.Namespace) -> dict[str, Any]:
     for name, table in rows.items():
         _validate_episode_table(name, table)
     by_key = {name: {_key(row): row for row in table} for name, table in rows.items()}
-    uncoupled = _summarize(COMBINED_ROW, rows[COMBINED_ROW])
-    coupled = _summarize(COUPLED_ROW, rows[COUPLED_ROW])
+    uncoupled = _summarize(uncoupled_name, rows[uncoupled_name])
+    coupled = _summarize(coupled_name, rows[coupled_name])
     result = {
         "verdict": "COUPLED_VS_UNCOUPLED_COMPARISON_COMPLETE",
         "paper_table_eligible": False,
         "classification": "fixed-seed paired mechanism screening",
-        "manifest_sha256": summaries[COMBINED_ROW]["manifest_sha256"],
-        "rows": {COMBINED_ROW: uncoupled, COUPLED_ROW: coupled},
+        "manifest_sha256": summaries[uncoupled_name]["manifest_sha256"],
+        "k_c": coupled_spec.k_c,
+        "n_g": coupled_spec.n_g,
+        "rows": {uncoupled_name: uncoupled, coupled_name: coupled},
         "success_rate_delta_percentage_points": 100.0
         * (coupled["success_rate"] - uncoupled["success_rate"]),
         "latency_per_policy_query_delta_ms": coupled["latency_per_policy_query_ms"]
         - uncoupled["latency_per_policy_query_ms"],
-        "paired_outcomes": _paired(by_key[COMBINED_ROW], by_key[COUPLED_ROW]),
+        "paired_outcomes": _paired(by_key[uncoupled_name], by_key[coupled_name]),
         "same_compute_schedule": {
             "full_vlm_calls": uncoupled["full_vlm_calls"] == coupled["full_vlm_calls"],
             "condition_updater_calls": uncoupled["condition_updater_calls"]
@@ -400,18 +418,18 @@ def compare_coupling(args: argparse.Namespace) -> dict[str, Any]:
     output.mkdir(parents=True)
     atomic_write_json(output / "coupled_vs_uncoupled_summary.json", result)
     comparison_rows = []
-    for key in sorted(by_key[COMBINED_ROW]):
+    for key in sorted(by_key[uncoupled_name]):
         comparison_rows.append(
             {
                 "task_id": key[0],
                 "trial_id": key[1],
-                "uncoupled_success": _int(by_key[COMBINED_ROW][key], "success"),
-                "coupled_success": _int(by_key[COUPLED_ROW][key], "success"),
+                "uncoupled_success": _int(by_key[uncoupled_name][key], "success"),
+                "coupled_success": _int(by_key[coupled_name][key], "success"),
                 "uncoupled_episode_length": _int(
-                    by_key[COMBINED_ROW][key], "episode_length"
+                    by_key[uncoupled_name][key], "episode_length"
                 ),
                 "coupled_episode_length": _int(
-                    by_key[COUPLED_ROW][key], "episode_length"
+                    by_key[coupled_name][key], "episode_length"
                 ),
             }
         )

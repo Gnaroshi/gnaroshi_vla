@@ -34,6 +34,7 @@ SOURCE_FILES = (
     "architectures/simvla/adapters/latentloop/efficient_multirate/joint_nfe_aggregate.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/row_postprocess_recovery.py",
     "architectures/simvla/wrappers/run_coupled_condition_generation.sh",
+    "architectures/simvla/wrappers/run_coupled_kc3_condition_generation.sh",
     "architectures/simvla/wrappers/run_fixed_2x2_single_gpu_row.sh",
     "architectures/simvla/wrappers/run_kc_efficiency_frontier_sd1.sh",
     "architectures/simvla/wrappers/run_joint_nfe_frontier_sd1.sh",
