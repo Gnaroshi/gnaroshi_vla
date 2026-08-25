@@ -106,7 +106,7 @@ def _ensure_generation_latency_schema() -> None:
         rollout_runner_runtime.LATENCY_FIELDS.append("generation_loop_ms")
 
 
-class SynchronizedConditionK_C2Policy(RealSimVLANativeV0Policy):
+class SynchronizedConditionK_CPolicy(RealSimVLANativeV0Policy):
     """Use learned recursive condition updates between full VLM refreshes."""
 
     def __init__(
@@ -192,7 +192,7 @@ class SynchronizedConditionK_C2Policy(RealSimVLANativeV0Policy):
         }
 
 
-class SynchronizedCombinedK_C2N_G3Policy(SynchronizedConditionK_C2Policy):
+class SynchronizedCombinedK_CN_G3Policy(SynchronizedConditionK_CPolicy):
     """Uncoupled K_C condition loop and N_G=3 generation loop."""
 
     def __init__(
@@ -230,7 +230,7 @@ class SynchronizedCombinedK_C2N_G3Policy(SynchronizedConditionK_C2Policy):
         )
 
 
-class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_C2N_G3Policy):
+class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_CN_G3Policy):
     """K_C=2 and N_G=3 with the Condition updater's real 128-D c_j."""
 
     def __init__(self, **kwargs: Any) -> None:
@@ -370,6 +370,11 @@ class SynchronizedCoupledK_C2N_G3Policy(SynchronizedCombinedK_C2N_G3Policy):
         self.metrics.counters["num_action_transformer_decodes"] += 1
         self.metrics.counters["num_generation_decoder_only_steps"] += 10 - self.n_g
         return action, seed
+
+
+# Preserve the fixed-2x2 public imports while making the generic implementation explicit.
+SynchronizedConditionK_C2Policy = SynchronizedConditionK_CPolicy
+SynchronizedCombinedK_C2N_G3Policy = SynchronizedCombinedK_CN_G3Policy
 
 
 def _git(root: Path, *args: str) -> str:
@@ -617,7 +622,7 @@ def _make_policy(
     if spec.uses_condition and not spec.uses_generation:
         if condition_updater is None:
             raise RuntimeError("condition row requires the frozen Condition updater")
-        return SynchronizedConditionK_C2Policy(
+        return SynchronizedConditionK_CPolicy(
             **condition_common,
             k_c=spec.k_c,
             row_name=row,
@@ -643,7 +648,7 @@ def _make_policy(
             raise RuntimeError("combined row requires the frozen Condition updater")
         if generation_updater is None:
             raise RuntimeError("combined row requires the frozen Generation updater")
-        return SynchronizedCombinedK_C2N_G3Policy(
+        return SynchronizedCombinedK_CN_G3Policy(
             **condition_common,
             generation_updater=generation_updater,
             k_c=spec.k_c,
