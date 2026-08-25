@@ -100,7 +100,8 @@ preflight() {
 }
 
 run_one() {
-  local name=$1 max_sequences=$2 port=$3 output=$OUTPUT_ROOT/$name rc
+  local name=$1 max_sequences=$2 port=$3 rc
+  local output=$OUTPUT_ROOT/$name
   CURRENT_OUTPUT=$output
   if [[ -f "$output/condition_drift_p1_summary.json" ]]; then
     echo "ALREADY_COMPLETE output=$output"
