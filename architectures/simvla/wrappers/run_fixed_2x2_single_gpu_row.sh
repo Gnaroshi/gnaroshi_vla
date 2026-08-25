@@ -24,6 +24,7 @@ GPU=
 CLASSIFICATION=RB2_CONFIRMATORY_EGL
 INFERENCE_SEED=seed02
 TASK_IDS=0,1,2,3,4,5,6,7,8,9
+SAVE_FAILURE_VIDEOS=0
 
 while (($#)); do
   case "$1" in
@@ -40,6 +41,7 @@ while (($#)); do
     --classification) CLASSIFICATION=$2; shift 2 ;;
     --inference-seed) INFERENCE_SEED=$2; shift 2 ;;
     --task-ids) TASK_IDS=$2; shift 2 ;;
+    --save-failure-videos) SAVE_FAILURE_VIDEOS=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -103,6 +105,10 @@ control_args=()
 if [[ -n "$CONTROL_MANIFEST" ]]; then
   control_args=(--control-manifest "$CONTROL_MANIFEST")
 fi
+video_args=()
+if ((SAVE_FAILURE_VIDEOS == 1)); then
+  video_args=(--save-video --video-failures-only --video-stride 2 --video-max-per-task 2)
+fi
 CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" \
   -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval \
   --row "$ROW" \
@@ -119,6 +125,7 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" \
   --task-ids "$TASK_IDS" \
   --classification "$CLASSIFICATION" \
   --inference-seed "$INFERENCE_SEED" \
+  "${video_args[@]}" \
   2>&1 | tee "$OUTPUT/logs/evaluate.log"
 eval_rc=${PIPESTATUS[0]}
 ((eval_rc == 0)) || exit "$eval_rc"

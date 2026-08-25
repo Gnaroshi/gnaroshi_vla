@@ -67,7 +67,8 @@ run_row() {
     --physical-gpu-id "$gpu" \
     --classification HOST_LOCAL_EGL_DIAGNOSTIC \
     --inference-seed seed02 \
-    --task-ids 0,1,2,3,4,5,6,7,8,9
+    --task-ids 0,1,2,3,4,5,6,7,8,9 \
+    --save-failure-videos
 }
 
 run_all() {
