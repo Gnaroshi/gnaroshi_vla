@@ -55,7 +55,10 @@ wait_for_gpus() {
 }
 
 recover_row_if_complete() {
-  local row=$1 row_root=$2 shard=$row_root/shard_rank0_tasks_0_9 count=0
+  local row=$1
+  local row_root=$2
+  local shard=$row_root/shard_rank0_tasks_0_9
+  local count=0
   [[ ! -f "$row_root/merged/row_summary.json" ]] || return 0
   if [[ -f "$shard/episode_metrics.csv" ]]; then
     count=$(($(wc -l < "$shard/episode_metrics.csv") - 1))
