@@ -1,0 +1,68 @@
+{
+  "schema_version": "simvla_completed_frontier_evidence_v1",
+  "classification": "HOST_LOCAL_EGL_DIAGNOSTIC",
+  "source_host": "sd1",
+  "source_result_root": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/joint_nfe_frontier/kc2_kc3_seed02_v1",
+  "manifest_sha256": "9e652bf2027652717b409bb25b4c9bcf8fcfbd3791560b2c81137c0c3daaca48",
+  "inference_seed": "seed02",
+  "episodes_per_row": 500,
+  "rows": {
+    "condition_kc2_naive_nfe2": {
+      "successes": 472,
+      "success_rate": 0.944,
+      "status_file": "condition_kc2_naive_nfe2.status",
+      "status_sha256": "bde294368bfed77c2cddf8cec271d398aee9cdbab3b26e1059281bd33adb0120",
+      "summary_file": "condition_kc2_naive_nfe2_row_summary.json",
+      "summary_sha256": "ff27e90437bafb347ee896a92888aa0fb051e325332366f9cd390f9567d8ed4d"
+    },
+    "condition_kc2_naive_nfe3": {
+      "successes": 473,
+      "success_rate": 0.946,
+      "status_file": "condition_kc2_naive_nfe3.status",
+      "status_sha256": "bde294368bfed77c2cddf8cec271d398aee9cdbab3b26e1059281bd33adb0120",
+      "summary_file": "condition_kc2_naive_nfe3_row_summary.json",
+      "summary_sha256": "70c18beaa82c6ff707be281518606303b9ca1169980bfe978d8b51a0821bde94"
+    },
+    "condition_kc2_ng2": {
+      "successes": 477,
+      "success_rate": 0.954,
+      "status_file": "condition_kc2_ng2.status",
+      "status_sha256": "bde294368bfed77c2cddf8cec271d398aee9cdbab3b26e1059281bd33adb0120",
+      "summary_file": "condition_kc2_ng2_row_summary.json",
+      "summary_sha256": "ef699e77f728a62304cf0e42e38f400e2f6a972b2fa7c607f141b50f6a4ef4cf"
+    },
+    "condition_kc3_naive_nfe3": {
+      "successes": 453,
+      "success_rate": 0.906,
+      "status_file": "condition_kc3_naive_nfe3.status",
+      "status_sha256": "bde294368bfed77c2cddf8cec271d398aee9cdbab3b26e1059281bd33adb0120",
+      "summary_file": "condition_kc3_naive_nfe3_row_summary.json",
+      "summary_sha256": "922932fd7aac93224ec012c79bfd9133a5a1641cff7804250a7eafffc5ba026d"
+    }
+  },
+  "aggregate_file": "joint_nfe_frontier_summary.json",
+  "aggregate_sha256": "715f93a2994e0dcfb976bb6c251b9b16d38ab0bf6fd84ca5130209f420da6858",
+  "paired_outcomes_file": "paired_episode_outcomes.csv",
+  "paired_outcomes_sha256": "a8a6f1a133f9ad0b4f7b06e9b91f5833f27548a26cef4e1f50255e57ac7ea4a7",
+  "launcher_status_file": "launcher_original.status",
+  "launcher_status_sha256": "9dad7ec229042ed92df7f5fd6132fc016917c0f194fd3b55f79e15289e7f6074",
+  "launcher_exit_interpretation": "exit_code=1 only from final Bash nounset aggregation bug; individual rows are complete",
+  "learned_vs_naive": {
+    "kc2_budget3": {
+      "learned_gain_percentage_points": 2.2,
+      "learned_only": 20,
+      "naive_only": 9,
+      "exact_mcnemar_p": 0.06142834573984146
+    },
+    "kc3_budget3": {
+      "learned_gain_percentage_points": 2.8,
+      "learned_only": 27,
+      "naive_only": 13,
+      "exact_mcnemar_p": 0.03847730828420026
+    },
+    "kc2_budget2": {
+      "learned_gain_percentage_points": 1.0
+    }
+  },
+  "rerun_allowed": false
+}
