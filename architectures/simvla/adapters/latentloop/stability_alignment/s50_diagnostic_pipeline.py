@@ -31,6 +31,12 @@ STORAGE = Path("/home/mingyujung/private/gnaroshi_vla_storage").resolve()
 BUNDLE = STORAGE / "artifacts/simvla/stability_alignment/s50_10k_diagnostic"
 RESULT_ROOT = STORAGE / "results/simvla/stability_alignment/s50_10k_diagnostic_rb2"
 EVALUATOR = "architectures.simvla.adapters.latentloop.stability_alignment.online_eval"
+SOURCE_FILES = {
+    "online_eval.py": WORKTREE
+    / "architectures/simvla/adapters/latentloop/stability_alignment/online_eval.py",
+    "s50_diagnostic_pipeline.py": WORKTREE
+    / "architectures/simvla/adapters/latentloop/stability_alignment/s50_diagnostic_pipeline.py",
+}
 ROWS = tuple(
     (k_c, mode)
     for k_c in (3, 4)
@@ -149,6 +155,9 @@ def _aggregate(ready: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, A
         "offline_gate_passed": False,
         "offline_gate_verdict": "STABILITY_10K_GATE_FAIL",
         "checkpoint_sha256": ready["checkpoint_sha256"],
+        "evaluation_source_sha256": {
+            name: sha256_file(path) for name, path in SOURCE_FILES.items()
+        },
         "manifest_sha256": MANIFEST_SHA256,
         "baseline": {
             "successes": int(baseline["successes"]),
@@ -176,6 +185,9 @@ def run() -> dict[str, Any]:
                 "classification": "DIAGNOSTIC_ONLY",
                 "rows": [f"kc{k_c}_{mode}" for k_c, mode in ROWS],
                 "checkpoint_sha256": ready["checkpoint_sha256"],
+                "evaluation_source_sha256": {
+                    name: sha256_file(path) for name, path in SOURCE_FILES.items()
+                },
                 "manifest_sha256": MANIFEST_SHA256,
                 "renderer": "egl",
                 "inference_seed": "seed02",
