@@ -89,6 +89,7 @@ SOURCE_FILES = (
     "architectures/simvla/adapters/latentloop/action_equivalent_refresh/policy.py",
     "architectures/simvla/adapters/latentloop/action_equivalent_refresh/online_evaluator.py",
     "architectures/simvla/adapters/latentloop/action_equivalent_refresh/online_aggregate.py",
+    "architectures/simvla/adapters/latentloop/action_equivalent_refresh/three_seed_aggregate.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/generation_checkpoint.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/generation_hidden.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/generation_policy.py",
@@ -97,7 +98,13 @@ SOURCE_FILES = (
     "architectures/simvla/adapters/latentloop/native_v0_policy.py",
     "architectures/simvla/wrappers/dcld_eval/rollout_runner.py",
     "architectures/simvla/wrappers/run_action_equivalent_refresh_online_sd1.sh",
+    "architectures/simvla/wrappers/run_action_equivalent_refresh_three_seed_rb2.sh",
 )
+
+PRODUCTION_GPU_IDS = {
+    "SD1_HOST_LOCAL_EGL_LONG500": {4, 5, 6, 7},
+    "RB2_HOST_LOCAL_EGL_LONG500": {0},
+}
 
 
 def _git(root: Path, *args: str) -> str:
@@ -239,10 +246,10 @@ def _verify_offline_gate(root: Path, risk_checkpoint: Path) -> dict[str, Any]:
         "manual_candidate_supported": bool(
             comparison.get("comparison", {}).get("online_candidate")
         ),
-        "risk_checkpoint_identity": Path(
+        "risk_checkpoint_filename": Path(
             str(comparison.get("checkpoint", ""))
-        ).resolve()
-        == risk_checkpoint.resolve(),
+        ).name
+        == risk_checkpoint.name,
     }
     if not all(checks.values()):
         raise RuntimeError(f"offline selector gate failed: {checks}")
@@ -514,8 +521,15 @@ def _finalize_shard(
 
 def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
     physical_gpu_id = int(args.physical_gpu_id)
-    if physical_gpu_id not in {4, 5, 6, 7}:
-        raise RuntimeError("sd1 online evaluation is restricted to GPUs 4,5,6,7")
+    allowed_gpu_ids = PRODUCTION_GPU_IDS.get(
+        args.classification,
+        set(range(8)) if args.classification == "SMOKE_EGL" else set(),
+    )
+    if physical_gpu_id not in allowed_gpu_ids:
+        raise RuntimeError(
+            f"physical GPU {physical_gpu_id} is invalid for {args.classification}; "
+            f"allowed={sorted(allowed_gpu_ids)}"
+        )
     if os.environ.get("CUDA_VISIBLE_DEVICES") != str(physical_gpu_id):
         raise RuntimeError("CUDA_VISIBLE_DEVICES must expose exactly the physical GPU")
     if os.environ.get("MUJOCO_EGL_DEVICE_ID") != str(physical_gpu_id):
@@ -917,7 +931,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-ids", required=True)
     parser.add_argument(
         "--classification",
-        choices=("SD1_HOST_LOCAL_EGL_LONG500", "SMOKE_EGL"),
+        choices=(
+            "SD1_HOST_LOCAL_EGL_LONG500",
+            "RB2_HOST_LOCAL_EGL_LONG500",
+            "SMOKE_EGL",
+        ),
         required=True,
     )
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)

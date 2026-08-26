@@ -141,7 +141,13 @@ def _load_control(
         raise RuntimeError(f"unexpected control row {row_name} under {root}")
     if summary.get("manifest_sha256") != expected_manifest_sha256:
         raise RuntimeError(f"control manifest mismatch under {root}")
-    rows = _read_csv(root / "episode_metrics.csv")
+    direct = root / "episode_metrics.csv"
+    csv_paths = [direct] if direct.is_file() else sorted(
+        root.glob("shard_rank*_tasks_*/episode_metrics.csv")
+    )
+    if not csv_paths:
+        raise RuntimeError(f"control episode table is missing under {root}")
+    rows = [row for path in csv_paths for row in _read_csv(path)]
     keys = [_episode_key(row) for row in rows]
     if len(rows) != 500 or len(set(keys)) != 500 or set(keys) != expected_keys:
         raise RuntimeError(f"control is not the identical Long-500 axis: {root}")
@@ -333,7 +339,7 @@ def aggregate(args: argparse.Namespace) -> dict[str, Any]:
 
     comparison = {
         "verdict": FINAL_VERDICT,
-        "classification": "SD1_HOST_LOCAL_EGL_LONG500",
+        "classification": args.classification,
         "manifest_sha256": manifest["manifest_sha256"],
         "source_combined_sha256": next(iter(source_hashes)),
         "candidate": candidate_summary,
@@ -369,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--expected-manifest-sha256", required=True)
+    parser.add_argument(
+        "--classification",
+        choices=("SD1_HOST_LOCAL_EGL_LONG500", "RB2_HOST_LOCAL_EGL_LONG500"),
+        default="SD1_HOST_LOCAL_EGL_LONG500",
+    )
     parser.add_argument("--shards", nargs="+", required=True)
     parser.add_argument("--full-control", required=True)
     parser.add_argument("--generation-control", required=True)
