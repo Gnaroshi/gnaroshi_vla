@@ -94,11 +94,38 @@ def _summarize(row_name: str, rows: Sequence[Mapping[str, Any]]) -> dict[str, An
     full_vlm = sum(_int(row, "num_full_vlm_calls") for row in rows)
     condition = sum(_int(row, "num_condition_updater_calls") for row in rows)
     full_action = sum(
-        _int(row, "num_full_action_transformer_evaluations") for row in rows
+        _int(
+            row,
+            (
+                "num_full_action_transformer_evaluations"
+                if row.get("num_full_action_transformer_evaluations") not in {None, ""}
+                else "num_action_transformer_flow_iterations"
+            ),
+        )
+        for row in rows
     )
-    generation = sum(_int(row, "num_generation_loop_updates") for row in rows)
+    generation = sum(
+        _int(
+            row,
+            (
+                "num_generation_loop_updates"
+                if row.get("num_generation_loop_updates") not in {None, ""}
+                else "num_generation_decoder_only_steps"
+            ),
+        )
+        for row in rows
+    )
     actions = sum(_int(row, "episode_length") for row in rows)
-    policy_seconds = sum(_float(row, "policy_wall_time_seconds") for row in rows)
+    policy_seconds = sum(
+        (
+            _float(row, "policy_wall_time_seconds")
+            if row.get("policy_wall_time_seconds") not in {None, ""}
+            else _float(row, "latency_per_executed_action_ms")
+            * _int(row, "episode_length")
+            / 1000.0
+        )
+        for row in rows
+    )
     success = sum(_int(row, "success") for row in rows)
     return {
         "row": row_name,

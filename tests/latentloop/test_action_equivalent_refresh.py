@@ -28,6 +28,7 @@ from architectures.simvla.adapters.latentloop.action_equivalent_refresh.policy i
 )
 from architectures.simvla.adapters.latentloop.action_equivalent_refresh.online_aggregate import (
     _paired_comparison,
+    _summarize,
 )
 from architectures.simvla.adapters.latentloop.action_equivalent_refresh.online_evaluator import (
     _episode_identity,
@@ -487,3 +488,33 @@ def test_paired_online_comparison_counts_discordant_episodes() -> None:
     assert result["control_only_success"] == 1
     assert result["both_failure"] == 1
     assert result["mcnemar_exact_two_sided_p"] == pytest.approx(1.0)
+
+
+def test_online_control_summary_accepts_legacy_generation_schema() -> None:
+    rows = [
+        {
+            "success": 1,
+            "episode_length": 10,
+            "num_policy_queries": 2,
+            "num_full_vlm_calls": 2,
+            "num_action_transformer_flow_iterations": 6,
+            "num_generation_decoder_only_steps": 14,
+            "latency_per_executed_action_ms": 12.5,
+        },
+        {
+            "success": 0,
+            "episode_length": 20,
+            "num_policy_queries": 4,
+            "num_full_vlm_calls": 4,
+            "num_action_transformer_flow_iterations": 12,
+            "num_generation_decoder_only_steps": 28,
+            "latency_per_executed_action_ms": 15.0,
+        },
+    ]
+    result = _summarize("generation_ng3", rows)
+    assert result["episodes"] == 2
+    assert result["total_full_action_transformer_evaluations"] == 18
+    assert result["total_generation_loop_updates"] == 42
+    assert result["latency_per_executed_action_ms"] == pytest.approx(
+        (10 * 12.5 + 20 * 15.0) / 30
+    )
