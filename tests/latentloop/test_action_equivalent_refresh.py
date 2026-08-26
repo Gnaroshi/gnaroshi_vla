@@ -26,6 +26,14 @@ from architectures.simvla.adapters.latentloop.action_equivalent_refresh.extracti
 from architectures.simvla.adapters.latentloop.action_equivalent_refresh.policy import (
     ActionEquivalentRefreshSimVLAPolicy,
 )
+from architectures.simvla.adapters.latentloop.action_equivalent_refresh.online_aggregate import (
+    _paired_comparison,
+)
+from architectures.simvla.adapters.latentloop.action_equivalent_refresh.online_evaluator import (
+    _episode_identity,
+    _parse_task_ids,
+    _validate_selective_counters,
+)
 from architectures.simvla.adapters.latentloop.action_equivalent_refresh.training import (
     save_compact_action_fidelity_dataset,
     train_compact_action_fidelity_head,
@@ -426,3 +434,56 @@ def test_policy_source_locks_h10_r5_ng3_and_routes_before_decode() -> None:
     assert candidate_line < route_line < decode_line
     assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)]
     assert assignments
+
+
+def test_online_counter_gate_requires_one_decode_and_ng3_per_query() -> None:
+    counters = {
+        "num_policy_queries": 6,
+        "num_full_vlm_calls": 2,
+        "num_candidate_condition_updates": 5,
+        "num_condition_updater_calls": 5,
+        "num_risk_head_calls": 5,
+        "num_accepted_condition_updates": 4,
+        "num_rejected_condition_updates": 1,
+        "num_forced_age_refreshes": 0,
+        "num_risk_triggered_refreshes": 1,
+        "num_action_transformer_decodes": 6,
+        "num_action_transformer_calls": 18,
+        "num_generation_decoder_only_steps": 42,
+    }
+    passed = _validate_selective_counters(counters, decision_count=6)
+    assert passed["verdict"] == "ACTION_EQUIVALENT_REFRESH_COUNTER_PASS"
+    broken = dict(counters, num_action_transformer_decodes=7)
+    failed = _validate_selective_counters(broken, decision_count=6)
+    assert failed["verdict"] == "ACTION_EQUIVALENT_REFRESH_COUNTER_FAIL"
+    assert failed["checks"]["one_action_decode_per_query"] is False
+
+
+def test_online_task_and_episode_identity_parsing_is_fail_closed() -> None:
+    assert _parse_task_ids("0,1,4") == (0, 1, 4)
+    assert _episode_identity(4, 9) == "task_04_trial_009"
+    with pytest.raises(ValueError, match="unique"):
+        _parse_task_ids("0,0")
+    with pytest.raises(ValueError, match=r"\[0,9\]"):
+        _parse_task_ids("10")
+
+
+def test_paired_online_comparison_counts_discordant_episodes() -> None:
+    candidate = {
+        (0, 0): {"success": 1},
+        (0, 1): {"success": 1},
+        (0, 2): {"success": 0},
+        (0, 3): {"success": 0},
+    }
+    control = {
+        (0, 0): {"success": 1},
+        (0, 1): {"success": 0},
+        (0, 2): {"success": 1},
+        (0, 3): {"success": 0},
+    }
+    result = _paired_comparison(candidate, control)
+    assert result["both_success"] == 1
+    assert result["candidate_only_success"] == 1
+    assert result["control_only_success"] == 1
+    assert result["both_failure"] == 1
+    assert result["mcnemar_exact_two_sided_p"] == pytest.approx(1.0)

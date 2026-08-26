@@ -15,7 +15,12 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[4]
-UPSTREAM = ROOT / "architectures" / "simvla" / "upstream"
+UPSTREAM = Path(
+    os.environ.get(
+        "SIMVLA_UPSTREAM_ROOT",
+        ROOT / "architectures" / "simvla" / "upstream",
+    )
+).expanduser().resolve()
 
 
 def _command(args: list[str], cwd: Path) -> str:
