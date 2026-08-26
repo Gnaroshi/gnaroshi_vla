@@ -20,6 +20,7 @@ from architectures.simvla.adapters.latentloop.action_equivalent_refresh.features
     runtime_feature_contract,
 )
 from architectures.simvla.adapters.latentloop.action_equivalent_refresh.extraction import (
+    extract_all_anchor_fidelity_records,
     extract_compact_fidelity_records,
 )
 from architectures.simvla.adapters.latentloop.action_equivalent_refresh.policy import (
@@ -38,6 +39,7 @@ from methods.latentloop.modules.action_equivalent_refresh import (
     action_fidelity_loss,
     counterfactual_action_targets,
     fit_exact_call_budget_calibration,
+    fit_sequential_exact_call_budget_calibration,
     simulate_exact_fraction,
 )
 from methods.latentloop.modules.native_simvla_v0 import (
@@ -188,6 +190,34 @@ def test_budget_calibration_is_deterministic_and_includes_forced_refreshes() -> 
     assert len(decisions) == len(starts)
 
 
+def test_sequential_calibration_uses_row_after_latest_exact_anchor() -> None:
+    routing = [
+        {"sequence_id": "s0", "anchor_offset": 0, "query_offset": 1},
+        {"sequence_id": "s0", "anchor_offset": 0, "query_offset": 2},
+        {"sequence_id": "s0", "anchor_offset": 0, "query_offset": 3},
+        {"sequence_id": "s0", "anchor_offset": 1, "query_offset": 2},
+        {"sequence_id": "s0", "anchor_offset": 1, "query_offset": 3},
+        {"sequence_id": "s0", "anchor_offset": 2, "query_offset": 3},
+    ]
+    arm = [0.9, 0.1, 0.1, 0.8, 0.1, 0.7]
+    gripper = [0.1] * len(arm)
+    left = fit_sequential_exact_call_budget_calibration(
+        arm,
+        gripper,
+        routing,
+        target_exact_fraction=0.5,
+    )
+    right = fit_sequential_exact_call_budget_calibration(
+        arm,
+        gripper,
+        routing,
+        target_exact_fraction=0.5,
+    )
+    assert left == right
+    assert left.observed_exact_fraction == pytest.approx(0.5)
+    assert left.calibration_queries == 7
+
+
 def test_router_forces_episode_start_and_max_age_without_changing_cadence() -> None:
     router = ActionEquivalentRefreshRouter(_calibration(threshold=1.1))
     assert router.candidate_required() is False
@@ -326,6 +356,57 @@ def test_compact_extraction_preserves_sequence_order_and_same_noise() -> None:
     assert len(calls) == 6
     for age in range(3):
         assert torch.equal(calls[2 * age], calls[2 * age + 1])
+
+
+def test_all_anchor_extraction_materializes_reachable_triangular_rows() -> None:
+    torch.manual_seed(23)
+    config = SimVLAActionFidelityFeatureConfig(delta_dim=8)
+    adapter = NativeSimVLAV0(
+        condition_dim=16,
+        delta_dim=8,
+        rank_dim=64,
+        max_tokens=8,
+    ).eval()
+    batch, tokens = 1, 5
+    noises = torch.randn(batch, 4, 10, 7)
+    calls: list[torch.Tensor] = []
+
+    def decode(condition: torch.Tensor, proprio: torch.Tensor, noise: torch.Tensor):
+        calls.append(noise.detach().clone())
+        return noise + condition.mean(dim=(1, 2)).reshape(batch, 1, 1)
+
+    records = extract_all_anchor_fidelity_records(
+        condition_adapter=adapter,
+        decode_same_noise=decode,
+        exact_conditions=torch.randn(batch, 4, tokens, 16),
+        image_sequence=torch.randint(
+            0, 256, (batch, 4, 2, 12, 12, 3), dtype=torch.uint8
+        ),
+        proprio_sequence=torch.randn(batch, 4, 8),
+        explicit_noises=noises,
+        valid_mask=torch.ones(batch, tokens, dtype=torch.bool),
+        group_ids=torch.arange(tokens).repeat(batch, 1),
+        episode_ids=("episode-a",),
+        sequence_ids=("sequence-a",),
+        arm_scale=torch.ones(6),
+        feature_config=config,
+    )
+    assert records.features.shape == (6, config.input_dim)
+    assert [(value["anchor_offset"], value["query_offset"]) for value in records.routing_records] == [
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 2),
+        (1, 3),
+        (2, 3),
+    ]
+    assert len(calls) == 10  # Four exact actions plus six candidates.
+    assert torch.equal(calls[1], calls[4])
+    assert torch.equal(calls[2], calls[5])
+    assert torch.equal(calls[3], calls[6])
+    assert torch.equal(calls[2], calls[7])
+    assert torch.equal(calls[3], calls[8])
+    assert torch.equal(calls[3], calls[9])
 
 
 def test_policy_source_locks_h10_r5_ng3_and_routes_before_decode() -> None:

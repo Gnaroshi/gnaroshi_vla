@@ -10,7 +10,7 @@ from __future__ import annotations
 import bisect
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -231,7 +231,11 @@ def action_fidelity_loss(
 def _percentile(sorted_reference: Sequence[float], value: float) -> float:
     if not sorted_reference:
         raise ValueError("calibration reference cannot be empty")
-    return bisect.bisect_right(sorted_reference, float(value)) / len(sorted_reference)
+    left = bisect.bisect_left(sorted_reference, float(value))
+    right = bisect.bisect_right(sorted_reference, float(value))
+    # Mid-rank ties keep a constant/non-informative channel at percentile 0.5
+    # instead of assigning every row percentile 1.0 and dominating max fusion.
+    return (left + right) / (2.0 * len(sorted_reference))
 
 
 @dataclass(frozen=True)
@@ -383,6 +387,118 @@ def fit_exact_call_budget_calibration(
         observed_exact_fraction=float(observed),
         max_approximate_age=int(max_approximate_age),
         calibration_queries=len(scores) + sum(bool(value) for value in episode_first_candidates),
+    )
+
+
+def _sequential_exact_fraction(
+    scores: Sequence[float],
+    routing_records: Sequence[Mapping[str, Any]],
+    *,
+    threshold: float,
+    max_approximate_age: int,
+) -> float:
+    """Replay q0--q3 routing with the row matching the latest exact anchor."""
+
+    if len(scores) != len(routing_records) or not scores:
+        raise ValueError("scores and routing_records must be non-empty and aligned")
+    grouped: dict[str, dict[tuple[int, int], float]] = {}
+    for score, raw in zip(scores, routing_records):
+        sequence_id = str(raw["sequence_id"])
+        key = (int(raw["anchor_offset"]), int(raw["query_offset"]))
+        if key in grouped.setdefault(sequence_id, {}):
+            raise ValueError(f"duplicate routing row for {sequence_id}: {key}")
+        grouped[sequence_id][key] = float(score)
+
+    exact_count = 0
+    query_count = 0
+    for sequence_id in sorted(grouped):
+        rows = grouped[sequence_id]
+        query_offsets = sorted({query for _, query in rows})
+        if query_offsets != [1, 2, 3]:
+            raise ValueError(f"{sequence_id} does not contain q1--q3")
+        exact_count += 1  # q0 is the exact anchor.
+        query_count += 1
+        last_exact = 0
+        for query in query_offsets:
+            key = (last_exact, query)
+            if key not in rows:
+                raise ValueError(f"missing reachable routing row for {sequence_id}: {key}")
+            age = query - last_exact
+            choose_exact = (
+                age > int(max_approximate_age) or rows[key] >= float(threshold)
+            )
+            exact_count += int(choose_exact)
+            query_count += 1
+            if choose_exact:
+                last_exact = query
+    return exact_count / query_count
+
+
+def fit_sequential_exact_call_budget_calibration(
+    arm_q90: Sequence[float],
+    gripper_probability: Sequence[float],
+    routing_records: Sequence[Mapping[str, Any]],
+    *,
+    target_exact_fraction: float,
+    max_approximate_age: int = 3,
+) -> ExactCallBudgetCalibration:
+    """Fit the budget against reachable candidates after each exact reset.
+
+    Each q0--q3 cache window contains all triangular ``(last exact, query)``
+    candidates.  Threshold simulation follows only the row reachable under the
+    preceding decisions, so an exact q1 correctly turns q2 into an age-1
+    candidate instead of reusing the stale q0-to-q2 age-2 row.
+    """
+
+    if not (
+        len(arm_q90) == len(gripper_probability) == len(routing_records)
+        and len(arm_q90) > 0
+    ):
+        raise ValueError("sequential calibration arrays must be non-empty and aligned")
+    if not 0.0 < float(target_exact_fraction) <= 1.0:
+        raise ValueError("target_exact_fraction must be in (0,1]")
+    arm_reference = tuple(sorted(float(value) for value in arm_q90))
+    gripper_reference = tuple(sorted(float(value) for value in gripper_probability))
+    scores = tuple(
+        max(
+            _percentile(arm_reference, arm),
+            _percentile(gripper_reference, gripper),
+        )
+        for arm, gripper in zip(arm_q90, gripper_probability)
+    )
+    candidates = (math.inf, *sorted(set(scores), reverse=True), -math.inf)
+    choices: list[tuple[float, bool, float, float]] = []
+    for threshold in candidates:
+        fraction = _sequential_exact_fraction(
+            scores,
+            routing_records,
+            threshold=threshold,
+            max_approximate_age=max_approximate_age,
+        )
+        choices.append(
+            (
+                abs(fraction - float(target_exact_fraction)),
+                fraction > float(target_exact_fraction),
+                -fraction,
+                float(threshold),
+            )
+        )
+    _, _, _, threshold = min(choices)
+    observed = _sequential_exact_fraction(
+        scores,
+        routing_records,
+        threshold=threshold,
+        max_approximate_age=max_approximate_age,
+    )
+    sequence_count = len({str(value["sequence_id"]) for value in routing_records})
+    return ExactCallBudgetCalibration(
+        arm_reference=arm_reference,
+        gripper_reference=gripper_reference,
+        route_threshold=threshold,
+        target_exact_fraction=float(target_exact_fraction),
+        observed_exact_fraction=float(observed),
+        max_approximate_age=int(max_approximate_age),
+        calibration_queries=len(scores) + sequence_count,
     )
 
 

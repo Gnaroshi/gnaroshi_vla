@@ -12,7 +12,11 @@ from .features import (
     feature_names,
     runtime_feature_contract,
 )
-from .extraction import CompactFidelityRecords, extract_compact_fidelity_records
+from .extraction import (
+    CompactFidelityRecords,
+    extract_all_anchor_fidelity_records,
+    extract_compact_fidelity_records,
+)
 
 __all__ = [
     "CHECKPOINT_SCHEMA",
@@ -20,6 +24,7 @@ __all__ = [
     "SimVLAActionFidelityFeatureConfig",
     "build_simvla_action_fidelity_features",
     "control_risk_scores",
+    "extract_all_anchor_fidelity_records",
     "extract_compact_fidelity_records",
     "feature_names",
     "load_action_fidelity_checkpoint",

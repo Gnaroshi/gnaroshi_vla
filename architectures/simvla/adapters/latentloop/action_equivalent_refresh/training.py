@@ -23,11 +23,12 @@ from methods.latentloop.modules.action_equivalent_refresh import (
     CounterfactualActionTargets,
     action_fidelity_loss,
     fit_exact_call_budget_calibration,
+    fit_sequential_exact_call_budget_calibration,
 )
 
 
 DATASET_SCHEMA = "simvla_action_fidelity_compact_dataset_v1"
-ALLOWED_SPLITS = ("train", "checkpoint_validation")
+ALLOWED_SPLITS = ("train", "checkpoint_validation", "final_offline")
 
 
 def _atomic_torch_save(path: Path, payload: dict[str, Any]) -> Path:
@@ -51,6 +52,7 @@ def save_compact_action_fidelity_dataset(
     episode_ids: list[str],
     feature_config: SimVLAActionFidelityFeatureConfig,
     source_metadata: dict[str, Any],
+    routing_records: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Persist only cheap runtime features and scalar same-noise labels."""
 
@@ -70,6 +72,8 @@ def save_compact_action_fidelity_dataset(
         raise ValueError("targets and episode_first_candidates must be [N]")
     if len(episode_ids) != rows or not rows:
         raise ValueError("episode_ids must contain one non-empty ID per row")
+    if routing_records is not None and len(routing_records) != rows:
+        raise ValueError("routing_records must contain one entry per row")
     if not bool(episode_first_candidates[0]) or not bool(
         episode_first_candidates.any()
     ):
@@ -94,6 +98,7 @@ def save_compact_action_fidelity_dataset(
         "episode_first_candidates": episode_first_candidates.detach().cpu().bool(),
         "episode_ids": [str(value) for value in episode_ids],
         "source_metadata": dict(source_metadata),
+        "routing_records": list(routing_records or ()),
         "runtime_forbidden_tensors_absent": {
             "exact_condition": True,
             "exact_action_chunk": True,
@@ -135,6 +140,9 @@ class CompactActionFidelityDataset(Dataset[dict[str, Tensor]]):
         self.episode_ids = tuple(str(value) for value in payload["episode_ids"])
         if len(self.episode_ids) != len(self.features):
             raise ValueError("stored episode IDs are not row-aligned")
+        self.routing_records = tuple(dict(value) for value in payload.get("routing_records", ()))
+        if self.routing_records and len(self.routing_records) != len(self.features):
+            raise ValueError("stored routing records are not row-aligned")
 
     def __len__(self) -> int:
         return int(self.features.shape[0])
@@ -269,13 +277,24 @@ def train_compact_action_fidelity_head(
         batch_size=batch_size,
         device=target_device,
     )
-    calibration = fit_exact_call_budget_calibration(
-        arm,
-        gripper,
-        starts,
-        target_exact_fraction=float(target_exact_fraction),
-        max_approximate_age=train.feature_config.max_age,
-    )
+    if validation.routing_records:
+        calibration = fit_sequential_exact_call_budget_calibration(
+            arm,
+            gripper,
+            validation.routing_records,
+            target_exact_fraction=float(target_exact_fraction),
+            max_approximate_age=train.feature_config.max_age,
+        )
+        calibration_mode = "reachable_all_anchor_q0_q3"
+    else:
+        calibration = fit_exact_call_budget_calibration(
+            arm,
+            gripper,
+            starts,
+            target_exact_fraction=float(target_exact_fraction),
+            max_approximate_age=train.feature_config.max_age,
+        )
+        calibration_mode = "legacy_fixed_anchor"
     output_root = Path(output).expanduser().resolve()
     checkpoint = save_action_fidelity_checkpoint(
         output_root / "action_fidelity_head.pt",
@@ -303,6 +322,7 @@ def train_compact_action_fidelity_head(
         "last_train_losses": last_losses,
         "validation_losses": validation_losses,
         "calibration": calibration.to_dict(),
+        "calibration_mode": calibration_mode,
         "frozen_external_modules": ["SimVLA", "U_C", "U_G"],
     }
     output_root.mkdir(parents=True, exist_ok=True)
