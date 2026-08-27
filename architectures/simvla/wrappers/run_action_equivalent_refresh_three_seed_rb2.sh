@@ -291,7 +291,7 @@ run_periodic_once() {
       --bundle-root "${FIXED_BUNDLE}" --condition-checkpoint "${CONDITION}" \
       --source-lock "${FIXED_SOURCE}" --parity-gate "${GATES}/${seed}/fixed_2x2_parity.json" \
       --control-manifest "${CONTROL_MANIFEST}" \
-      --physical-gpu-id 0 --classification HOST_LOCAL_EGL_DIAGNOSTIC \
+      --physical-gpu-id 0 --classification RB2_CONFIRMATORY_EGL \
       --inference-seed "${seed}" --save-failure-videos \
       >"${LOGS}/${seed}_periodic_kc3_ng3.log" 2>&1
 }

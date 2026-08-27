@@ -5,6 +5,7 @@ import csv
 import inspect
 import textwrap
 from collections import defaultdict, deque
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -393,6 +394,20 @@ def test_sd1_fixed_rows_use_gpus_2_through_7_and_all_tasks() -> None:
         assert gate["verdict"] == "SD1_FIXED_SHARD_PASS"
     assert _validate_sd1_fixed_shard(1, tuple(range(10)))["verdict"] == "SD1_FIXED_SHARD_FAIL"
     assert _validate_sd1_fixed_shard(2, tuple(range(5)))["verdict"] == "SD1_FIXED_SHARD_FAIL"
+
+
+def test_rb2_three_seed_launcher_uses_confirmatory_gpu_contract() -> None:
+    root = Path(__file__).resolve().parents[2]
+    launcher = (
+        root
+        / "architectures/simvla/wrappers/run_action_equivalent_refresh_three_seed_rb2.sh"
+    ).read_text(encoding="utf-8")
+    periodic_call = launcher.split("run_periodic_once()", 1)[1].split(
+        "action_complete()", 1
+    )[0]
+
+    assert "--classification RB2_CONFIRMATORY_EGL" in periodic_call
+    assert "--classification HOST_LOCAL_EGL_DIAGNOSTIC" not in periodic_call
 
 
 def test_action_chunk_npz_is_loaded_once_and_indexed_correctly(tmp_path) -> None:
