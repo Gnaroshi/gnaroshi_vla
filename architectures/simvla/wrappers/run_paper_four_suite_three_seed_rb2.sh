@@ -119,6 +119,28 @@ source_audit() {
   require_file "${CONDITION_CHECKPOINT}" || return 1
   require_file "${FIXED_LOCK}" || return 1
   command -v nvidia-smi >/dev/null 2>&1 || { log "PREFLIGHT_FAIL nvidia-smi_missing"; return 1; }
+  local driver_commit expected_driver_commit
+  driver_commit=$(git -C "${DRIVER_ROOT}" rev-parse HEAD 2>/dev/null) || {
+    log "PREFLIGHT_FAIL driver_git_commit_unavailable"
+    return 1
+  }
+  expected_driver_commit=${SIMVLA_PAPER_DRIVER_COMMIT:-}
+  if [[ -n "${expected_driver_commit}" && "${driver_commit}" != "${expected_driver_commit}" ]]; then
+    log "PREFLIGHT_FAIL driver_commit=${driver_commit} expected=${expected_driver_commit}"
+    return 1
+  fi
+  if ! git -C "${DRIVER_ROOT}" diff --quiet -- \
+      architectures/simvla/wrappers/run_paper_four_suite_three_seed_rb2.sh \
+      tools/simvla/paper_suite_matrix.py; then
+    log "PREFLIGHT_FAIL driver_files_have_uncommitted_changes"
+    return 1
+  fi
+  if ! git -C "${DRIVER_ROOT}" diff --cached --quiet -- \
+      architectures/simvla/wrappers/run_paper_four_suite_three_seed_rb2.sh \
+      tools/simvla/paper_suite_matrix.py; then
+    log "PREFLIGHT_FAIL driver_files_have_staged_changes"
+    return 1
+  fi
   "${PYTHON}" "${HELPER}" audit \
     --generation-root "${GENERATION_ROOT}" \
     --control-root "${CONTROL_ROOT}" \
