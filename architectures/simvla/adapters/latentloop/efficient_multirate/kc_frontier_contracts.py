@@ -34,6 +34,22 @@ class EfficiencyRowSpec:
     uses_generation: bool
     coupled: bool = False
     naive_nfe: bool = False
+    mechanical_control: str | None = None
+
+
+MECHANICAL_CONTROL_MODES = (
+    "hold_condition",
+    "native_chunk_replay",
+    "hold_action",
+    "no_observation",
+)
+
+
+def mechanical_control_row_name(mode: str) -> str:
+    value = str(mode)
+    if value not in MECHANICAL_CONTROL_MODES:
+        raise ValueError(f"unsupported mechanical control: {value}")
+    return f"mechanical_{value}_kc2_ng3"
 
 
 def condition_row_name(k_c: int, n_g: int) -> str:
@@ -72,6 +88,19 @@ ROW_SPECS = {
         for k_c, nfe in NAIVE_CONFIGS
     },
     COUPLED_ROW: EfficiencyRowSpec(COUPLED_ROW, 2, 3, True, True, True),
+    **{
+        mechanical_control_row_name(mode): EfficiencyRowSpec(
+            mechanical_control_row_name(mode),
+            2,
+            3,
+            True,
+            True,
+            False,
+            False,
+            mode,
+        )
+        for mode in MECHANICAL_CONTROL_MODES
+    },
 }
 
 if condition_row_name(2, 10) != CONDITION_ROW:
@@ -97,6 +126,9 @@ JOINT_NFE_ROWS = (
     naive_condition_row_name(2, 2),
     naive_condition_row_name(3, 3),
 )
+MECHANICAL_CONTROL_ROWS = tuple(
+    mechanical_control_row_name(mode) for mode in MECHANICAL_CONTROL_MODES
+)
 
 
 def row_spec(row: str) -> EfficiencyRowSpec:
@@ -114,9 +146,17 @@ def expected_call_counts(row: str, policy_queries: int) -> dict[str, int]:
     full_vlm_calls = (
         (queries + spec.k_c - 1) // spec.k_c if spec.uses_condition else queries
     )
-    condition_calls = queries - full_vlm_calls if spec.uses_condition else 0
-    full_action_calls = queries * spec.n_g
-    generation_updates = queries * (10 - spec.n_g) if spec.uses_generation else 0
+    skipped_queries = queries - full_vlm_calls
+    condition_calls = skipped_queries if spec.uses_condition else 0
+    decode_queries = queries
+    if spec.mechanical_control in {"hold_condition", "native_chunk_replay", "hold_action"}:
+        condition_calls = 0
+    if spec.mechanical_control in {"native_chunk_replay", "hold_action"}:
+        decode_queries = full_vlm_calls
+    full_action_calls = decode_queries * spec.n_g
+    generation_updates = (
+        decode_queries * (10 - spec.n_g) if spec.uses_generation else 0
+    )
     return {
         "full_vlm_calls": full_vlm_calls,
         "condition_updater_calls": condition_calls,

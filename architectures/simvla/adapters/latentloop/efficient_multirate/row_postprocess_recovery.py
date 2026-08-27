@@ -129,7 +129,10 @@ def recover_row(
     if manifest.get("observed_manifest_sha256") != expected_manifest_sha256:
         raise RuntimeError("recovery manifest SHA-256 mismatch")
     host = load_json(shard_path / "host_shard_contract.json")
-    if host.get("verdict") != "SD1_FIXED_SHARD_PASS":
+    if host.get("verdict") not in {
+        "SD1_FIXED_SHARD_PASS",
+        "CONFIRMATORY_SHARD_PASS",
+    }:
         raise RuntimeError("host shard contract did not pass")
     provenance = load_json(shard_path / "frozen_provenance.json")
     if provenance.get("verdict") != "FROZEN_PROVENANCE_PASS":
@@ -144,6 +147,7 @@ def recover_row(
 
     contract = row_spec(row_name)
     naive_nfe = bool(getattr(contract, "naive_nfe", False))
+    mechanical_control = getattr(contract, "mechanical_control", None)
     classification = str(rows[0]["classification"])
     inference_seed = str(rows[0]["inference_seed"])
     is_frontier = contract.k_c > 2 or contract.n_g == 2 or naive_nfe
@@ -169,8 +173,15 @@ def recover_row(
     elapsed_seconds = float(
         sum(float(item.get("episode_wall_time_seconds", 0.0)) for item in rows)
     )
+    shard_verdict = (
+        "MECHANICAL_CONTROL_SHARD_PASS"
+        if mechanical_control is not None
+        else "KC_FRONTIER_SHARD_PASS"
+        if is_frontier
+        else "FIXED_2X2_SHARD_PASS"
+    )
     shard_summary = {
-        "verdict": "KC_FRONTIER_SHARD_PASS" if is_frontier else "FIXED_2X2_SHARD_PASS",
+        "verdict": shard_verdict,
         "row": row_name,
         "classification": classification,
         "inference_seed": inference_seed,
@@ -192,8 +203,11 @@ def recover_row(
         "paper_runtime_match": bool(provenance["paper_runtime_match"]),
         "condition_refresh_interval": contract.k_c,
         "full_generation_evaluations": contract.n_g,
+        "mechanical_control": mechanical_control,
         "generation_mode": (
-            "naive_nfe"
+            f"mechanical_{mechanical_control}"
+            if mechanical_control is not None
+            else "naive_nfe"
             if naive_nfe
             else "learned_hidden_update"
             if contract.uses_generation
@@ -217,8 +231,18 @@ def recover_row(
     merged_path.mkdir(parents=True, exist_ok=True)
     _write_csv_atomic(merged_path / "episode_metrics.csv", rows)
     _copy_atomic(action_chunks, merged_path / "action_chunks.npz")
+    query_trace = shard_path / "query_trace.csv"
+    if query_trace.is_file():
+        _copy_atomic(query_trace, merged_path / "query_trace.csv")
+    row_verdict = (
+        "MECHANICAL_CONTROL_ROW_PASS"
+        if mechanical_control is not None
+        else "KC_FRONTIER_ROW_PASS"
+        if is_frontier
+        else "FIXED_2X2_ROW_PASS"
+    )
     row_summary = {
-        "verdict": "KC_FRONTIER_ROW_PASS" if is_frontier else "FIXED_2X2_ROW_PASS",
+        "verdict": row_verdict,
         "classification": classification,
         "inference_seed": inference_seed,
         "manifest_sha256": expected_manifest_sha256,
@@ -227,6 +251,7 @@ def recover_row(
         "paper_runtime_match": bool(provenance["paper_runtime_match"]),
         "condition_refresh_interval": contract.k_c,
         "full_generation_evaluations": contract.n_g,
+        "mechanical_control": mechanical_control,
         "generation_mode": shard_summary["generation_mode"],
         "postprocess_recovered": True,
         **summarized,

@@ -66,6 +66,9 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_co
     expected_call_counts,
     row_spec,
 )
+from architectures.simvla.adapters.latentloop.efficient_multirate.mechanical_control_policy import (
+    SynchronizedMechanicalControlPolicy,
+)
 from architectures.simvla.adapters.latentloop.native_v0_long_eval import (
     _SynchronizedFullPolicy,
     _trajectory_metrics,
@@ -670,6 +673,16 @@ def _make_policy(
             flow_steps=10,
             row_name=FULL_ROW,
         )
+    if spec.mechanical_control is not None:
+        if condition_updater is None:
+            raise RuntimeError("mechanical control requires the frozen Condition updater")
+        if generation_updater is None:
+            raise RuntimeError("mechanical control requires the frozen Generation updater")
+        return SynchronizedMechanicalControlPolicy(
+            **condition_common,
+            control_mode=spec.mechanical_control,
+            generation_updater=generation_updater,
+        )
     if spec.naive_nfe:
         if condition_updater is None:
             raise RuntimeError("naive condition row requires the frozen Condition updater")
@@ -735,6 +748,8 @@ def _validate_fixed_2x2_counters(
     condition_updater_calls: int,
     full_action_transformer_calls: int,
     generation_loop_updates: int,
+    action_transformer_decodes: int | None = None,
+    observation_encoder_calls: int | None = None,
 ) -> dict[str, Any]:
     queries = int(policy_queries)
     spec = row_spec(row)
@@ -748,8 +763,32 @@ def _validate_fixed_2x2_counters(
         + int(generation_loop_updates),
     }
     checks = {name: observed[name] == value for name, value in expected.items()}
+    if action_transformer_decodes is not None:
+        expected_decodes = expected["full_action_transformer_calls"] // spec.n_g
+        observed["action_transformer_decodes"] = int(action_transformer_decodes)
+        expected["action_transformer_decodes"] = expected_decodes
+        checks["action_transformer_decodes"] = (
+            observed["action_transformer_decodes"] == expected_decodes
+        )
+    if observation_encoder_calls is not None:
+        expected_observation_calls = (
+            0
+            if spec.mechanical_control == "no_observation"
+            else expected["condition_updater_calls"]
+        )
+        observed["observation_encoder_calls"] = int(observation_encoder_calls)
+        expected["observation_encoder_calls"] = expected_observation_calls
+        checks["observation_encoder_calls"] = (
+            observed["observation_encoder_calls"] == expected_observation_calls
+        )
     is_fixed_row = not (spec.k_c > 2 or spec.n_g == 2 or spec.naive_nfe)
-    prefix = "FIXED_2X2" if is_fixed_row else "KC_FRONTIER"
+    prefix = (
+        "MECHANICAL_CONTROL"
+        if spec.mechanical_control is not None
+        else "FIXED_2X2"
+        if is_fixed_row
+        else "KC_FRONTIER"
+    )
     return {
         "verdict": f"{prefix}_COUNTER_PASS" if all(checks.values()) else f"{prefix}_COUNTER_FAIL",
         "row": row,
@@ -989,6 +1028,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
     suite = benchmark.get_benchmark_dict()[str(manifest["suite"])]()
     episode_rows: list[dict[str, Any]] = []
     action_chunk_rows: list[dict[str, Any]] = []
+    query_trace_rows: list[dict[str, Any]] = []
     assigned_total = len(task_ids) * int(manifest["trials_per_task"])
     progress = tqdm(
         total=assigned_total,
@@ -1074,9 +1114,23 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
                     condition_updater_calls=condition_updates,
                     full_action_transformer_calls=full_calls,
                     generation_loop_updates=generation_updates,
+                    action_transformer_decodes=int(
+                        counters.get("num_action_transformer_decodes", 0)
+                    ),
+                    observation_encoder_calls=int(
+                        counters.get("num_observation_encoder_calls", 0)
+                    ),
                 )
                 if not counter_gate["verdict"].endswith("_COUNTER_PASS"):
                     raise RuntimeError(json.dumps(counter_gate, indent=2, sort_keys=True))
+                if row_contract.mechanical_control is not None:
+                    if len(policy.query_trace) != policy_queries:
+                        raise RuntimeError("mechanical query trace count drift")
+                    expected_decodes = expected_call_counts(
+                        args.row, policy_queries
+                    )["full_action_transformer_calls"] // row_contract.n_g
+                    if len(policy.action_chunk_records) != expected_decodes:
+                        raise RuntimeError("mechanical decoded-chunk record count drift")
 
                 trajectory = _trajectory_metrics(actions)
                 gripper = _gripper_metrics(actions)
@@ -1108,6 +1162,24 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
                     "num_full_action_transformer_evaluations": full_calls,
                     "num_generation_loop_updates": generation_updates,
                     "num_integration_updates": integration_updates,
+                    "num_action_transformer_decodes": int(
+                        counters.get("num_action_transformer_decodes", 0)
+                    ),
+                    "num_observation_encoder_calls": int(
+                        counters.get("num_observation_encoder_calls", 0)
+                    ),
+                    "num_no_observation_updates": int(
+                        counters.get("num_no_observation_updates", 0)
+                    ),
+                    "num_hold_action_steps": int(
+                        counters.get("num_hold_action_steps", 0)
+                    ),
+                    "num_hold_condition_steps": int(
+                        counters.get("num_hold_condition_steps", 0)
+                    ),
+                    "num_native_chunk_steps": int(
+                        counters.get("num_native_chunk_steps", 0)
+                    ),
                     "num_action_queue_steps": int(counters.get("num_action_queue_steps", 0)),
                     "effective_k_c": float(
                         policy_queries / max(1, int(counters.get("num_full_vlm_calls", 0)))
@@ -1115,13 +1187,26 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
                     "latency_per_policy_query_ms": float(np.mean(query_policy_ms)),
                     "latency_per_executed_action_ms": float(np.mean(policy_ms)),
                     "model_vlm_encoder_per_query_ms": float(np.mean(vlm_encoder_ms)),
+                    "model_vlm_encoder_per_call_ms": float(np.mean(vlm_encoder_ms)),
+                    "model_vlm_encoder_amortized_per_query_ms": float(
+                        sum(vlm_encoder_ms) / max(1, policy_queries)
+                    ),
                     "model_action_generation_per_query_ms": float(
                         np.mean(action_transformer_ms)
+                    ),
+                    "model_action_generation_per_decode_ms": float(
+                        np.mean(action_transformer_ms)
+                    ),
+                    "model_action_generation_amortized_per_query_ms": float(
+                        sum(action_transformer_ms) / max(1, policy_queries)
                     ),
                     "model_condition_updater_per_update_ms": (
                         float(np.mean(condition_updater_ms))
                         if condition_updater_ms
                         else 0.0
+                    ),
+                    "model_condition_updater_amortized_per_query_ms": float(
+                        sum(condition_updater_ms) / max(1, policy_queries)
                     ),
                     "model_generation_loop_per_query_ms": (
                         float(np.mean(generation_loop_ms))
@@ -1159,6 +1244,15 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
                             "action_chunk": record["action_chunk"].numpy()[0],
                         }
                     )
+                for trace in getattr(policy, "query_trace", []):
+                    query_trace_rows.append(
+                        {
+                            "row": args.row,
+                            "task_id": task_id,
+                            "trial_id": trial_id,
+                            **trace,
+                        }
+                    )
 
                 if args.save_video and (not args.video_failures_only or not success):
                     video_root = output / "videos" / f"task_{task_id:02d}"
@@ -1186,13 +1280,27 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         writer.writeheader()
         writer.writerows(episode_rows)
     _save_action_chunks(output / "action_chunks.npz", action_chunk_rows)
+    if query_trace_rows:
+        with (output / "query_trace.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(query_trace_rows[0]))
+            writer.writeheader()
+            writer.writerows(query_trace_rows)
     is_frontier = (
         row_contract.k_c > 2
         or row_contract.n_g == 2
         or row_contract.naive_nfe
     )
+    shard_verdict = (
+        "MECHANICAL_CONTROL_SHARD_PASS"
+        if row_contract.mechanical_control is not None
+        else "KC_FRONTIER_SHARD_PASS"
+        if is_frontier
+        else "FIXED_2X2_SHARD_PASS"
+    )
     summary = {
-        "verdict": "KC_FRONTIER_SHARD_PASS" if is_frontier else "FIXED_2X2_SHARD_PASS",
+        "verdict": shard_verdict,
         "row": args.row,
         "classification": args.classification,
         "inference_seed": args.inference_seed,
@@ -1232,8 +1340,11 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         "paper_runtime_match": provenance["paper_runtime_match"],
         "condition_refresh_interval": row_contract.k_c,
         "full_generation_evaluations": row_contract.n_g,
+        "mechanical_control": row_contract.mechanical_control,
         "generation_mode": (
-            "naive_nfe"
+            f"mechanical_{row_contract.mechanical_control}"
+            if row_contract.mechanical_control is not None
+            else "naive_nfe"
             if row_contract.naive_nfe
             else "learned_hidden_update"
             if row_contract.uses_generation
@@ -1260,6 +1371,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "elapsed_seconds": float(time.perf_counter() - shard_started),
         "action_chunk_records": len(action_chunk_rows),
+        "query_trace_records": len(query_trace_rows),
     }
     atomic_write_json(output / "shard_summary.json", summary)
     return summary

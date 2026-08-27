@@ -122,6 +122,7 @@ def _summarize(row_name: str, rows: Sequence[Mapping[str, Any]]) -> dict[str, An
     queries = sum(_int(row, "num_policy_queries") for row in rows)
     vlm_calls = sum(_int(row, "num_full_vlm_calls") for row in rows)
     condition_calls = sum(_int(row, "num_condition_updater_calls") for row in rows)
+    action_decodes = sum(_int(row, "num_action_transformer_decodes") for row in rows)
     transformer_calls = sum(
         _int(row, "num_full_action_transformer_evaluations") for row in rows
     )
@@ -148,6 +149,7 @@ def _summarize(row_name: str, rows: Sequence[Mapping[str, Any]]) -> dict[str, An
         "policy_queries": queries,
         "full_vlm_calls": vlm_calls,
         "condition_updater_calls": condition_calls,
+        "action_transformer_decodes": action_decodes,
         "full_action_transformer_evaluations": transformer_calls,
         "generation_loop_updates": generation_updates,
         "integration_updates": transformer_calls + generation_updates,
@@ -161,11 +163,27 @@ def _summarize(row_name: str, rows: Sequence[Mapping[str, Any]]) -> dict[str, An
         "model_vlm_encoder_per_call_ms": _weighted_mean(
             rows, "model_vlm_encoder_per_query_ms", "num_full_vlm_calls"
         ),
+        "model_vlm_encoder_amortized_per_query_ms": _weighted_mean(
+            rows, "model_vlm_encoder_amortized_per_query_ms", "num_policy_queries"
+        ),
         "model_condition_updater_per_call_ms": _weighted_mean(
             rows, "model_condition_updater_per_update_ms", "num_condition_updater_calls"
         ),
+        "model_condition_updater_amortized_per_query_ms": _weighted_mean(
+            rows,
+            "model_condition_updater_amortized_per_query_ms",
+            "num_policy_queries",
+        ),
+        "model_action_generation_per_decode_ms": _weighted_mean(
+            rows, "model_action_generation_per_query_ms", "num_action_transformer_decodes"
+        ),
         "model_action_generation_per_query_ms": _weighted_mean(
             rows, "model_action_generation_per_query_ms", "num_policy_queries"
+        ),
+        "model_action_generation_amortized_per_query_ms": _weighted_mean(
+            rows,
+            "model_action_generation_amortized_per_query_ms",
+            "num_policy_queries",
         ),
         "policy_wall_time_seconds": policy_seconds,
     }
@@ -177,7 +195,11 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
     if output.exists():
         raise FileExistsError(f"refusing existing output: {output}")
     shard_summary = load_json(shard / "shard_summary.json")
-    accepted_shard_verdicts = {"FIXED_2X2_SHARD_PASS", "KC_FRONTIER_SHARD_PASS"}
+    accepted_shard_verdicts = {
+        "FIXED_2X2_SHARD_PASS",
+        "KC_FRONTIER_SHARD_PASS",
+        "MECHANICAL_CONTROL_SHARD_PASS",
+    }
     if shard_summary.get("verdict") not in accepted_shard_verdicts:
         raise RuntimeError("efficiency-row shard gate did not pass")
     if shard_summary.get("row") != args.row:
@@ -187,8 +209,15 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
     rows = _read_csv(shard / "episode_metrics.csv")
     spec = row_spec(args.row)
     is_frontier = spec.k_c > 2 or spec.n_g == 2 or spec.naive_nfe
+    row_verdict = (
+        "MECHANICAL_CONTROL_ROW_PASS"
+        if spec.mechanical_control is not None
+        else "KC_FRONTIER_ROW_PASS"
+        if is_frontier
+        else "FIXED_2X2_ROW_PASS"
+    )
     summary = {
-        "verdict": "KC_FRONTIER_ROW_PASS" if is_frontier else "FIXED_2X2_ROW_PASS",
+        "verdict": row_verdict,
         "classification": shard_summary["classification"],
         "inference_seed": shard_summary["inference_seed"],
         "manifest_sha256": args.expected_manifest_sha256,
@@ -205,8 +234,11 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
         "paper_runtime_match": bool(shard_summary["paper_runtime_match"]),
         "condition_refresh_interval": spec.k_c,
         "full_generation_evaluations": spec.n_g,
+        "mechanical_control": spec.mechanical_control,
         "generation_mode": (
-            "naive_nfe"
+            f"mechanical_{spec.mechanical_control}"
+            if spec.mechanical_control is not None
+            else "naive_nfe"
             if spec.naive_nfe
             else "learned_hidden_update"
             if spec.uses_generation
@@ -217,6 +249,8 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
     output.mkdir(parents=True)
     _write_csv(output / "episode_metrics.csv", rows)
     shutil.copy2(shard / "action_chunks.npz", output / "action_chunks.npz")
+    if (shard / "query_trace.csv").is_file():
+        shutil.copy2(shard / "query_trace.csv", output / "query_trace.csv")
     atomic_write_json(output / "row_summary.json", summary)
     return summary
 
