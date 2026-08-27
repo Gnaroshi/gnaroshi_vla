@@ -27,7 +27,7 @@ FIXED_LOCK=${STORAGE}/results/simvla/action_equivalent_refresh/three_seed_long50
 RESULT=${SIMVLA_PAPER_MATRIX_OUTPUT:-${STORAGE}/results/simvla/paper_four_suite_three_seed_v1}
 REGISTRY=${RESULT}/metadata/experiment_registry.json
 AUDIT=${RESULT}/metadata/preflight_audit.json
-SUMMARY=${RESULT}/summary/four_suite_three_seed_summary.json
+SUMMARY=${RESULT}/summary/selected_matrix_summary.json
 LOG_ROOT=${RESULT}/logs
 STATUS=${RESULT}/launcher.status
 FAILURES=${RESULT}/metadata/failed_cells.tsv
@@ -37,10 +37,15 @@ GPU_ID=${SIMVLA_RB2_GPU_ID:-0}
 MINIMUM_FREE_MIB=${SIMVLA_MINIMUM_FREE_MIB:-28000}
 GPU_WAIT_SECONDS=${SIMVLA_GPU_WAIT_SECONDS:-120}
 
-SUITES=(libero_spatial libero_object libero_goal libero_10)
-SEEDS=(seed01 seed02 seed03)
-PRIMARY_ROWS=(full_nfe10 generation_ng3 condition_kc2_ng3)
-CONTROL_ROWS=(condition_kc2_ng10 naive_nfe3)
+IFS=',' read -r -a SUITES <<< "${SIMVLA_PAPER_SUITES:-libero_spatial,libero_object,libero_goal,libero_10}"
+IFS=',' read -r -a SEEDS <<< "${SIMVLA_PAPER_SEEDS:-seed01,seed02,seed03}"
+IFS=',' read -r -a MATRIX_ROWS <<< "${SIMVLA_PAPER_ROWS:-full_nfe10,generation_ng3,condition_kc2_ng3,condition_kc2_ng10,naive_nfe3}"
+IFS=',' read -r -a PRIMARY_ROWS <<< "${SIMVLA_PAPER_PRIMARY_ROWS:-full_nfe10,generation_ng3,condition_kc2_ng3}"
+IFS=',' read -r -a CONTROL_ROWS <<< "${SIMVLA_PAPER_CONTROL_ROWS:-condition_kc2_ng10,naive_nfe3}"
+
+SUITES_CSV=$(IFS=,; printf '%s' "${SUITES[*]}")
+SEEDS_CSV=$(IFS=,; printf '%s' "${SEEDS[*]}")
+ROWS_CSV=$(IFS=,; printf '%s' "${MATRIX_ROWS[*]}")
 
 mkdir -p "${RESULT}/metadata" "${RESULT}/summary" "${LOG_ROOT}" "${RESULT}/failed_attempts"
 touch "${FAILURES}"
@@ -99,6 +104,9 @@ prepare_manifests() {
   "${PYTHON}" "${HELPER}" build-registry \
     --result-root "${RESULT}" \
     --storage "${STORAGE}" \
+    --suites "${SUITES_CSV}" \
+    --seeds "${SEEDS_CSV}" \
+    --rows "${ROWS_CSV}" \
     --output "${REGISTRY}" \
     > "${LOG_ROOT}/registry.log" 2>&1 || return 1
   local planned reused
@@ -230,14 +238,15 @@ ensure_egl() {
   quarantine_path "${preflight}" "egl_${suite}_${seed}"
   mkdir -p "$(dirname "${preflight}")"
   wait_for_isolated_gpu || return 1
-  PYTHONPATH="${FIXED_ROOT}:${UPSTREAM}:${LIBERO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+  (cd "${FIXED_ROOT}" && \
+    PYTHONPATH="${FIXED_ROOT}:${UPSTREAM}:${LIBERO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
     "${PYTHON}" "${FIXED_ROOT}/tools/simvla/simvla_egl_preflight.py" \
       --output "${preflight}" \
       --gpu-id "${GPU_ID}" \
       --suite "${suite}" \
       --task-id 0 \
       --environment-seed 7 \
-      --resolution 256 \
+      --resolution 256) \
       > "${log_file}" 2>&1 || return 1
   validate_egl "${preflight}" "${suite}"
 }
@@ -262,7 +271,8 @@ ensure_parity() {
   quarantine_path "${parity}" "parity_${suite}_${seed}"
   expected=$(manifest_sha "${manifest}") || return 1
   wait_for_isolated_gpu || return 1
-  PYTHONPATH="${FIXED_ROOT}:${UPSTREAM}:${LIBERO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+  (cd "${FIXED_ROOT}" && \
+    PYTHONPATH="${FIXED_ROOT}:${UPSTREAM}:${LIBERO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
     "${PYTHON}" -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_parity \
       --output "${parity}" \
       --manifest "${manifest}" \
@@ -274,7 +284,7 @@ ensure_parity() {
       --physical-gpu-id "${GPU_ID}" \
       --classification RB2_CONFIRMATORY_EGL \
       --checkpoint "${CHECKPOINT}" \
-      --smolvlm-model "${SMOLVLM}" \
+      --smolvlm-model "${SMOLVLM}") \
       > "${log_file}" 2>&1 || return 1
   validate_parity "${parity}" "${manifest}"
 }
@@ -315,7 +325,8 @@ run_generation_control_row() {
     if [[ ${rc:-0} -eq 0 ]]; then
       log "row_start suite=${suite} seed=${seed} row=${row} attempt=${attempt} episodes=500"
       nvidia-smi -q -i "${GPU_ID}" > "${cell}/logs/nvidia_smi_before.txt" 2>&1 || true
-      PYTHONPATH="${CONTROL_ROOT}:${UPSTREAM}:${LIBERO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+      (cd "${CONTROL_ROOT}" && \
+        PYTHONPATH="${CONTROL_ROOT}:${UPSTREAM}:${LIBERO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
         "${PYTHON}" -m architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_eval \
           --row "${row}" \
           --output "${shard}" \
@@ -330,7 +341,7 @@ run_generation_control_row() {
           --checkpoint "${CHECKPOINT}" \
           --smolvlm-model "${SMOLVLM}" \
           --tqdm-mininterval 1.0 \
-          --save-video --video-failures-only --video-stride 2 --video-max-per-task 1 \
+          --save-video --video-failures-only --video-stride 2 --video-max-per-task 1) \
           2>&1 | tee -a "${log_file}"
       rc=${PIPESTATUS[0]}
       nvidia-smi -q -i "${GPU_ID}" > "${cell}/logs/nvidia_smi_after.txt" 2>&1 || true
@@ -367,7 +378,8 @@ run_fixed_row() {
     if [[ ${rc:-0} -eq 0 ]]; then
       log "row_start suite=${suite} seed=${seed} row=${row} attempt=${attempt} episodes=500"
       nvidia-smi -q -i "${GPU_ID}" > "${cell}/logs/nvidia_smi_before.txt" 2>&1 || true
-      PYTHONPATH="${FIXED_ROOT}:${UPSTREAM}:${LIBERO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+      (cd "${FIXED_ROOT}" && \
+        PYTHONPATH="${FIXED_ROOT}:${UPSTREAM}:${LIBERO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
         "${PYTHON}" -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval \
           --row "${row}" \
           --output "${shard}" \
@@ -386,7 +398,7 @@ run_fixed_row() {
           --checkpoint "${CHECKPOINT}" \
           --smolvlm-model "${SMOLVLM}" \
           --tqdm-mininterval 1.0 \
-          --save-video --video-failures-only --video-stride 2 --video-max-per-task 1 \
+          --save-video --video-failures-only --video-stride 2 --video-max-per-task 1) \
           2>&1 | tee -a "${log_file}"
       rc=${PIPESTATUS[0]}
       nvidia-smi -q -i "${GPU_ID}" > "${cell}/logs/nvidia_smi_after.txt" 2>&1 || true
@@ -477,13 +489,21 @@ main() {
 
   run_phase primary "${PRIMARY_ROWS[@]}"
   if [[ "${MODE}" == "--primary-only" ]]; then
-    printf 'PAPER_MATRIX_PRIMARY_PHASE_COMPLETE\n' > "${STATUS}"
-    log "primary_only_complete"
-    return 0
+    if "${PYTHON}" "${HELPER}" aggregate \
+        --registry "${REGISTRY}" --output "${SUMMARY}" \
+        > "${LOG_ROOT}/aggregate_final.log" 2>&1; then
+      printf 'PAPER_SELECTED_MATRIX_COMPLETE\n' > "${STATUS}"
+      log "primary_only_complete summary=${SUMMARY}"
+      return 0
+    fi
+    printf 'PAPER_SELECTED_MATRIX_INCOMPLETE\n' > "${STATUS}"
+    log "primary_only_incomplete summary=${SUMMARY} failures=${FAILURES}"
+    return 1
   fi
 
-  run_phase condition_ablation condition_kc2_ng10
-  run_phase naive_control naive_nfe3
+  if (( ${#CONTROL_ROWS[@]} > 0 )); then
+    run_phase controls "${CONTROL_ROWS[@]}"
+  fi
 
   if "${PYTHON}" "${HELPER}" aggregate \
       --registry "${REGISTRY}" --output "${SUMMARY}" \

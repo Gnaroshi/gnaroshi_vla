@@ -5,6 +5,8 @@ import json
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 from tools.simvla import paper_suite_matrix as matrix
 
 
@@ -124,3 +126,105 @@ def test_validate_row_accepts_legacy_baseline_alias(tmp_path: Path) -> None:
 def test_exact_mcnemar_is_symmetric() -> None:
     assert matrix._mcnemar(3, 9) == matrix._mcnemar(9, 3)
     assert matrix._mcnemar(0, 0) == 1.0
+
+
+def test_aggregate_supports_single_seed_subset(tmp_path: Path) -> None:
+    base = tmp_path / "base.json"
+    manifest_path = tmp_path / "manifests/libero_spatial/seed01/episode_manifest.json"
+    matrix.atomic_json(base, _base_manifest())
+    matrix.prepare_manifest(
+        Namespace(
+            base_manifest=str(base),
+            output=str(manifest_path),
+            suite="libero_spatial",
+            seed="seed01",
+        )
+    )
+    manifest = matrix.load_json(manifest_path)
+    entries = []
+    for row, successes, latency in (
+        ("full_nfe10", 450, 100.0),
+        ("generation_ng3", 455, 70.0),
+    ):
+        root = tmp_path / "rows/libero_spatial/seed01" / row
+        shard = root / "shard_rank0_tasks_0_9"
+        shard.mkdir(parents=True)
+        metrics = shard / "episode_metrics.csv"
+        with metrics.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=(
+                    "row",
+                    "task_id",
+                    "trial_id",
+                    "success",
+                    "episode_length",
+                    "latency_per_executed_action_ms",
+                ),
+            )
+            writer.writeheader()
+            index = 0
+            for task in range(10):
+                for trial in range(50):
+                    writer.writerow(
+                        {
+                            "row": row,
+                            "task_id": task,
+                            "trial_id": trial,
+                            "success": index < successes,
+                            "episode_length": 100,
+                            "latency_per_executed_action_ms": latency,
+                        }
+                    )
+                    index += 1
+        matrix.atomic_json(
+            shard / "shard_summary.json",
+            {
+                "row": row,
+                "episodes": 500,
+                "successes": successes,
+                "manifest_sha256": manifest["manifest_sha256"],
+            },
+        )
+        entries.append(
+            {
+                "suite": "libero_spatial",
+                "seed": "seed01",
+                "row": row,
+                "manifest": str(manifest_path),
+                "path": str(root),
+                "planned_path": str(root),
+                "reused": False,
+                "reuse_validation": None,
+            }
+        )
+    registry_path = tmp_path / "registry.json"
+    matrix.atomic_json(
+        registry_path,
+        {
+            "schema_version": "simvla_paper_selected_matrix_registry_v1",
+            "result_root": str(tmp_path),
+            "suites": ["libero_spatial"],
+            "seeds": ["seed01"],
+            "rows": ["full_nfe10", "generation_ng3"],
+            "cells": 2,
+            "episodes_total_including_reuse": 1000,
+            "episodes_reused": 0,
+            "episodes_to_run": 1000,
+            "entries": entries,
+        },
+    )
+    result = matrix.aggregate(
+        Namespace(
+            registry=str(registry_path),
+            output=str(tmp_path / "summary.json"),
+            allow_partial=False,
+        )
+    )
+    assert result["verdict"] == "PAPER_SELECTED_MATRIX_COMPLETE"
+    assert result["suite_summary"]["libero_spatial"]["full_nfe10"][
+        "seed_sample_std_success_rate"
+    ] is None
+    assert result["paired_vs_full_nfe10"]["libero_spatial"][
+        "generation_ng3"
+    ]["success_rate_delta_percentage_points"] == pytest.approx(1.0)

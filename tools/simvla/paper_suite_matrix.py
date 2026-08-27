@@ -206,7 +206,7 @@ def prepare_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "training_seed_replica": "fixed_generation_step_030000",
                 "same_trained_checkpoint_across_replicas": True,
                 "evaluation_axis": {
-                    "classification": "rb2_egl_four_suite_three_inference_seed",
+                    "classification": "rb2_egl_paper_suite_fixed_inference_seed",
                     "suite": args.suite,
                     "inference_seed": args.seed,
                     "source_locked_policy_code_modified": False,
@@ -218,7 +218,7 @@ def prepare_manifest(args: argparse.Namespace) -> dict[str, Any]:
                     "PYOPENGL_PLATFORM": "egl",
                     "PYTHONHASHSEED": str(determinism_seed),
                     "SIMVLA_RENDER_AXIS": (
-                        f"rb2_egl_paper4suite3seed_{args.suite}_{args.seed}_v1"
+                        f"rb2_egl_paper_suite_{args.suite}_{args.seed}_v2"
                     ),
                 },
             }
@@ -546,13 +546,28 @@ def validate_row(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def _selection(raw: str, allowed: tuple[str, ...], label: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in raw.split(",") if item.strip())
+    if not values:
+        raise ValueError(f"{label} selection is empty")
+    if len(set(values)) != len(values):
+        raise ValueError(f"{label} selection contains duplicates: {values}")
+    unsupported = sorted(set(values) - set(allowed))
+    if unsupported:
+        raise ValueError(f"unsupported {label}: {unsupported}")
+    return values
+
+
 def build_registry(args: argparse.Namespace) -> dict[str, Any]:
     result_root = Path(args.result_root).resolve()
     storage = Path(args.storage).resolve()
+    suites = _selection(args.suites, SUITES, "suite")
+    seeds = _selection(args.seeds, SEEDS, "seed")
+    rows = _selection(args.rows, ROWS, "row")
     manifests = {
         (suite, seed): result_root / "manifests" / suite / seed / "episode_manifest.json"
-        for suite in SUITES
-        for seed in SEEDS
+        for suite in suites
+        for seed in seeds
     }
     long_generation = storage / "results/simvla/latentloop/generation_loop_ng2_rb2_v1/online"
     fixed = storage / "results/simvla/fixed_2x2/kc2_ng3_seed02_v1"
@@ -570,10 +585,10 @@ def build_registry(args: argparse.Namespace) -> dict[str, Any]:
         ("seed03", "naive_nfe3"): naive / "seed03/naive_nfe3",
     }
     entries: list[dict[str, Any]] = []
-    for suite in SUITES:
-        for seed in SEEDS:
+    for suite in suites:
+        for seed in seeds:
             manifest = manifests[(suite, seed)]
-            for row in ROWS:
+            for row in rows:
                 planned = result_root / "rows" / suite / seed / row
                 reused = False
                 path = planned
@@ -597,11 +612,11 @@ def build_registry(args: argparse.Namespace) -> dict[str, Any]:
                     }
                 )
     payload = {
-        "schema_version": "simvla_paper_four_suite_three_seed_registry_v1",
+        "schema_version": "simvla_paper_selected_matrix_registry_v1",
         "result_root": str(result_root),
-        "suites": list(SUITES),
-        "seeds": list(SEEDS),
-        "rows": list(ROWS),
+        "suites": list(suites),
+        "seeds": list(seeds),
+        "rows": list(rows),
         "cells": len(entries),
         "episodes_total_including_reuse": len(entries) * 500,
         "episodes_reused": sum(500 for item in entries if item["reused"]),
@@ -666,26 +681,33 @@ def _paired(
 def aggregate(args: argparse.Namespace) -> dict[str, Any]:
     registry = load_json(args.registry)
     output = Path(args.output).resolve()
+    suites = _selection(",".join(registry["suites"]), SUITES, "suite")
+    seeds = _selection(",".join(registry["seeds"]), SEEDS, "seed")
+    rows = _selection(",".join(registry["rows"]), ROWS, "row")
+    if "full_nfe10" not in rows:
+        raise ValueError("selected matrix must include full_nfe10")
     cell_reports: dict[tuple[str, str, str], dict[str, Any]] = {}
     cell_rows: dict[tuple[str, str, str], list[dict[str, str]]] = {}
     missing: list[dict[str, Any]] = []
     for entry in registry["entries"]:
         key = (entry["suite"], entry["seed"], entry["row"])
-        report, rows = validate_row_data(entry["path"], entry["manifest"], entry["row"])
+        report, episode_rows = validate_row_data(
+            entry["path"], entry["manifest"], entry["row"]
+        )
         report["reused"] = bool(entry["reused"])
         cell_reports[key] = report
-        cell_rows[key] = rows
+        cell_rows[key] = episode_rows
         if report["verdict"] != "PAPER_ROW_PASS":
             missing.append({"suite": key[0], "seed": key[1], "row": key[2], "failures": report["failures"]})
 
     suite_summary: dict[str, Any] = {}
     paired_summary: dict[str, Any] = {}
     if not missing:
-        for suite in SUITES:
+        for suite in suites:
             suite_summary[suite] = {}
             paired_summary[suite] = {}
-            for row in ROWS:
-                reports = [cell_reports[(suite, seed, row)] for seed in SEEDS]
+            for row in rows:
+                reports = [cell_reports[(suite, seed, row)] for seed in seeds]
                 rates = [float(item["success_rate"]) for item in reports]
                 total_successes = sum(int(item["successes"]) for item in reports)
                 total_episodes = sum(int(item["episodes"]) for item in reports)
@@ -700,7 +722,9 @@ def aggregate(args: argparse.Namespace) -> dict[str, Any]:
                     "successes": total_successes,
                     "success_rate": total_successes / total_episodes,
                     "seed_mean_success_rate": statistics.mean(rates),
-                    "seed_sample_std_success_rate": statistics.stdev(rates),
+                    "seed_sample_std_success_rate": (
+                        statistics.stdev(rates) if len(rates) > 1 else None
+                    ),
                     "latency_per_executed_action_ms": latency,
                     "per_seed": {
                         seed: {
@@ -710,16 +734,18 @@ def aggregate(args: argparse.Namespace) -> dict[str, Any]:
                             "latency_per_executed_action_ms": cell_reports[(suite, seed, row)]["latency_per_executed_action_ms"],
                             "reused": cell_reports[(suite, seed, row)]["reused"],
                         }
-                        for seed in SEEDS
+                        for seed in seeds
                     },
                 }
             baseline_outcomes: dict[tuple[int, int, int], bool] = {}
-            for seed_index, seed in enumerate(SEEDS):
+            for seed_index, seed in enumerate(seeds):
                 for item in cell_rows[(suite, seed, "full_nfe10")]:
                     baseline_outcomes[(seed_index, int(item["task_id"]), int(item["trial_id"]))] = _bool(item["success"])
-            for row in ROWS[1:]:
+            for row in rows:
+                if row == "full_nfe10":
+                    continue
                 candidate: dict[tuple[int, int, int], bool] = {}
-                for seed_index, seed in enumerate(SEEDS):
+                for seed_index, seed in enumerate(seeds):
                     for item in cell_rows[(suite, seed, row)]:
                         candidate[(seed_index, int(item["task_id"]), int(item["trial_id"]))] = _bool(item["success"])
                 paired = _paired(baseline_outcomes, candidate)
@@ -737,34 +763,56 @@ def aggregate(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 paired_summary[suite][row] = paired
 
-    four_suite: dict[str, Any] = {}
+    matrix_summary: dict[str, Any] = {}
     if not missing:
-        for row in ROWS:
+        for row in rows:
             per_seed_macro = []
-            for seed in SEEDS:
+            for seed in seeds:
                 per_seed_macro.append(
                     statistics.mean(
                         float(cell_reports[(suite, seed, row)]["success_rate"])
-                        for suite in SUITES
+                        for suite in suites
                     )
                 )
-            four_suite[row] = {
+            matrix_summary[row] = {
                 "macro_success_rate": statistics.mean(
-                    suite_summary[suite][row]["success_rate"] for suite in SUITES
+                    suite_summary[suite][row]["success_rate"] for suite in suites
                 ),
                 "seed_macro_mean_success_rate": statistics.mean(per_seed_macro),
-                "seed_macro_sample_std_success_rate": statistics.stdev(per_seed_macro),
-                "per_seed_macro_success_rate": dict(zip(SEEDS, per_seed_macro)),
+                "seed_macro_sample_std_success_rate": (
+                    statistics.stdev(per_seed_macro)
+                    if len(per_seed_macro) > 1
+                    else None
+                ),
+                "per_seed_macro_success_rate": dict(zip(seeds, per_seed_macro)),
                 "mean_suite_latency_per_executed_action_ms": statistics.mean(
                     suite_summary[suite][row]["latency_per_executed_action_ms"]
-                    for suite in SUITES
+                    for suite in suites
                 ),
             }
 
+    is_full_matrix = suites == SUITES and seeds == SEEDS and rows == ROWS
+    complete_verdict = (
+        "PAPER_FOUR_SUITE_THREE_SEED_COMPLETE"
+        if is_full_matrix
+        else "PAPER_SELECTED_MATRIX_COMPLETE"
+    )
+    incomplete_verdict = (
+        "PAPER_FOUR_SUITE_THREE_SEED_INCOMPLETE"
+        if is_full_matrix
+        else "PAPER_SELECTED_MATRIX_INCOMPLETE"
+    )
     result = {
-        "verdict": "PAPER_FOUR_SUITE_THREE_SEED_COMPLETE" if not missing else "PAPER_FOUR_SUITE_THREE_SEED_INCOMPLETE",
-        "replication_unit": "inference_noise_seed_on_fixed_trained_checkpoints",
+        "verdict": complete_verdict if not missing else incomplete_verdict,
+        "replication_unit": (
+            "inference_noise_seed_on_fixed_trained_checkpoints"
+            if len(seeds) > 1
+            else "single_fixed_inference_seed"
+        ),
         "training_seed_replication": False,
+        "suites": list(suites),
+        "seeds": list(seeds),
+        "rows": list(rows),
         "episodes_per_cell": 500,
         "cells": len(registry["entries"]),
         "total_episodes_including_reuse": len(registry["entries"]) * 500,
@@ -772,7 +820,8 @@ def aggregate(args: argparse.Namespace) -> dict[str, Any]:
         "episodes_run_by_this_pipeline": registry["episodes_to_run"],
         "suite_summary": suite_summary,
         "paired_vs_full_nfe10": paired_summary,
-        "four_suite_summary": four_suite,
+        "matrix_summary": matrix_summary,
+        "four_suite_summary": matrix_summary if is_full_matrix else {},
         "cell_reports": {"|".join(key): value for key, value in cell_reports.items()},
         "missing_or_invalid": missing,
     }
@@ -824,6 +873,9 @@ def build_parser() -> argparse.ArgumentParser:
     registry.add_argument("--result-root", required=True)
     registry.add_argument("--storage", required=True)
     registry.add_argument("--output", required=True)
+    registry.add_argument("--suites", default=",".join(SUITES))
+    registry.add_argument("--seeds", default=",".join(SEEDS))
+    registry.add_argument("--rows", default=",".join(ROWS))
     registry.set_defaults(handler=build_registry)
 
     find = commands.add_parser("lookup")
