@@ -9,13 +9,13 @@ if [[ ${SIMVLA_ACTION_REFRESH_3SEED_RUN:-0} != 1 ]]; then
 fi
 
 ROOT=${SIMVLA_ACTION_REFRESH_ROOT:-/home/mingyujung/private/gnaroshi_vla_worktrees/simvla_action_refresh_3seed_rb2}
-FIXED_ROOT=/home/mingyujung/private/gnaroshi_vla_worktrees/simvla_fixed_2x2
 UPSTREAM=/home/mingyujung/private/gnaroshi_vla/architectures/simvla/upstream
 STORAGE=/home/mingyujung/private/gnaroshi_vla_storage
 PYTHON=${STORAGE}/envs/simvla/libero_mujoco237/bin/python
 LIBERO_ROOT=${STORAGE}/datasets/LIBERO
 LIBERO_CONFIG=${STORAGE}/results/simvla/reproduction/official_ckpt_mujoco237_official_norm_seed7_n50_r2/runtime/libero_config
 EXPECTED_COMMIT=${SIMVLA_ACTION_REFRESH_EXPECTED_COMMIT:-}
+MAX_ATTEMPTS=${SIMVLA_ACTION_REFRESH_MAX_ATTEMPTS:-3}
 MODE=${1:---all}
 
 OUTPUT=${SIMVLA_ACTION_REFRESH_3SEED_OUTPUT:-${STORAGE}/results/simvla/action_equivalent_refresh/three_seed_long500_v1}
@@ -24,7 +24,8 @@ RISK=${OFFLINE}/risk_head_2k/action_fidelity_head.pt
 INPUTS=${STORAGE}/artifacts/simvla/fixed_2x2_inputs_v1
 FIXED_BUNDLE=${INPUTS}/generation_bundle
 CONDITION=${INPUTS}/condition/native_v0_step_150000.pt
-FIXED_SOURCE=${INPUTS}/fixed_2x2_source_lock.json
+BASE_FIXED_SOURCE=${INPUTS}/fixed_2x2_source_lock.json
+BASE_CONTROL_MANIFEST=${FIXED_BUNDLE}/transfer_manifest.json
 GENERATION_BUNDLE=${STORAGE}/artifacts/simvla/generation_eval_bundle_20260824_v1
 GENERATION=${GENERATION_BUNDLE}/checkpoint/generation_step_030000.pt
 NORM=${GENERATION_BUNDLE}/norm/libero_norm_official_32700d0.json
@@ -48,6 +49,9 @@ LOGS=${OUTPUT}/logs
 GATES=${OUTPUT}/gates
 FAILED=${OUTPUT}/failed_attempts
 STATUS=${OUTPUT}/pipeline.status
+PROVENANCE=${OUTPUT}/provenance
+FIXED_SOURCE=${PROVENANCE}/fixed_eval_source_lock.json
+CONTROL_MANIFEST=${PROVENANCE}/control_manifest.json
 mkdir -p "${LOGS}" "${GATES}" "${FAILED}"
 
 export SIMVLA_UPSTREAM_ROOT=${UPSTREAM}
@@ -83,15 +87,49 @@ fail() {
 
 [[ ${MODE} == --all || ${MODE} == --preflight ]] || { fail "usage: $0 [--preflight|--all]" 2; exit 2; }
 [[ -n ${EXPECTED_COMMIT} ]] || { fail "SIMVLA_ACTION_REFRESH_EXPECTED_COMMIT is required" 2; exit 2; }
-for path in "${PYTHON}" "${ROOT}" "${FIXED_ROOT}" "${UPSTREAM}" "${LIBERO_ROOT}" \
-  "${OFFLINE}/pipeline.status" "${RISK}" "${CONDITION}" "${FIXED_SOURCE}" \
+[[ ${MAX_ATTEMPTS} =~ ^[1-9][0-9]*$ ]] || { fail "SIMVLA_ACTION_REFRESH_MAX_ATTEMPTS must be a positive integer" 2; exit 2; }
+for path in "${PYTHON}" "${ROOT}" "${UPSTREAM}" "${LIBERO_ROOT}" \
+  "${OFFLINE}/pipeline.status" "${RISK}" "${CONDITION}" "${BASE_FIXED_SOURCE}" \
+  "${BASE_CONTROL_MANIFEST}" \
   "${GENERATION}" "${NORM}"; do
   [[ -e ${path} ]] || { fail "missing required path: ${path}" 2; exit 2; }
 done
 observed_commit=$(git -C "${ROOT}" rev-parse HEAD) || exit 2
 [[ ${observed_commit} == "${EXPECTED_COMMIT}" ]] || { fail "commit ${observed_commit} != ${EXPECTED_COMMIT}" 2; exit 2; }
 [[ -z $(git -C "${ROOT}" status --porcelain --untracked-files=no) ]] || { fail "tracked worktree changes are present" 2; exit 2; }
-[[ $(git -C "${FIXED_ROOT}" rev-parse HEAD) == df212bb87ee73480dfea9563dd4f8dc5899992ce ]] || { fail "fixed-2x2 worktree commit changed" 2; exit 2; }
+
+prepare_periodic_provenance() {
+  if [[ -s ${FIXED_SOURCE} && -s ${CONTROL_MANIFEST} ]] && \
+    COMMIT=${EXPECTED_COMMIT} FIXED_SOURCE=${FIXED_SOURCE} "${PYTHON}" - <<'PY' >/dev/null 2>&1
+import json, os
+d=json.load(open(os.environ['FIXED_SOURCE'], encoding='utf-8'))
+assert d['root_commit']==os.environ['COMMIT']
+assert d['file_sha256']
+PY
+  then
+    record "periodic_provenance=resume_skip commit=${EXPECTED_COMMIT}"
+    return 0
+  fi
+  if [[ -e ${PROVENANCE} ]]; then
+    mv "${PROVENANCE}" "${FAILED}/provenance_$(date +%s)"
+  fi
+  cd "${ROOT}" || return 1
+  CUDA_VISIBLE_DEVICES='' "${PYTHON}" -m \
+    architectures.simvla.adapters.latentloop.efficient_multirate.coupled_source_lock \
+    --base-fixed-source-lock "${BASE_FIXED_SOURCE}" \
+    --base-control-manifest "${BASE_CONTROL_MANIFEST}" \
+    --output "${PROVENANCE}" \
+    >"${LOGS}/prepare_periodic_provenance.log" 2>&1 || return 1
+  COMMIT=${EXPECTED_COMMIT} FIXED_SOURCE=${FIXED_SOURCE} CONTROL_MANIFEST=${CONTROL_MANIFEST} \
+    "${PYTHON}" - <<'PY'
+import json, os
+fixed=json.load(open(os.environ['FIXED_SOURCE'], encoding='utf-8'))
+control=json.load(open(os.environ['CONTROL_MANIFEST'], encoding='utf-8'))
+assert fixed['root_commit']==os.environ['COMMIT']
+assert fixed['file_sha256'] and control['control_file_sha256']
+print('PERIODIC_PROVENANCE_PASS', fixed['root_commit'])
+PY
+}
 
 wait_for_gpu() {
   while true; do
@@ -202,8 +240,8 @@ ensure_parity() {
   fi
   [[ ! -e ${path} ]] || mv "${path}" "${FAILED}/${seed}_fixed_2x2_parity_$(date +%s).json"
   set_seed_runtime "${seed}" || return 1
-  cd "${FIXED_ROOT}" || return 1
-  PYTHONPATH="${FIXED_ROOT}:${UPSTREAM}:${LIBERO_ROOT}" CUDA_VISIBLE_DEVICES=0 "${PYTHON}" \
+  cd "${ROOT}" || return 1
+  PYTHONPATH="${ROOT}:${UPSTREAM}:${LIBERO_ROOT}" CUDA_VISIBLE_DEVICES=0 "${PYTHON}" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_parity \
     --output "${path}" --manifest "${MANIFESTS[$seed]}" \
     --expected-manifest-sha256 "${MANIFEST_SHAS[$seed]}" \
@@ -241,18 +279,19 @@ run_periodic_once() {
     [[ ! -e ${root}.egl_preflight.json ]] || mv "${root}.egl_preflight.json" "${archive}/egl_preflight.json"
   fi
   set_seed_runtime "${seed}" || return 1
-  cd "${FIXED_ROOT}" || return 1
+  cd "${ROOT}" || return 1
   export SIMVLA_FIXED_2X2_RUN=1
-  export SIMVLA_FIXED_2X2_ROOT=${FIXED_ROOT}
+  export SIMVLA_FIXED_2X2_ROOT=${ROOT}
   export SIMVLA_FIXED_2X2_PYTHON=${PYTHON}
   export SIMVLA_UPSTREAM_ROOT=${UPSTREAM}
-  PYTHONPATH="${FIXED_ROOT}:${UPSTREAM}:${LIBERO_ROOT}" \
+  PYTHONPATH="${ROOT}:${UPSTREAM}:${LIBERO_ROOT}" \
     bash architectures/simvla/wrappers/run_fixed_2x2_single_gpu_row.sh \
       --row condition_kc3_ng3 --output "${root}" \
       --manifest "${MANIFESTS[$seed]}" --manifest-sha256 "${MANIFEST_SHAS[$seed]}" \
       --bundle-root "${FIXED_BUNDLE}" --condition-checkpoint "${CONDITION}" \
       --source-lock "${FIXED_SOURCE}" --parity-gate "${GATES}/${seed}/fixed_2x2_parity.json" \
-      --physical-gpu-id 0 --classification RB2_CONFIRMATORY_EGL \
+      --control-manifest "${CONTROL_MANIFEST}" \
+      --physical-gpu-id 0 --classification HOST_LOCAL_EGL_DIAGNOSTIC \
       --inference-seed "${seed}" --save-failure-videos \
       >"${LOGS}/${seed}_periodic_kc3_ng3.log" 2>&1
 }
@@ -302,6 +341,14 @@ run_until_complete() {
       record "label=${label} seed=${seed} attempt=${attempt} state=complete child_rc=${rc}"
       return 0
     fi
+    if (( rc == 2 )); then
+      record "label=${label} seed=${seed} attempt=${attempt} state=deterministic_configuration_failure child_rc=2"
+      return 2
+    fi
+    if (( attempt >= MAX_ATTEMPTS )); then
+      record "label=${label} seed=${seed} attempt=${attempt} state=retry_budget_exhausted child_rc=${rc}"
+      return 1
+    fi
     record "label=${label} seed=${seed} attempt=${attempt} state=incomplete child_rc=${rc} retry=60s"
     sleep 60
   done
@@ -324,6 +371,7 @@ aggregate_seed() {
 }
 
 validate_input_axis || { fail "3-seed input-axis validation failed" 2; exit 2; }
+prepare_periodic_provenance || { fail "periodic evaluator provenance preparation failed" 2; exit 2; }
 wait_for_gpu || { fail "cannot query rb2 GPU0" 2; exit 2; }
 for seed in seed01 seed02 seed03; do
   set_seed_runtime "${seed}" || { fail "renderer contract failed for ${seed}" 2; exit 2; }
@@ -334,12 +382,19 @@ if [[ ${MODE} == --preflight ]]; then
   printf 'ACTION_EQUIVALENT_REFRESH_3SEED_PREFLIGHT_PASS\n' | tee "${STATUS}"
   exit 0
 fi
+printf 'ACTION_EQUIVALENT_REFRESH_3SEED_RUNNING\n' | tee "${STATUS}"
 
 # Distinct seeds first. Seed02 runs last because the same seed is already in
 # progress on sd1, while rb2 measurements remain host-local for latency.
 for seed in seed01 seed03 seed02; do
-  run_until_complete periodic_kc3_ng3 periodic_complete run_periodic_once "${seed}"
-  run_until_complete action_equivalent_refresh_ng3 action_complete run_action_once "${seed}"
+  run_until_complete periodic_kc3_ng3 periodic_complete run_periodic_once "${seed}" || {
+    fail "periodic_kc3_ng3 failed for ${seed}"
+    exit 1
+  }
+  run_until_complete action_equivalent_refresh_ng3 action_complete run_action_once "${seed}" || {
+    fail "action_equivalent_refresh_ng3 failed for ${seed}"
+    exit 1
+  }
   aggregate_seed "${seed}" || { fail "per-seed aggregation failed for ${seed}"; exit 1; }
   record "seed=${seed} paired_aggregation=complete"
 done
