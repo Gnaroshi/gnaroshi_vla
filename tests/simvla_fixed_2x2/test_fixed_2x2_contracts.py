@@ -8,6 +8,7 @@ from collections import defaultdict, deque
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggregate import (
@@ -167,7 +168,12 @@ def test_evaluate_shard_does_not_shadow_row_contract_with_episode_spec() -> None
     assert shadowing_targets == []
 
 
-def test_completed_row_postprocessing_is_recoverable(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "host_verdict", ("SD1_FIXED_SHARD_PASS", "CONFIRMATORY_SHARD_PASS")
+)
+def test_completed_row_postprocessing_is_recoverable(
+    tmp_path, host_verdict: str
+) -> None:
     row_name = naive_condition_row_name(2, 3)
     shard = tmp_path / "shard"
     merged = tmp_path / "merged"
@@ -218,7 +224,9 @@ def test_completed_row_postprocessing_is_recoverable(tmp_path) -> None:
         encoding="utf-8",
     )
     (shard / "host_shard_contract.json").write_text(
-        '{"verdict":"SD1_FIXED_SHARD_PASS","physical_gpu_id":4,'
+        '{"verdict":"'
+        + host_verdict
+        + '","physical_gpu_id":4,'
         '"task_ids":[0,1,2,3,4,5,6,7,8,9]}\n',
         encoding="utf-8",
     )

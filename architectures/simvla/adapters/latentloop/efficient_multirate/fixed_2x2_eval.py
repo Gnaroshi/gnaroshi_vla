@@ -55,6 +55,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_hid
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_eval import (
     SynchronizedGenerationN_G3Policy,
+    SynchronizedNaiveNFE3Policy,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_contracts import (
     FROZEN_CONDITION_CHECKPOINT_SHA256,
@@ -63,6 +64,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_cont
 from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
     EVAL_ROWS,
     expected_call_counts,
+    is_frontier_row,
     row_spec,
 )
 from architectures.simvla.adapters.latentloop.native_v0_long_eval import (
@@ -198,8 +200,8 @@ class SynchronizedConditionNaiveNFEPolicy(SynchronizedConditionK_CPolicy):
     """Condition updater plus native SimVLA Euler integration at reduced NFE."""
 
     def __init__(self, *, nfe: int, **kwargs: Any) -> None:
-        if int(nfe) not in {2, 3}:
-            raise ValueError("naive control requires NFE in {2,3}")
+        if int(nfe) not in {2, 3, 5}:
+            raise ValueError("naive control requires NFE in {2,3,5}")
         super().__init__(**kwargs)
         self.nfe = int(nfe)
 
@@ -250,8 +252,8 @@ class SynchronizedCombinedK_CN_GPolicy(SynchronizedConditionK_CPolicy):
         row_name: str | None = None,
         **kwargs: Any,
     ) -> None:
-        if int(n_g) not in {2, 3}:
-            raise ValueError("combined learned generation requires N_G in {2,3}")
+        if int(n_g) not in {2, 3, 5}:
+            raise ValueError("combined learned generation requires N_G in {2,3,5}")
         _ensure_generation_latency_schema()
         combined_row = row_name or f"condition_kc{int(k_c)}_ng{int(n_g)}"
         super().__init__(k_c=k_c, row_name=combined_row, **kwargs)
@@ -279,17 +281,18 @@ class SynchronizedCombinedK_CN_GPolicy(SynchronizedConditionK_CPolicy):
         )
 
 
-class SynchronizedCoupledK_CN_G3Policy(SynchronizedCombinedK_CN_GPolicy):
-    """K_C in {2,3} and N_G=3 with the Condition updater's real c_j."""
+class SynchronizedCoupledK_CN_GPolicy(SynchronizedCombinedK_CN_GPolicy):
+    """K_C in {2,3} and N_G in {2,3,5} with the Condition updater's real c_j."""
 
     def __init__(
         self,
         *,
         k_c: int,
+        n_g: int,
         row_name: str,
         **kwargs: Any,
     ) -> None:
-        super().__init__(k_c=k_c, n_g=3, row_name=row_name, **kwargs)
+        super().__init__(k_c=k_c, n_g=n_g, row_name=row_name, **kwargs)
         self._active_condition_change_code: torch.Tensor | None = None
         self.condition_change_code_norms: list[float] = []
 
@@ -431,6 +434,17 @@ class SynchronizedCoupledK_CN_G3Policy(SynchronizedCombinedK_CN_GPolicy):
 SynchronizedConditionK_C2Policy = SynchronizedConditionK_CPolicy
 SynchronizedCombinedK_CN_G3Policy = SynchronizedCombinedK_CN_GPolicy
 SynchronizedCombinedK_C2N_G3Policy = SynchronizedCombinedK_CN_GPolicy
+SynchronizedCoupledK_CN_G3Policy = SynchronizedCoupledK_CN_GPolicy
+
+
+class SynchronizedNaiveNFEPolicy(SynchronizedNaiveNFE3Policy):
+    """Full-condition native SimVLA control at an explicit NFE schedule."""
+
+    def __init__(self, *, nfe: int, **kwargs: Any) -> None:
+        if int(nfe) not in {2, 3, 5}:
+            raise ValueError("naive full-condition control requires NFE in {2,3,5}")
+        self.NFE = int(nfe)
+        super().__init__(**kwargs)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -676,6 +690,13 @@ def _make_policy(
             row_name=FULL_ROW,
         )
     if spec.naive_nfe:
+        if spec.k_c == 1:
+            return SynchronizedNaiveNFEPolicy(
+                **full_common,
+                flow_steps=10,
+                row_name=row,
+                nfe=spec.n_g,
+            )
         if condition_updater is None:
             raise RuntimeError("naive condition row requires the frozen Condition updater")
         return SynchronizedConditionNaiveNFEPolicy(
@@ -692,7 +713,7 @@ def _make_policy(
             k_c=spec.k_c,
             row_name=row,
         )
-    if row == GENERATION_ROW:
+    if spec.uses_generation and not spec.uses_condition and not spec.coupled:
         if generation_updater is None:
             raise RuntimeError("Generation row requires the frozen Generation updater")
         _ensure_generation_latency_schema()
@@ -700,7 +721,7 @@ def _make_policy(
             model=model,
             processor=processor,
             updater=generation_updater,
-            n_g=3,
+            n_g=spec.n_g,
             device=device,
             suite=suite,
             task_id=task_id,
@@ -725,10 +746,11 @@ def _make_policy(
             raise RuntimeError("coupled row requires the frozen Condition updater")
         if generation_updater is None:
             raise RuntimeError("coupled row requires the trained c_j projection")
-        return SynchronizedCoupledK_CN_G3Policy(
+        return SynchronizedCoupledK_CN_GPolicy(
             **condition_common,
             generation_updater=generation_updater,
             k_c=spec.k_c,
+            n_g=spec.n_g,
             row_name=row,
         )
     raise ValueError(f"unsupported row: {row}")
@@ -744,7 +766,6 @@ def _validate_fixed_2x2_counters(
     generation_loop_updates: int,
 ) -> dict[str, Any]:
     queries = int(policy_queries)
-    spec = row_spec(row)
     expected = expected_call_counts(row, queries)
     observed = {
         "full_vlm_calls": int(full_vlm_calls),
@@ -755,8 +776,7 @@ def _validate_fixed_2x2_counters(
         + int(generation_loop_updates),
     }
     checks = {name: observed[name] == value for name, value in expected.items()}
-    is_fixed_row = not (spec.k_c > 2 or spec.n_g == 2 or spec.naive_nfe)
-    prefix = "FIXED_2X2" if is_fixed_row else "KC_FRONTIER"
+    prefix = "KC_FRONTIER" if is_frontier_row(row) else "FIXED_2X2"
     return {
         "verdict": f"{prefix}_COUNTER_PASS" if all(checks.values()) else f"{prefix}_COUNTER_FAIL",
         "row": row,
@@ -870,7 +890,8 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         specs = [item for item in manifest["episodes"] if int(item["task_id"]) == task_id]
         if len(specs) != int(manifest["trials_per_task"]):
             raise RuntimeError(f"task {task_id} does not have exactly 50 manifest episodes")
-        specs_by_task[task_id] = sorted(specs, key=lambda item: int(item["trial_id"]))
+        ordered = sorted(specs, key=lambda item: int(item["trial_id"]))
+        specs_by_task[task_id] = ordered[: int(args.episodes_per_task_limit)]
 
     output.mkdir(parents=True)
     atomic_write_json(output / "frozen_provenance.json", provenance)
@@ -1000,7 +1021,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
     suite = benchmark.get_benchmark_dict()[str(manifest["suite"])]()
     episode_rows: list[dict[str, Any]] = []
     action_chunk_rows: list[dict[str, Any]] = []
-    assigned_total = len(task_ids) * int(manifest["trials_per_task"])
+    assigned_total = sum(len(specs) for specs in specs_by_task.values())
     progress = tqdm(
         total=assigned_total,
         desc=f"{args.row} gpu{physical_gpu_id}",
@@ -1197,11 +1218,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         writer.writeheader()
         writer.writerows(episode_rows)
     _save_action_chunks(output / "action_chunks.npz", action_chunk_rows)
-    is_frontier = (
-        row_contract.k_c > 2
-        or row_contract.n_g == 2
-        or row_contract.naive_nfe
-    )
+    is_frontier = is_frontier_row(args.row)
     summary = {
         "verdict": "KC_FRONTIER_SHARD_PASS" if is_frontier else "FIXED_2X2_SHARD_PASS",
         "row": args.row,
@@ -1302,6 +1319,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--smolvlm-model", default=DEFAULT_SMOLVLM)
     parser.add_argument("--tqdm-mininterval", type=float, default=1.0)
+    parser.add_argument(
+        "--episodes-per-task-limit", type=int, choices=range(1, 51), default=50
+    )
     parser.add_argument("--save-video", action="store_true")
     parser.add_argument("--video-failures-only", action="store_true")
     parser.add_argument("--video-stride", type=int, default=2)

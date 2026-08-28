@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import argparse
 from pathlib import Path
@@ -21,6 +22,11 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_con
 
 
 ROOT = Path(__file__).resolve().parents[5]
+UPSTREAM = Path(
+    os.environ.get(
+        "SIMVLA_UPSTREAM_ROOT", ROOT / "architectures" / "simvla" / "upstream"
+    )
+).expanduser().resolve()
 SOURCE_FILES = (
     "architectures/simvla/adapters/latentloop/efficient_multirate/coupled_condition_generation.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/coupled_condition_parity.py",
@@ -31,11 +37,13 @@ SOURCE_FILES = (
     "architectures/simvla/adapters/latentloop/efficient_multirate/fixed_2x2_eval.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/kc_frontier_aggregate.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/kc_frontier_contracts.py",
+    "architectures/simvla/adapters/latentloop/efficient_multirate/paper_grid.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/joint_nfe_aggregate.py",
     "architectures/simvla/adapters/latentloop/efficient_multirate/row_postprocess_recovery.py",
     "architectures/simvla/wrappers/run_coupled_condition_generation.sh",
     "architectures/simvla/wrappers/run_coupled_kc3_condition_generation.sh",
     "architectures/simvla/wrappers/run_fixed_2x2_single_gpu_row.sh",
+    "architectures/simvla/wrappers/run_paper_grid_seed02_rb2.sh",
     "architectures/simvla/wrappers/run_kc_efficiency_frontier_sd1.sh",
     "architectures/simvla/wrappers/run_joint_nfe_frontier_sd1.sh",
 )
@@ -75,7 +83,7 @@ def build_coupled_source_lock(
         "schema_version": "simvla_condition_generation_coupling_source_v1",
         "root_commit": _git("rev-parse", "HEAD"),
         "upstream_commit": _git(
-            "-C", str(ROOT / "architectures" / "simvla" / "upstream"), "rev-parse", "HEAD"
+            "-C", str(UPSTREAM), "rev-parse", "HEAD"
         ),
         "source_file_sha256": files,
         "parent_generation_source_combined_sha256": FROZEN_GENERATION_SOURCE_SHA256,
