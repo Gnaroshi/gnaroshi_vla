@@ -603,6 +603,37 @@ def _parse_task_ids(text: str) -> tuple[int, ...]:
     return values
 
 
+def _select_episode_specs(
+    manifest: dict[str, Any],
+    task_ids: Sequence[int],
+    *,
+    episodes_per_task_limit: int = 0,
+) -> dict[int, list[dict[str, Any]]]:
+    """Validate the immutable manifest, then optionally select a smoke prefix."""
+    limit = int(episodes_per_task_limit)
+    trials_per_task = int(manifest["trials_per_task"])
+    if limit < 0 or limit > trials_per_task:
+        raise ValueError(
+            "episodes_per_task_limit must be in "
+            f"[0, {trials_per_task}], got {limit}"
+        )
+    selected: dict[int, list[dict[str, Any]]] = {}
+    for task_id in task_ids:
+        specs = [
+            item
+            for item in manifest["episodes"]
+            if int(item["task_id"]) == int(task_id)
+        ]
+        if len(specs) != trials_per_task:
+            raise RuntimeError(
+                f"task {task_id} does not have exactly "
+                f"{trials_per_task} manifest episodes"
+            )
+        specs = sorted(specs, key=lambda item: int(item["trial_id"]))
+        selected[int(task_id)] = specs[:limit] if limit else specs
+    return selected
+
+
 def _validate_sd1_fixed_shard(
     physical_gpu_id: int, task_ids: Sequence[int]
 ) -> dict[str, Any]:
@@ -897,12 +928,11 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
             "runtime does not match immutable renderer/determinism manifest: "
             + json.dumps(renderer_mismatches, sort_keys=True)
         )
-    specs_by_task: dict[int, list[dict[str, Any]]] = {}
-    for task_id in task_ids:
-        specs = [item for item in manifest["episodes"] if int(item["task_id"]) == task_id]
-        if len(specs) != int(manifest["trials_per_task"]):
-            raise RuntimeError(f"task {task_id} does not have exactly 50 manifest episodes")
-        specs_by_task[task_id] = sorted(specs, key=lambda item: int(item["trial_id"]))
+    specs_by_task = _select_episode_specs(
+        manifest,
+        task_ids,
+        episodes_per_task_limit=int(args.episodes_per_task_limit),
+    )
 
     output.mkdir(parents=True)
     atomic_write_json(output / "frozen_provenance.json", provenance)
@@ -1029,7 +1059,7 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
     episode_rows: list[dict[str, Any]] = []
     action_chunk_rows: list[dict[str, Any]] = []
     query_trace_rows: list[dict[str, Any]] = []
-    assigned_total = len(task_ids) * int(manifest["trials_per_task"])
+    assigned_total = sum(len(specs) for specs in specs_by_task.values())
     progress = tqdm(
         total=assigned_total,
         desc=f"{args.row} gpu{physical_gpu_id}",
@@ -1306,6 +1336,12 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
         "inference_seed": args.inference_seed,
         "physical_gpu_id": physical_gpu_id,
         "task_ids": list(task_ids),
+        "episodes_per_task_limit": int(args.episodes_per_task_limit),
+        "evaluation_scope": (
+            "bounded_runtime_smoke"
+            if int(args.episodes_per_task_limit) > 0
+            else "full_manifest"
+        ),
         "episodes": len(episode_rows),
         "successes": sum(int(item["success"]) for item in episode_rows),
         "success_rate": float(np.mean([item["success"] for item in episode_rows])),
@@ -1392,6 +1428,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--egl-preflight", required=True)
     parser.add_argument("--physical-gpu-id", type=int, required=True)
     parser.add_argument("--task-ids", required=True)
+    parser.add_argument(
+        "--episodes-per-task-limit",
+        type=int,
+        default=0,
+        help="Use only the first N validated manifest episodes per task; 0 runs all.",
+    )
     parser.add_argument(
         "--classification",
         choices=("HOST_LOCAL_EGL_DIAGNOSTIC", "RB2_CONFIRMATORY_EGL"),

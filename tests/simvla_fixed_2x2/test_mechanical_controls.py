@@ -3,11 +3,13 @@ from __future__ import annotations
 import csv
 import json
 from collections import defaultdict, deque
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval import (
+    _select_episode_specs,
     _validate_fixed_2x2_counters,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
@@ -54,6 +56,32 @@ def test_mechanical_control_counter_contracts() -> None:
             observation_encoder_calls=0,
         )
         assert gate["verdict"] == "MECHANICAL_CONTROL_COUNTER_PASS"
+
+
+def test_runtime_smoke_selects_prefix_after_full_manifest_validation() -> None:
+    manifest = {
+        "trials_per_task": 3,
+        "episodes": [
+            {"task_id": task, "trial_id": trial}
+            for task in range(2)
+            for trial in (2, 0, 1)
+        ],
+    }
+    selected = _select_episode_specs(
+        manifest, (0, 1), episodes_per_task_limit=1
+    )
+    assert [item["trial_id"] for item in selected[0]] == [0]
+    assert [item["trial_id"] for item in selected[1]] == [0]
+
+
+def test_row_wrapper_passes_explicit_libero_root_to_evaluator() -> None:
+    root = Path(__file__).resolve().parents[2]
+    wrapper = (
+        root / "architectures/simvla/wrappers/run_fixed_2x2_single_gpu_row.sh"
+    ).read_text(encoding="utf-8")
+    assert "LIBERO_ROOT=${SIMVLA_LIBERO_ROOT:?Set SIMVLA_LIBERO_ROOT}" in wrapper
+    assert 'export PYTHONPATH="$ROOT:$UPSTREAM:$LIBERO_ROOT:' in wrapper
+    assert "LIBERO_RUNTIME_IMPORT_PASS" in wrapper
 
 
 def _bare_policy(mode: str) -> SynchronizedMechanicalControlPolicy:

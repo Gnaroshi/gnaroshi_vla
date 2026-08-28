@@ -107,7 +107,10 @@ source_audit() {
   fi
   PYTHONPATH="${ROOT}:${UPSTREAM}:${LIBERO_ROOT}" "${PYTHON}" - <<'PY'
 from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import MECHANICAL_CONTROL_ROWS
+from libero.libero import benchmark
+
 assert len(MECHANICAL_CONTROL_ROWS) == 4
+assert "libero_10" in benchmark.get_benchmark_dict()
 print("MECHANICAL_CONTROL_IMPORT_PASS")
 PY
   log "source_artifact_import_audit_pass commit=${observed}"
@@ -118,6 +121,7 @@ set_runtime() {
   export SIMVLA_FIXED_2X2_ROOT=${ROOT}
   export SIMVLA_FIXED_2X2_PYTHON=${PYTHON}
   export SIMVLA_UPSTREAM_ROOT=${UPSTREAM}
+  export SIMVLA_LIBERO_ROOT=${LIBERO_ROOT}
   export LIBERO_CONFIG_PATH=${LIBERO_CONFIG}
   export HF_HOME=${STORAGE}/cache/simvla/huggingface
   export HF_HUB_OFFLINE=1
@@ -182,6 +186,43 @@ quarantine() {
   local destination=${FAILED_ROOT}/${label}_$(date +%Y%m%d_%H%M%S)_$$
   mv "${path}" "${destination}"
   log "quarantined label=${label} destination=${destination}"
+}
+
+runtime_smoke() {
+  local row output rc expected
+  expected=$(manifest_sha) || return 1
+  for row in "${ROWS[@]}"; do
+    output=${RESULT}/runtime_smoke/${row}
+    quarantine "${output}" "runtime_smoke_${row}"
+    quarantine "${output}.egl_preflight.json" "runtime_smoke_${row}_preflight"
+    wait_for_isolated_gpu || return 1
+    set_runtime || return 1
+    export SIMVLA_FIXED_2X2_RUN=1
+    log "runtime_smoke_start row=${row} episodes=1"
+    bash "${ROOT}/architectures/simvla/wrappers/run_fixed_2x2_single_gpu_row.sh" \
+      --row "${row}" \
+      --output "${output}" \
+      --manifest "${MANIFEST}" \
+      --manifest-sha256 "${expected}" \
+      --bundle-root "${BUNDLE}" \
+      --condition-checkpoint "${CONDITION_CHECKPOINT}" \
+      --source-lock "${SOURCE_LOCK}" \
+      --control-manifest "${BUNDLE}/transfer_manifest.json" \
+      --parity-gate "${PARITY_GATE}" \
+      --physical-gpu-id "${GPU_ID}" \
+      --classification RB2_CONFIRMATORY_EGL \
+      --inference-seed seed02 \
+      --task-ids 0 \
+      --episodes-per-task-limit 1 \
+      2>&1 | tee -a "${LOG_ROOT}/runtime_smoke_${row}.log"
+    rc=${PIPESTATUS[0]}
+    if ((rc != 0)); then
+      log "runtime_smoke_failed row=${row} rc=${rc}"
+      return "${rc}"
+    fi
+    log "runtime_smoke_complete row=${row}"
+  done
+  log "runtime_smoke_suite_complete rows=${#ROWS[@]}"
 }
 
 run_row() {
@@ -254,6 +295,10 @@ main() {
     log "preflight_complete"
     return 0
   fi
+  runtime_smoke || {
+    printf 'MECHANICAL_CONTROL_FAILED stage=runtime_smoke\n' > "${STATUS}"
+    return 1
+  }
   local row
   for row in "${ROWS[@]}"; do
     run_row "${row}" || {
