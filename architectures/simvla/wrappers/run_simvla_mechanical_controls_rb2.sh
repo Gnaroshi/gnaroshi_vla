@@ -105,7 +105,8 @@ source_audit() {
     log "PREFLIGHT_FAIL staged_runtime_files_dirty"
     return 1
   fi
-  PYTHONPATH="${ROOT}:${UPSTREAM}:${LIBERO_ROOT}" "${PYTHON}" - <<'PY'
+  if ! LIBERO_CONFIG_PATH="${LIBERO_CONFIG}" \
+    PYTHONPATH="${ROOT}:${UPSTREAM}:${LIBERO_ROOT}" "${PYTHON}" - <<'PY'
 from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import MECHANICAL_CONTROL_ROWS
 from libero.libero import benchmark
 
@@ -113,6 +114,10 @@ assert len(MECHANICAL_CONTROL_ROWS) == 4
 assert "libero_10" in benchmark.get_benchmark_dict()
 print("MECHANICAL_CONTROL_IMPORT_PASS")
 PY
+  then
+    log "PREFLIGHT_FAIL runtime_import"
+    return 1
+  fi
   log "source_artifact_import_audit_pass commit=${observed}"
 }
 

@@ -80,6 +80,7 @@ def test_row_wrapper_passes_explicit_libero_root_to_evaluator() -> None:
         root / "architectures/simvla/wrappers/run_fixed_2x2_single_gpu_row.sh"
     ).read_text(encoding="utf-8")
     assert "LIBERO_ROOT=${SIMVLA_LIBERO_ROOT:?Set SIMVLA_LIBERO_ROOT}" in wrapper
+    assert "LIBERO_CONFIG=${LIBERO_CONFIG_PATH:?Set LIBERO_CONFIG_PATH}" in wrapper
     assert 'export PYTHONPATH="$ROOT:$UPSTREAM:$LIBERO_ROOT:' in wrapper
     assert "LIBERO_RUNTIME_IMPORT_PASS" in wrapper
 
