@@ -5,8 +5,8 @@ set -uo pipefail
 
 MODE=${1:---all}
 case "${MODE}" in
-  --all|--preflight) ;;
-  *) echo "usage: $0 [--all|--preflight]" >&2; exit 2 ;;
+  --all|--preflight|--runtime-smoke) ;;
+  *) echo "usage: $0 [--all|--preflight|--runtime-smoke]" >&2; exit 2 ;;
 esac
 
 if [[ "${SIMVLA_MECHANICAL_CONTROL_RUN:-0}" != "1" ]]; then
@@ -304,6 +304,11 @@ main() {
     printf 'MECHANICAL_CONTROL_FAILED stage=runtime_smoke\n' > "${STATUS}"
     return 1
   }
+  if [[ "${MODE}" == "--runtime-smoke" ]]; then
+    printf 'MECHANICAL_CONTROL_RUNTIME_SMOKE_PASS\n' > "${STATUS}"
+    log "runtime_smoke_only_complete"
+    return 0
+  fi
   local row
   for row in "${ROWS[@]}"; do
     run_row "${row}" || {
