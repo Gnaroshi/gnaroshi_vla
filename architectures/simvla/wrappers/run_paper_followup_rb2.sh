@@ -342,7 +342,9 @@ prepare_runtime_provenance() {
 import json, subprocess, sys
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 head = subprocess.check_output(["git", "-C", sys.argv[2], "rev-parse", "HEAD"], text=True).strip()
-assert payload.get("root_commit") == head
+if payload.get("root_commit") != head:
+    print(f"PROVENANCE_STALE observed={payload.get('root_commit')} expected={head}")
+    raise SystemExit(1)
 print("PROVENANCE_REUSE_PASS")
 PY
     then
