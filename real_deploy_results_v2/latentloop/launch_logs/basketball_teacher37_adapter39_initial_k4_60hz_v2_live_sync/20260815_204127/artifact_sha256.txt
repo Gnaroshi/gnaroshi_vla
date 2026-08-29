@@ -1,0 +1,4 @@
+d7807e8d6d2ce9ede0e26d681a0d7a6ff131c88c1dda22a80ed0072f01c27d58  /home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/checkpoint_manifest.json
+90f73d0a55da443a35ba863261ea8a00de6d5cc466f6519f0e704505f76cc25a  /home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/baseline/teacher_37.pth
+aec5f0b68e5f3193a00b07bc65a37440db549c15b36b8bea242606cc40c4bc5d  /home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/shared/mae_pretrain_vit_base.pth
+a5e3bbe75c6b1e435c4e38ab797a25d7980b965be6f7555f7cd78912acbed7ab  /home/jbr/gnaroshi_vla/artifacts/seer/real_world/basketball/latentloop/teacher_37/teacher_37_adapter_39.pth

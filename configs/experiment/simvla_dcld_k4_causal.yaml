@@ -1,0 +1,19 @@
+experiment:
+  name: simvla_dcld_k4_causal
+  architecture: simvla
+  method: dcld
+  eval_mode: k4_causal_ablation
+
+extends:
+  - configs/method/dcld.yaml
+  - configs/experiment/simvla_dcld_repro.yaml
+
+eval:
+  refresh_every: 4
+  modes:
+    - real_delta
+    - no_delta
+    - shuffled_delta
+    - proprio_only
+    - image_only
+  measure_latency: true

@@ -21,7 +21,10 @@ set -euo pipefail
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 
-protocol_root="${LRNODE_PROTOCOL_ROOT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UPSTREAM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${UPSTREAM_DIR}/../../.." && pwd)"
+protocol_root="${LRNODE_PROTOCOL_ROOT:-${REPO_ROOT}/results/seer/lrnode/default}"
 experiment_name="${EXPERIMENT_NAME:-lrnode_distill_qred20_ckpt_sweep}"
 experiment_tag="${EXPERIMENT_TAG:-distill_qred20_ckpt_sweep_$(date +%Y%m%d_%H%M%S)}"
 result_root="${EVAL_RESULT_ROOT:-${protocol_root}/eval/${experiment_name}_${experiment_tag}}"

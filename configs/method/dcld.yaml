@@ -1,0 +1,22 @@
+method:
+  name: dcld
+  description: fixed-euler delta-conditioned latent dynamics
+  condition_key: vlm_features
+  latent_target: simvla_action_transformer_condition
+
+dcld:
+  delta_dim: 512
+  hidden_dim: 1024
+  image_size: 64
+  image_feature_dim: 256
+  proprio_feature_dim: 128
+  dynamics:
+    integration: fixed_euler
+    adaptive_solver: false
+    gated_update: true
+    gate_bias: -4.0
+  losses:
+    condition_mse: 1.0
+    condition_cosine: 0.05
+    action_l1: 0.0
+    smoothness: 0.0

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "task": "pick_up_the_red_ball_and_place_it_in_the_basketball_hoop_filtered_40p",
+  "latentloop_architecture": {
+    "hidden_dim": 256,
+    "motion_dim": 128,
+    "fast_encoder_type": "diffcnn",
+    "detach_input_latent": true,
+    "detach_teacher_latent": true,
+    "freeze_action_head": true,
+    "use_post_layernorm": false,
+    "gate_init_bias": -4.0
+  },
+  "vit": {
+    "filename": "mae_pretrain_vit_base.pth",
+    "sha256": "aec5f0b68e5f3193a00b07bc65a37440db549c15b36b8bea242606cc40c4bc5d",
+    "size_bytes": 343249461
+  },
+  "teachers": {
+    "34": {
+      "filename": "teacher_34.pth",
+      "checkpoint_epoch": 34,
+      "sha256": "3d9107c0e01b8c87b0326cbefb61eb68b32b8ecaba8628e17eeaaf230d37339b",
+      "size_bytes": 809418674,
+      "adapters": {
+        "39": {
+          "filename": "teacher_34_adapter_39.pth",
+          "checkpoint_epoch": 39,
+          "sha256": "814dfabb67ce947ec59caa6c6b958bfe494d290d4213d9fe4e80940782faa07a",
+          "size_bytes": 5731648
+        }
+      }
+    },
+    "35": {
+      "filename": "teacher_35.pth",
+      "checkpoint_epoch": 35,
+      "sha256": "e2c55b04183e35156e84aa9582ab277d86aec4f2b698b15a0fb8b93237c3162d",
+      "size_bytes": 809418674,
+      "adapters": {
+        "39": {
+          "filename": "teacher_35_adapter_39.pth",
+          "checkpoint_epoch": 39,
+          "sha256": "44a9cc0fea0e8b701efb00665d05a755347e3bbfb880be550201d32c06085fb4",
+          "size_bytes": 5731648
+        }
+      }
+    },
+    "37": {
+      "filename": "teacher_37.pth",
+      "checkpoint_epoch": 37,
+      "sha256": "90f73d0a55da443a35ba863261ea8a00de6d5cc466f6519f0e704505f76cc25a",
+      "size_bytes": 809418674,
+      "adapters": {
+        "39": {
+          "filename": "teacher_37_adapter_39.pth",
+          "checkpoint_epoch": 39,
+          "sha256": "a5e3bbe75c6b1e435c4e38ab797a25d7980b965be6f7555f7cd78912acbed7ab",
+          "size_bytes": 5731648
+        }
+      }
+    }
+  }
+}

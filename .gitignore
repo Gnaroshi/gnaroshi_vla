@@ -1,10 +1,12 @@
 # Python cache
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 
 # Tool and package caches
 .cache/
+.cache
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -15,8 +17,14 @@ __pycache__/
 env/
 venv/
 
-# Generated outputs
+# Agent-generated documentation and outputs
 codex_outputs/
+AGENTS.md
+**/AGENTS.md
+WORKSPACE_FILE_MANIFEST.txt
+architectures/*/results.md
+
+# Generated runtime outputs
 outputs/
 wandb/
 lightning_logs/
@@ -38,14 +46,14 @@ ckpts/
 
 # Upstream architecture clones kept as separate git repositories unless
 # intentionally converted to git submodules.
-architectures/simvla/upstream/
+/architectures/simvla/upstream
+architectures/openpi/upstream/
 
-# Per-run checkpoint payloads. Keep README/schema files.
-results/*/*/*/*/
-results/*/*/*/*/checkpoints/
+# Experiment results stay local. Keep only the repository-level schema.
+results/**
+!results/README.md
 
 # Keep these tracked if this workspace later commits them.
-!results/README.md
 !architectures/**/env/
 !architectures/**/env/README.md
 !architectures/**/env/*.yml
@@ -53,6 +61,9 @@ results/*/*/*/*/checkpoints/
 !architectures/**/env/*.txt
 !configs/**
 !scripts/**
-!AGENTS.md
-!docs/**
 !methods/**
+
+# Re-apply generated Python cache ignores after broad source unignore rules.
+**/__pycache__/
+*.pyc
+*.pyo

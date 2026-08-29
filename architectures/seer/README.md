@@ -23,11 +23,10 @@ environment snapshot is stored under `env/`.
 
 ## Current Method State
 
-The current `seer_node3` code already contains LR-NODE modifications mixed into
-Seer training, evaluation, model, and script files. Because the source is not a
-valid git repository and no clean upstream baseline is available locally, the
-initial integration preserves this working state in `upstream/` and documents
-mixed files in `docs/architectures/seer/modified_upstream_files.md`.
+The integrated upstream copy contains LR-NODE modifications across Seer
+training, evaluation, model, and script files. The release-facing training and
+evaluation workflow is documented in
+[`docs/seer/lrnode.md`](../../docs/seer/lrnode.md).
 
 Future refactors should move method-owned code into `methods/<method>/` and use
 `adapters/<method>/` for upstream integration.
