@@ -210,6 +210,7 @@ def _family(row: str) -> str:
 
 def _table_row(row: str, root: Path) -> dict[str, Any]:
     summary = json.loads((root / "row_summary.json").read_text(encoding="utf-8"))
+    episodes = _read_csv(root / "episode_metrics.csv")
     spec = row_spec(row)
     return {
         "row": row,
@@ -235,12 +236,19 @@ def _table_row(row: str, root: Path) -> dict[str, Any]:
             summary["latency_per_executed_action_ms"]
         ),
         "latency_per_policy_query_ms": float(summary["latency_per_policy_query_ms"]),
-        "full_vlm_calls": int(summary["full_vlm_calls"]),
-        "condition_updater_calls": int(summary["condition_updater_calls"]),
-        "full_action_transformer_evaluations": int(
-            summary["full_action_transformer_evaluations"]
+        "full_vlm_calls": sum(
+            _integer(item, "num_full_vlm_calls") for item in episodes
         ),
-        "generation_loop_updates": int(summary["generation_loop_updates"]),
+        "condition_updater_calls": sum(
+            _integer(item, "num_condition_updater_calls") for item in episodes
+        ),
+        "full_action_transformer_evaluations": sum(
+            _integer(item, "num_full_action_transformer_evaluations")
+            for item in episodes
+        ),
+        "generation_loop_updates": sum(
+            _integer(item, "num_generation_loop_updates") for item in episodes
+        ),
         "root": str(root),
     }
 

@@ -24,6 +24,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.paper_grid imp
     CLASSIFICATION,
     INFERENCE_SEED,
     MANIFEST_SHA256,
+    _table_row,
     validate_row,
 )
 
@@ -106,12 +107,19 @@ def test_validate_row_requires_exact_seed02_10x50_and_counters(tmp_path) -> None
                 "inference_seed": INFERENCE_SEED,
                 "classification": CLASSIFICATION,
                 "paper_runtime_match": True,
+                "latency_per_executed_action_ms": 1.25,
+                "latency_per_policy_query_ms": 6.25,
             }
         ),
         encoding="utf-8",
     )
     report = validate_row(row, tmp_path)
     assert report["verdict"] == "PAPER_GRID_ROW_PASS"
+    table_row = _table_row(row, tmp_path)
+    assert table_row["full_vlm_calls"] == 1_000
+    assert table_row["condition_updater_calls"] == 0
+    assert table_row["full_action_transformer_evaluations"] == 10_000
+    assert table_row["generation_loop_updates"] == 0
     rows[-1]["num_integration_updates"] = 9
     with (tmp_path / "episode_metrics.csv").open(
         "w", newline="", encoding="utf-8"
