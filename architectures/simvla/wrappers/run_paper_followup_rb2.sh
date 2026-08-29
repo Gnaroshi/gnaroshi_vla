@@ -167,6 +167,11 @@ record_failure() {
   printf '%s\t%s\t%s\n' "$(date --iso-8601=seconds)" "$1" "$2" >> "$FAILURES"
 }
 
+write_running_status() {
+  printf 'verdict=PAPER_FOLLOWUP_RUNNING\nexit_code=pending\nstage=%s\nplan=%s\n' \
+    "$1" "$PLAN" > "$STATUS"
+}
+
 coupled_checkpoint_for_row() {
   case "$1" in
     condition_kc2_ng2_coupled)
@@ -625,6 +630,7 @@ run_all() {
     return 0
   fi
 
+  write_running_status waiting_for_gpu0
   wait_for_gpu
   condition_code_parity || return 1
   local cell seed row
@@ -635,6 +641,7 @@ run_all() {
       echo "CELL_SKIP_VALID seed=$seed row=$row"
       continue
     fi
+    write_running_status "$seed:$row"
     evaluate_cell "$seed" "$row" || true
     run_plan >/dev/null || return 1
   done
