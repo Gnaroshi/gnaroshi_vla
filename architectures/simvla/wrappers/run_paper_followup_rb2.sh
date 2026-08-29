@@ -457,6 +457,14 @@ wait_for_gpu() {
   echo "GPU0_STABLY_IDLE"
 }
 
+wait_for_gpu_available() {
+  CURRENT_STAGE=wait_for_gpu0_available
+  while gpu_busy; do
+    echo "[$(date --iso-8601=seconds)] rb2 GPU0 became busy; waiting 60s"
+    sleep 60
+  done
+}
+
 condition_code_parity() {
   CURRENT_STAGE=condition_code_parity
   local output=$CAMPAIGN/gates/condition_change_code_parity.json
@@ -543,7 +551,7 @@ smoke_cell() {
   for attempt in 1 2; do
     archive_path "$output"
     archive_path "${output}.egl_preflight.json"
-    wait_for_gpu
+    wait_for_gpu_available
     CURRENT_STAGE="cell_smoke_${seed}_${row}_attempt${attempt}"
     run_cell_once "$seed" "$row" "$output" 1 \
       2>&1 | tee "$CAMPAIGN/logs/smoke_${seed}_${row}_attempt${attempt}.log"
@@ -574,7 +582,7 @@ evaluate_cell() {
   for attempt in 1 2; do
     archive_path "$output"
     archive_path "${output}.egl_preflight.json"
-    wait_for_gpu
+    wait_for_gpu_available
     CURRENT_STAGE="cell_full_${seed}_${row}_attempt${attempt}"
     run_cell_once "$seed" "$row" "$output" 50 \
       2>&1 | tee "$CAMPAIGN/logs/full_${seed}_${row}_attempt${attempt}.log"
@@ -610,6 +618,8 @@ run_all() {
   run_plan >/dev/null || return 1
   validate_plan_scope || return 1
   if [[ "$MODE" == --preflight || "$MODE" == --dry-run ]]; then
+    printf 'verdict=PAPER_FOLLOWUP_PREFLIGHT_PASS\nexit_code=0\nplan=%s\n' \
+      "$PLAN" > "$STATUS"
     return 0
   fi
 
