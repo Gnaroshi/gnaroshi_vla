@@ -568,7 +568,8 @@ PY
   mapfile -t missing_rows < <(
     "$PYTHON" - "$PLAN" <<'PY'
 import json, sys
-print("\n".join(json.load(open(sys.argv[1], encoding="utf-8"))["missing_rows"]))
+for row in json.load(open(sys.argv[1], encoding="utf-8"))["missing_rows"]:
+    print(row)
 PY
   )
   for row in "${missing_rows[@]}"; do
