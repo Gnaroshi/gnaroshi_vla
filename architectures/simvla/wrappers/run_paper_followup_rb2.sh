@@ -227,11 +227,35 @@ validate_coupled_artifacts() {
   "$PYTHON" -m architectures.simvla.adapters.latentloop.efficient_multirate.paper_grid \
     validate-coupled --k-c 2 --n-g 2 \
     --train-root "$STORAGE/results/simvla/paper_grid/seed02_long500_egl_v1/coupled_artifacts/kc2_ng2/train/projection_10k" \
-    --offline-root "$STORAGE/results/simvla/paper_grid/seed02_long500_egl_v1/coupled_artifacts/kc2_ng2/offline/projection_10k_512" >/dev/null &&
-  "$PYTHON" -m architectures.simvla.adapters.latentloop.efficient_multirate.paper_grid \
-    validate-coupled --k-c 2 --n-g 3 \
-    --train-root "$STORAGE/results/simvla/coupled_condition_generation/kc2_ng3_real_cj_projection10k_seed02_v1/train/projection_10k" \
-    --offline-root "$STORAGE/results/simvla/coupled_condition_generation/kc2_ng3_real_cj_projection10k_seed02_v1/offline/projection_10k_512" >/dev/null &&
+    --offline-root "$STORAGE/results/simvla/paper_grid/seed02_long500_egl_v1/coupled_artifacts/kc2_ng2/offline/projection_10k_512" >/dev/null || return 1
+  "$PYTHON" - \
+    "$STORAGE/results/simvla/coupled_condition_generation/kc2_ng3_real_cj_projection10k_seed02_v1" <<'PY' || return 1
+import hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+train = root / "train" / "projection_10k"
+checkpoint = train / "checkpoints" / "coupled_generation_step_010000.pt"
+config = json.load(open(train / "training_config.json", encoding="utf-8"))
+summary = json.load(open(train / "run_summary.json", encoding="utf-8"))
+offline = json.load(open(root / "offline" / "projection_10k_512" / "offline_screen.json", encoding="utf-8"))
+online = json.load(open(root / "online" / "condition_kc2_ng3_coupled" / "merged" / "row_summary.json", encoding="utf-8"))
+digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+checks = {
+    "train_k_c": int(config.get("k_c", -1)) == 2,
+    "train_n_g": int(config.get("n_g", -1)) == 3,
+    "projection_parameters": int(config.get("projection_audit", {}).get("trainable_parameters", -1)) == 16_384,
+    "train_verdict": summary.get("verdict") == "COUPLED_PROJECTION_TRAINING_COMPLETE",
+    "optimizer_step": int(summary.get("optimizer_step", -1)) == 10_000,
+    "offline_verdict": offline.get("verdict") == "COUPLED_OFFLINE_INTEGRITY_PASS",
+    "offline_queries": int(offline.get("queries", -1)) == 512,
+    "offline_checks": bool(offline.get("checks")) and all(offline["checks"].values()),
+    "projection_state": offline.get("projection_only_state_audit", {}).get("verdict") == "PROJECTION_ONLY_STATE_PASS",
+    "online_row": online.get("row") == "condition_kc2_ng3_coupled",
+    "online_checkpoint_sha256": online.get("generation_checkpoint_sha256") == digest,
+}
+assert all(checks.values()), checks
+print("LEGACY_KC2_NG3_COUPLED_ARTIFACT_PASS", digest)
+PY
   "$PYTHON" -m architectures.simvla.adapters.latentloop.efficient_multirate.paper_grid \
     validate-coupled --k-c 2 --n-g 5 \
     --train-root "$STORAGE/results/simvla/paper_grid/seed02_long500_egl_v1/coupled_artifacts/kc2_ng5/train/projection_10k" \
