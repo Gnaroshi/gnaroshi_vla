@@ -388,6 +388,7 @@ PY
   bash -n "$ROOT/architectures/simvla/wrappers/run_fixed_2x2_single_gpu_row.sh" || return 1
   bash -n "$ROOT/architectures/simvla/wrappers/run_paper_followup_rb2.sh" || return 1
   CUDA_VISIBLE_DEVICES='' "$PYTHON" -m pytest -q \
+    "$ROOT/tests/simvla_fixed_2x2/test_coupled_condition_generation.py" \
     "$ROOT/tests/simvla_fixed_2x2/test_paper_followup.py" \
     "$ROOT/tests/simvla_fixed_2x2/test_paper_grid.py" \
     "$ROOT/tests/simvla_fixed_2x2/test_legacy_generation_row_materialization.py" || return 1
