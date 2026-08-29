@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_aggregate import (
+    _int,
     _key,
     _paired,
     _read_csv,
@@ -87,8 +88,8 @@ def _validated_row(
 def _per_task(rows: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
     output = {}
     for task_id in range(10):
-        task_rows = [row for row in rows if int(row["task_id"]) == task_id]
-        successes = sum(int(row["success"]) for row in task_rows)
+        task_rows = [row for row in rows if _int(row, "task_id") == task_id]
+        successes = sum(_int(row, "success") for row in task_rows)
         output[str(task_id)] = {
             "episodes": len(task_rows),
             "successes": successes,

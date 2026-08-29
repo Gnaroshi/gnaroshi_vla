@@ -238,7 +238,7 @@ def test_mechanical_control_aggregate_uses_exact_paired_episode_set(tmp_path) ->
             {
                 "task_id": task,
                 "trial_id": trial,
-                "success": int(task * 50 + trial < successes),
+                "success": task * 50 + trial < successes,
             }
             for task in range(10)
             for trial in range(50)
