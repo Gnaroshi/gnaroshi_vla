@@ -17,6 +17,7 @@ MANIFEST=
 MANIFEST_SHA=
 BUNDLE=
 CONDITION_CHECKPOINT=
+COUPLED_GENERATION_CHECKPOINT=
 SOURCE_LOCK=
 CONTROL_MANIFEST=
 PARITY_GATE=
@@ -25,6 +26,7 @@ CLASSIFICATION=RB2_CONFIRMATORY_EGL
 INFERENCE_SEED=seed02
 TASK_IDS=0,1,2,3,4,5,6,7,8,9
 SAVE_FAILURE_VIDEOS=0
+EPISODES_PER_TASK_LIMIT=50
 
 while (($#)); do
   case "$1" in
@@ -34,6 +36,7 @@ while (($#)); do
     --manifest-sha256) MANIFEST_SHA=$2; shift 2 ;;
     --bundle-root) BUNDLE=$2; shift 2 ;;
     --condition-checkpoint) CONDITION_CHECKPOINT=$2; shift 2 ;;
+    --coupled-generation-checkpoint) COUPLED_GENERATION_CHECKPOINT=$2; shift 2 ;;
     --source-lock) SOURCE_LOCK=$2; shift 2 ;;
     --control-manifest) CONTROL_MANIFEST=$2; shift 2 ;;
     --parity-gate) PARITY_GATE=$2; shift 2 ;;
@@ -42,17 +45,11 @@ while (($#)); do
     --inference-seed) INFERENCE_SEED=$2; shift 2 ;;
     --task-ids) TASK_IDS=$2; shift 2 ;;
     --save-failure-videos) SAVE_FAILURE_VIDEOS=1; shift ;;
+    --episodes-per-task-limit) EPISODES_PER_TASK_LIMIT=$2; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-case "$ROW" in
-  full_nfe10|generation_ng3|condition_kc2_ng10|condition_kc2_ng3|\
-  condition_kc3_ng10|condition_kc3_ng3|condition_kc4_ng10|condition_kc4_ng3|\
-  condition_kc2_ng2|condition_kc2_naive_nfe3|condition_kc2_naive_nfe2|\
-  condition_kc3_naive_nfe3) ;;
-  *) echo "Invalid --row: $ROW" >&2; exit 2 ;;
-esac
 case "$CLASSIFICATION" in
   HOST_LOCAL_EGL_DIAGNOSTIC|RB2_CONFIRMATORY_EGL) ;;
   *) echo "Invalid --classification: $CLASSIFICATION" >&2; exit 2 ;;
@@ -66,9 +63,18 @@ for value in "$OUTPUT" "$MANIFEST" "$MANIFEST_SHA" "$BUNDLE" \
   [[ -n "$value" ]] || { echo "Missing required argument" >&2; exit 2; }
 done
 [[ ! -e "$OUTPUT" ]] || { echo "Refusing existing output: $OUTPUT" >&2; exit 2; }
+[[ "$EPISODES_PER_TASK_LIMIT" =~ ^[0-9]+$ ]] \
+  && ((EPISODES_PER_TASK_LIMIT >= 1 && EPISODES_PER_TASK_LIMIT <= 50)) \
+  || { echo "--episodes-per-task-limit must be in [1,50]" >&2; exit 2; }
 
 cd "$ROOT" || exit 1
 export PYTHONPATH="$ROOT:$UPSTREAM:${PYTHONPATH:-}"
+"$PYTHON" - "$ROW" <<'PY'
+import sys
+from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import EVAL_ROWS
+if sys.argv[1] not in EVAL_ROWS:
+    raise SystemExit(f"Invalid --row: {sys.argv[1]}")
+PY
 export HF_HOME=${HF_HOME:-/home/mingyujung/private/gnaroshi_vla_storage/cache/simvla/huggingface}
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -104,12 +110,17 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" tools/simvla/simvla_egl_preflight.py \
 
 mkdir -p "$OUTPUT/logs"
 recover_and_merge() {
+  local generation_args=()
+  if [[ -n "$COUPLED_GENERATION_CHECKPOINT" ]]; then
+    generation_args=(--generation-checkpoint "$COUPLED_GENERATION_CHECKPOINT")
+  fi
   CUDA_VISIBLE_DEVICES='' "$PYTHON" \
     -m architectures.simvla.adapters.latentloop.efficient_multirate.row_postprocess_recovery \
     --row "$ROW" \
     --shard "$OUTPUT/shard_rank0_tasks_0_9" \
     --merged "$OUTPUT/merged" \
     --expected-manifest-sha256 "$MANIFEST_SHA" \
+    "${generation_args[@]}" \
     2>&1 | tee "$OUTPUT/logs/postprocess_recovery.log"
   return "${PIPESTATUS[0]}"
 }
@@ -122,6 +133,10 @@ video_args=()
 if ((SAVE_FAILURE_VIDEOS == 1)); then
   video_args=(--save-video --video-failures-only --video-stride 2 --video-max-per-task 2)
 fi
+coupled_args=()
+if [[ -n "$COUPLED_GENERATION_CHECKPOINT" ]]; then
+  coupled_args=(--coupled-generation-checkpoint "$COUPLED_GENERATION_CHECKPOINT")
+fi
 CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" \
   -m architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval \
   --row "$ROW" \
@@ -130,6 +145,7 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" \
   --expected-manifest-sha256 "$MANIFEST_SHA" \
   --bundle-root "$BUNDLE" \
   --condition-checkpoint "$CONDITION_CHECKPOINT" \
+  "${coupled_args[@]}" \
   --fixed-2x2-source-lock "$SOURCE_LOCK" \
   "${control_args[@]}" \
   --fixed-2x2-parity-gate "$PARITY_GATE" \
@@ -138,9 +154,24 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" \
   --task-ids "$TASK_IDS" \
   --classification "$CLASSIFICATION" \
   --inference-seed "$INFERENCE_SEED" \
+  --episodes-per-task-limit "$EPISODES_PER_TASK_LIMIT" \
   "${video_args[@]}" \
   2>&1 | tee "$OUTPUT/logs/evaluate.log"
 eval_rc=${PIPESTATUS[0]}
+if ((EPISODES_PER_TASK_LIMIT < 50)); then
+  ((eval_rc == 0)) || exit "$eval_rc"
+  "$PYTHON" - "$OUTPUT/shard_rank0_tasks_0_9/shard_summary.json" "$ROW" "$EPISODES_PER_TASK_LIMIT" <<'PY'
+import json, sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = 10 * int(sys.argv[3])
+if payload.get("row") != sys.argv[2] or int(payload.get("episodes", -1)) != expected:
+    raise SystemExit(f"smoke summary mismatch: {payload}")
+if not str(payload.get("verdict", "")).endswith("_SHARD_PASS"):
+    raise SystemExit(f"smoke shard gate failed: {payload}")
+print(f"FIXED_2X2_ROW_SMOKE_PASS row={sys.argv[2]} episodes={expected}")
+PY
+  exit 0
+fi
 if ((eval_rc != 0)); then
   echo "Evaluation exited rc=$eval_rc; validating bounded postprocess recovery." >&2
   recover_and_merge || exit "$eval_rc"

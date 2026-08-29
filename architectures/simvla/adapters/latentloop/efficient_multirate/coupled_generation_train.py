@@ -141,8 +141,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("coupled screening budget must be in [1,10000]")
     if args.k_c not in {2, 3}:
         raise ValueError("coupled screening requires K_C in {2,3}")
-    if args.n_g != 3:
-        raise ValueError("the fixed coupled screening row is N_G=3")
+    if args.n_g not in {2, 3, 5}:
+        raise ValueError("coupled screening requires N_G in {2,3,5}")
 
     dist.init_process_group("nccl")
     device = torch.device("cuda:0")
@@ -244,8 +244,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": COUPLED_CHECKPOINT_SCHEMA,
         "classification": "projection_only_10k_screening",
         "k_c": args.k_c,
-        "n_g": 3,
-        "full_step_indices": list(GENERATION_SCHEDULES[3]),
+        "n_g": args.n_g,
+        "full_step_indices": list(GENERATION_SCHEDULES[args.n_g]),
+        "generation_schedule_contract": (
+            "trained_schedule"
+            if args.n_g == 2
+            else "model_supported_transfer"
+            if args.n_g == 3
+            else "schedule_extrapolation"
+        ),
         "condition_change_code": (
             "NativeV0DeltaEncoder output from the same recursive Condition update"
         ),
@@ -308,7 +315,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 normalized_proprio=normalized_proprio,
                 condition_valid_mask=query["valid_mask"],
                 condition_change_code=query["condition_change_code"],
-                full_step_indices=GENERATION_SCHEDULES[3],
+                full_step_indices=GENERATION_SCHEDULES[args.n_g],
                 teacher_final_action=query["teacher_action"],
                 hidden_weight=1.0,
                 velocity_weight=0.0,
@@ -407,7 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--smolvlm-model", default=DEFAULT_SMOLVLM)
     parser.add_argument("--k-c", type=int, choices=(2, 3), default=2)
-    parser.add_argument("--n-g", type=int, default=3)
+    parser.add_argument("--n-g", type=int, choices=(2, 3, 5), default=3)
     parser.add_argument("--stop-step", type=int, default=10_000)
     parser.add_argument("--local-batch-size", type=int, default=2)
     parser.add_argument("--peak-lr", type=float, default=1e-4)

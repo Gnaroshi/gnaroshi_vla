@@ -25,6 +25,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_cont
 from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
     EVAL_ROWS,
     expected_call_counts,
+    is_frontier_row,
     row_spec,
 )
 
@@ -183,7 +184,7 @@ def aggregate_row(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("fixed 2x2 shard manifest mismatch")
     rows = _read_csv(shard / "episode_metrics.csv")
     spec = row_spec(args.row)
-    is_frontier = spec.k_c > 2 or spec.n_g == 2 or spec.naive_nfe
+    is_frontier = is_frontier_row(args.row)
     summary = {
         "verdict": "KC_FRONTIER_ROW_PASS" if is_frontier else "FIXED_2X2_ROW_PASS",
         "classification": shard_summary["classification"],

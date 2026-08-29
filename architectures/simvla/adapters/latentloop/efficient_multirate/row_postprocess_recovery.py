@@ -29,6 +29,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_con
 )
 try:
     from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
+        is_frontier_row,
         row_spec,
     )
 except ModuleNotFoundError:
@@ -58,6 +59,16 @@ except ModuleNotFoundError:
             raise ValueError(
                 f"legacy recovery does not know row: {row_name}"
             ) from exc
+
+    def is_frontier_row(row_name: str) -> bool:
+        row_spec(row_name)
+        return row_name not in {
+            "full_nfe10",
+            "generation_ng3",
+            "condition_kc2_ng10",
+            "condition_kc2_ng3",
+            "condition_kc2_ng3_coupled",
+        }
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -129,7 +140,10 @@ def recover_row(
     if manifest.get("observed_manifest_sha256") != expected_manifest_sha256:
         raise RuntimeError("recovery manifest SHA-256 mismatch")
     host = load_json(shard_path / "host_shard_contract.json")
-    if host.get("verdict") != "SD1_FIXED_SHARD_PASS":
+    if host.get("verdict") not in {
+        "SD1_FIXED_SHARD_PASS",
+        "CONFIRMATORY_SHARD_PASS",
+    }:
         raise RuntimeError("host shard contract did not pass")
     provenance = load_json(shard_path / "frozen_provenance.json")
     if provenance.get("verdict") != "FROZEN_PROVENANCE_PASS":
@@ -146,11 +160,14 @@ def recover_row(
     naive_nfe = bool(getattr(contract, "naive_nfe", False))
     classification = str(rows[0]["classification"])
     inference_seed = str(rows[0]["inference_seed"])
-    is_frontier = contract.k_c > 2 or contract.n_g == 2 or naive_nfe
+    is_frontier = is_frontier_row(row_name)
     coupled_validation = None
     if contract.coupled:
         coupled_validation = load_json(shard_path / "coupled_checkpoint_validation.json")
-        if coupled_validation.get("verdict") != "COUPLED_SOURCE_LOCK_PASS":
+        if coupled_validation.get("verdict") not in {
+            "COUPLED_SOURCE_LOCK_PASS",
+            "FROZEN_COUPLED_CHECKPOINT_PASS",
+        }:
             raise RuntimeError("coupled source-lock validation did not pass")
         if not generation_checkpoint:
             raise ValueError("coupled recovery requires --generation-checkpoint")

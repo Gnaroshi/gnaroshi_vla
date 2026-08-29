@@ -77,6 +77,7 @@ def _decode(
     proprio: torch.Tensor,
     noise: torch.Tensor,
     code: torch.Tensor,
+    n_g: int,
 ) -> torch.Tensor:
     def full_step(
         noisy_action: torch.Tensor, tau: torch.Tensor
@@ -94,7 +95,7 @@ def _decode(
     trace = loop(
         noise,
         full_step=full_step,
-        full_step_indices=GENERATION_SCHEDULES[3],
+        full_step_indices=GENERATION_SCHEDULES[int(n_g)],
         proprio=proprio,
         condition=condition,
         condition_valid_mask=valid_mask,
@@ -138,8 +139,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(
             f"coupled checkpoint K_C mismatch: {checkpoint_k_c} != {args.k_c}"
         )
-    if int(coupled_payload["training_config"].get("n_g", -1)) != 3:
-        raise RuntimeError("coupled checkpoint N_G is not 3")
+    checkpoint_n_g = int(coupled_payload["training_config"].get("n_g", -1))
+    if checkpoint_n_g != args.n_g:
+        raise RuntimeError(
+            f"coupled checkpoint N_G mismatch: {checkpoint_n_g} != {args.n_g}"
+        )
     source_report = verify_coupled_source_lock(
         coupled_payload["source_lock"],
         parent_generation_checkpoint=args.parent_generation_checkpoint,
@@ -202,6 +206,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             proprio=normalized_proprio,
             noise=query["initial_noise"],
             code=zero,
+            n_g=args.n_g,
         )
         coupled_zero_action = _decode(
             loop=coupled_loop,
@@ -212,6 +217,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             proprio=normalized_proprio,
             noise=query["initial_noise"],
             code=zero,
+            n_g=args.n_g,
         )
         zero_code_equal = zero_code_equal and torch.equal(
             uncoupled_action, coupled_zero_action
@@ -225,6 +231,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             proprio=normalized_proprio,
             noise=query["initial_noise"],
             code=query["condition_change_code"],
+            n_g=args.n_g,
         )
         oracle_action = action_adapter.decode_action_from_condition(
             query["condition"],
@@ -306,6 +313,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "paper_result": False,
         "requires_online_validation": True,
         "k_c": args.k_c,
+        "n_g": args.n_g,
         "queries": len(rows),
         "updated_query_ages": list(updated_ages),
         "checks": checks,
@@ -338,6 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--smolvlm-model", default=DEFAULT_SMOLVLM)
     parser.add_argument("--k-c", type=int, choices=(2, 3), default=2)
+    parser.add_argument("--n-g", type=int, choices=(2, 3, 5), default=3)
     parser.add_argument("--queries", type=int, default=512)
     parser.add_argument("--heldout-fraction", type=float, default=0.2)
     parser.add_argument("--split-seed", type=int, default=20260822)

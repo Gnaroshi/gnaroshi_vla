@@ -18,17 +18,24 @@ from methods.latentloop.modules.simvla_generation_loop import (
 )
 
 
+COUPLED_K_C_VALUES = (2, 3)
+COUPLED_N_G_VALUES = (2, 3, 5)
+COUPLED_CONFIGS = tuple(
+    (k_c, n_g) for k_c in COUPLED_K_C_VALUES for n_g in COUPLED_N_G_VALUES
+)
+
+
 def coupled_row_name(k_c: int, n_g: int = 3) -> str:
     if int(k_c) not in {2, 3}:
         raise ValueError("coupled condition refresh interval must be 2 or 3")
-    if int(n_g) != 3:
-        raise ValueError("coupled generation currently requires N_G=3")
+    if int(n_g) not in COUPLED_N_G_VALUES:
+        raise ValueError("coupled generation requires N_G in {2,3,5}")
     return f"condition_kc{int(k_c)}_ng{int(n_g)}_coupled"
 
 
 COUPLED_ROW = coupled_row_name(2)
 COUPLED_KC3_ROW = coupled_row_name(3)
-COUPLED_ROWS = (COUPLED_ROW, COUPLED_KC3_ROW)
+COUPLED_ROWS = tuple(coupled_row_name(k_c, n_g) for k_c, n_g in COUPLED_CONFIGS)
 COUPLED_CHECKPOINT_SCHEMA = "simvla_condition_generation_coupling_v1"
 
 
