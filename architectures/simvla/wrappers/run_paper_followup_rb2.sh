@@ -172,6 +172,17 @@ write_running_status() {
     "$1" "$PLAN" > "$STATUS"
 }
 
+handle_signal() {
+  local rc=$1 signal=$2
+  printf 'verdict=PAPER_FOLLOWUP_INTERRUPTED\nexit_code=%s\nsignal=%s\nstage=%s\nplan=%s\n' \
+    "$rc" "$signal" "$CURRENT_STAGE" "$PLAN" > "$STATUS"
+  echo "PAPER_FOLLOWUP_INTERRUPTED signal=$signal stage=$CURRENT_STAGE" >&2
+  exit "$rc"
+}
+
+trap 'handle_signal 130 INT' INT
+trap 'handle_signal 143 TERM' TERM
+
 coupled_checkpoint_for_row() {
   case "$1" in
     condition_kc2_ng2_coupled)
@@ -267,6 +278,52 @@ PY
     --offline-root "$STORAGE/results/simvla/paper_grid/seed02_long500_egl_v1/coupled_artifacts/kc2_ng5/offline/projection_10k_512" >/dev/null
 }
 
+validate_frozen_coupled_checkpoints() {
+  "$PYTHON" - \
+    "$BUNDLE/checkpoint/generation_step_030000.pt" \
+    "$CONDITION_CHECKPOINT" \
+    "$BUNDLE/norm/libero_norm_official_32700d0.json" \
+    "$BUNDLE/exact_cache_contract" \
+    "condition_kc2_ng2_coupled=$(coupled_checkpoint_for_row condition_kc2_ng2_coupled)" \
+    "condition_kc2_ng3_coupled=$(coupled_checkpoint_for_row condition_kc2_ng3_coupled)" \
+    "condition_kc2_ng5_coupled=$(coupled_checkpoint_for_row condition_kc2_ng5_coupled)" <<'PY' || return 1
+import sys
+
+from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
+    audit_projection_only_state,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_source_lock import (
+    verify_frozen_coupled_checkpoint,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.generation_checkpoint import (
+    load_generation_checkpoint,
+)
+
+parent_path, condition_path, norm_path, cache_path = sys.argv[1:5]
+parent, _ = load_generation_checkpoint(parent_path, device="cpu")
+for item in sys.argv[5:]:
+    row, checkpoint_path = item.split("=", 1)
+    updater, payload = load_generation_checkpoint(checkpoint_path, device="cpu")
+    report = verify_frozen_coupled_checkpoint(
+        checkpoint_path,
+        payload,
+        row=row,
+        parent_generation_checkpoint=parent_path,
+        condition_checkpoint=condition_path,
+        norm_stats=norm_path,
+        exact_cache=cache_path,
+    )
+    assert report["verdict"] == "FROZEN_COUPLED_CHECKPOINT_PASS", report
+    state = audit_projection_only_state(parent, updater)
+    assert state["verdict"] == "PROJECTION_ONLY_STATE_PASS", (row, state)
+    print(
+        "FROZEN_COUPLED_CHECKPOINT_PASS",
+        row,
+        report["observed"]["checkpoint_sha256"],
+    )
+PY
+}
+
 static_preflight() {
   CURRENT_STAGE=static_preflight
   local command required seed free_bytes
@@ -323,6 +380,7 @@ print("RUNTIME_CONTRACT_PASS")
 PY
   validate_parity_gates || return 1
   validate_coupled_artifacts || return 1
+  validate_frozen_coupled_checkpoints || return 1
   validate_external_evidence || return 1
   "$PYTHON" -m compileall -q \
     "$ROOT/architectures/simvla/adapters/latentloop/efficient_multirate" \
@@ -642,7 +700,12 @@ run_all() {
       continue
     fi
     write_running_status "$seed:$row"
-    evaluate_cell "$seed" "$row" || true
+    if ! evaluate_cell "$seed" "$row"; then
+      printf 'verdict=PAPER_FOLLOWUP_PIPELINE_FAILED\nexit_code=1\nstage=%s\ncell=%s:%s\nplan=%s\nfailures=%s\n' \
+        "$CURRENT_STAGE" "$seed" "$row" "$PLAN" "$FAILURES" > "$STATUS"
+      echo "PAPER_FOLLOWUP_ABORTED_AFTER_CELL_FAILURE seed=$seed row=$row" >&2
+      return 1
+    fi
     run_plan >/dev/null || return 1
   done
 
@@ -676,7 +739,8 @@ export WANDB_MODE=${WANDB_MODE:-offline}
 
 run_all
 rc=$?
-if ((rc != 0)) && [[ ! -f "$STATUS" ]]; then
+if ((rc != 0)) && ! grep -Eq \
+  '^verdict=PAPER_FOLLOWUP_(INTERRUPTED|PIPELINE_FAILED)$' "$STATUS" 2>/dev/null; then
   printf 'verdict=PAPER_FOLLOWUP_PIPELINE_FAILED\nexit_code=%s\nstage=%s\nplan=%s\n' \
     "$rc" "$CURRENT_STAGE" "$PLAN" > "$STATUS"
 fi

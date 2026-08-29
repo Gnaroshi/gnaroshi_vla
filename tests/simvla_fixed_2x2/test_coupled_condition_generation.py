@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+from copy import deepcopy
+from pathlib import Path
+
 import torch
 from torch import nn
+
+from architectures.simvla.adapters.latentloop.efficient_multirate import (
+    coupled_source_lock,
+)
 
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condition_generation import (
     audit_projection_only_state,
@@ -175,3 +183,103 @@ def test_projection_only_state_audit_rejects_any_other_change() -> None:
         audit_projection_only_state(parent, candidate)["verdict"]
         == "PROJECTION_ONLY_STATE_FAIL"
     )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_frozen_checkpoint_lineage_is_independent_of_current_eval_commit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    parent = tmp_path / "parent.pt"
+    condition = tmp_path / "condition.pt"
+    norm = tmp_path / "norm.json"
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    checkpoint.write_bytes(b"frozen-coupled-checkpoint")
+    parent.write_bytes(b"parent")
+    condition.write_bytes(b"condition")
+    norm.write_bytes(b"norm")
+    (cache / "manifest.json").write_bytes(b"cache")
+
+    monkeypatch.setattr(
+        coupled_source_lock, "FROZEN_GENERATION_CHECKPOINT_SHA256", _sha256(parent)
+    )
+    monkeypatch.setattr(
+        coupled_source_lock, "FROZEN_CONDITION_CHECKPOINT_SHA256", _sha256(condition)
+    )
+    monkeypatch.setattr(
+        coupled_source_lock, "FROZEN_NORM_STATS_SHA256", _sha256(norm)
+    )
+    monkeypatch.setattr(
+        coupled_source_lock,
+        "FROZEN_EXACT_CACHE_MANIFEST_SHA256",
+        _sha256(cache / "manifest.json"),
+    )
+    monkeypatch.setattr(
+        coupled_source_lock, "FROZEN_GENERATION_SOURCE_SHA256", "1" * 64
+    )
+    monkeypatch.setattr(
+        coupled_source_lock, "FROZEN_CONDITION_SOURCE_SHA256", "2" * 64
+    )
+    monkeypatch.setattr(coupled_source_lock, "FROZEN_UPSTREAM_COMMIT", "3" * 40)
+
+    historical_root = "4" * 40
+    source = {
+        "schema_version": "simvla_condition_generation_coupling_source_v1",
+        "root_commit": historical_root,
+        "upstream_commit": "3" * 40,
+        "source_file_sha256": {"historical_training.py": "5" * 64},
+        "parent_generation_source_combined_sha256": "1" * 64,
+        "condition_source_combined_sha256": "2" * 64,
+        "parent_generation_checkpoint_sha256": _sha256(parent),
+        "condition_checkpoint_sha256": _sha256(condition),
+        "norm_stats_sha256": _sha256(norm),
+        "exact_cache_manifest_sha256": _sha256(cache / "manifest.json"),
+    }
+    source["combined_sha256"] = coupled_source_lock._canonical_sha256(source)
+    row = "synthetic_coupled"
+    monkeypatch.setitem(
+        coupled_source_lock.FROZEN_COUPLED_CHECKPOINTS,
+        row,
+        {
+            "k_c": 2,
+            "n_g": 3,
+            "checkpoint_sha256": _sha256(checkpoint),
+            "source_combined_sha256": source["combined_sha256"],
+            "source_root_commit": historical_root,
+        },
+    )
+    payload = {
+        "source_lock": source,
+        "training_config": {
+            "source_combined_sha256": source["combined_sha256"],
+            "k_c": 2,
+            "n_g": 3,
+        },
+    }
+    report = coupled_source_lock.verify_frozen_coupled_checkpoint(
+        checkpoint,
+        payload,
+        row=row,
+        parent_generation_checkpoint=parent,
+        condition_checkpoint=condition,
+        norm_stats=norm,
+        exact_cache=cache,
+    )
+    assert report["verdict"] == "FROZEN_COUPLED_CHECKPOINT_PASS"
+
+    tampered = deepcopy(payload)
+    tampered["source_lock"]["root_commit"] = "6" * 40
+    failed = coupled_source_lock.verify_frozen_coupled_checkpoint(
+        checkpoint,
+        tampered,
+        row=row,
+        parent_generation_checkpoint=parent,
+        condition_checkpoint=condition,
+        norm_stats=norm,
+        exact_cache=cache,
+    )
+    assert failed["verdict"] == "FROZEN_COUPLED_CHECKPOINT_FAIL"

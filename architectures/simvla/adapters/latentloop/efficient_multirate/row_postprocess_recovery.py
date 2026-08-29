@@ -164,7 +164,10 @@ def recover_row(
     coupled_validation = None
     if contract.coupled:
         coupled_validation = load_json(shard_path / "coupled_checkpoint_validation.json")
-        if coupled_validation.get("verdict") != "COUPLED_SOURCE_LOCK_PASS":
+        if coupled_validation.get("verdict") not in {
+            "COUPLED_SOURCE_LOCK_PASS",
+            "FROZEN_COUPLED_CHECKPOINT_PASS",
+        }:
             raise RuntimeError("coupled source-lock validation did not pass")
         if not generation_checkpoint:
             raise ValueError("coupled recovery requires --generation-checkpoint")

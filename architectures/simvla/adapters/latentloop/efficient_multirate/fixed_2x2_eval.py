@@ -27,7 +27,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_condit
     condition_update_with_code,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.coupled_source_lock import (
-    verify_coupled_source_lock,
+    verify_frozen_coupled_checkpoint,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_contracts import (
     FROZEN_CHECKPOINT_REVISION,
@@ -973,14 +973,19 @@ def evaluate_shard(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("coupled checkpoint N_G does not match the evaluation row")
         if int(generation_payload.get("optimizer_step", -1)) != 10_000:
             raise RuntimeError("coupled checkpoint is not optimizer step 10,000")
-        coupled_checkpoint_report = verify_coupled_source_lock(
-            generation_payload["source_lock"],
+        coupled_checkpoint_report = verify_frozen_coupled_checkpoint(
+            args.coupled_generation_checkpoint,
+            generation_payload,
+            row=args.row,
             parent_generation_checkpoint=generation_checkpoint,
             condition_checkpoint=args.condition_checkpoint,
             norm_stats=norm_stats,
             exact_cache=bundle / "exact_cache_contract",
         )
-        if coupled_checkpoint_report["verdict"] != "COUPLED_SOURCE_LOCK_PASS":
+        if (
+            coupled_checkpoint_report["verdict"]
+            != "FROZEN_COUPLED_CHECKPOINT_PASS"
+        ):
             raise RuntimeError(
                 json.dumps(coupled_checkpoint_report, indent=2, sort_keys=True)
             )
