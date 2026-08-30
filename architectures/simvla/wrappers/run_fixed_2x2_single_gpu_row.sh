@@ -61,6 +61,7 @@ case "$ROW" in
   condition_kc2_ng2|condition_kc2_naive_nfe3|condition_kc2_naive_nfe2|\
   condition_kc3_naive_nfe3|mechanical_hold_condition_kc2_ng3|\
   mechanical_native_chunk_replay_kc2_ng3|mechanical_hold_action_kc2_ng3|\
+  mechanical_full_nfe10_native_chunk_replay_kc2|\
   mechanical_no_observation_kc2_ng3) ;;
   *) echo "Invalid --row: $ROW" >&2; exit 2 ;;
 esac

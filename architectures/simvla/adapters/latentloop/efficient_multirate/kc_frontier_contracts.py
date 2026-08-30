@@ -37,11 +37,14 @@ class EfficiencyRowSpec:
     mechanical_control: str | None = None
 
 
+FULL_NFE10_REPLAY_MODE = "full_nfe10_native_chunk_replay"
+FULL_NFE10_REPLAY_ROW = "mechanical_full_nfe10_native_chunk_replay_kc2"
 MECHANICAL_CONTROL_MODES = (
     "hold_condition",
     "native_chunk_replay",
     "hold_action",
     "no_observation",
+    FULL_NFE10_REPLAY_MODE,
 )
 
 
@@ -49,6 +52,8 @@ def mechanical_control_row_name(mode: str) -> str:
     value = str(mode)
     if value not in MECHANICAL_CONTROL_MODES:
         raise ValueError(f"unsupported mechanical control: {value}")
+    if value == FULL_NFE10_REPLAY_MODE:
+        return FULL_NFE10_REPLAY_ROW
     return f"mechanical_{value}_kc2_ng3"
 
 
@@ -92,9 +97,9 @@ ROW_SPECS = {
         mechanical_control_row_name(mode): EfficiencyRowSpec(
             mechanical_control_row_name(mode),
             2,
-            3,
-            True,
-            True,
+            10 if mode == FULL_NFE10_REPLAY_MODE else 3,
+            mode != FULL_NFE10_REPLAY_MODE,
+            mode != FULL_NFE10_REPLAY_MODE,
             False,
             False,
             mode,
@@ -144,14 +149,25 @@ def expected_call_counts(row: str, policy_queries: int) -> dict[str, int]:
     if queries < 0:
         raise ValueError("policy query count must be non-negative")
     full_vlm_calls = (
-        (queries + spec.k_c - 1) // spec.k_c if spec.uses_condition else queries
+        (queries + spec.k_c - 1) // spec.k_c
+        if spec.uses_condition or spec.mechanical_control is not None
+        else queries
     )
     skipped_queries = queries - full_vlm_calls
     condition_calls = skipped_queries if spec.uses_condition else 0
     decode_queries = queries
-    if spec.mechanical_control in {"hold_condition", "native_chunk_replay", "hold_action"}:
+    if spec.mechanical_control in {
+        "hold_condition",
+        "native_chunk_replay",
+        "hold_action",
+        FULL_NFE10_REPLAY_MODE,
+    }:
         condition_calls = 0
-    if spec.mechanical_control in {"native_chunk_replay", "hold_action"}:
+    if spec.mechanical_control in {
+        "native_chunk_replay",
+        "hold_action",
+        FULL_NFE10_REPLAY_MODE,
+    }:
         decode_queries = full_vlm_calls
     full_action_calls = decode_queries * spec.n_g
     generation_updates = (

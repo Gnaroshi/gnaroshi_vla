@@ -13,16 +13,24 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_eval
     _validate_fixed_2x2_counters,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
+    FULL_NFE10_REPLAY_MODE,
     MECHANICAL_CONTROL_MODES,
     expected_call_counts,
     mechanical_control_row_name,
+    row_spec,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.mechanical_control_aggregate import (
     PRIMARY_ROW,
     aggregate,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.mechanical_control_policy import (
+    SynchronizedFullNFE10ChunkReplayPolicy,
     SynchronizedMechanicalControlPolicy,
+)
+from architectures.simvla.adapters.latentloop.efficient_multirate.replay_control_aggregate import (
+    ROWS as REPLAY_ROWS,
+    SEEDS as REPLAY_SEEDS,
+    aggregate as aggregate_replay_controls,
 )
 
 
@@ -33,6 +41,7 @@ def test_mechanical_control_counter_contracts() -> None:
         "native_chunk_replay": (3, 0, 9, 21),
         "hold_action": (3, 0, 9, 21),
         "no_observation": (3, 2, 15, 35),
+        FULL_NFE10_REPLAY_MODE: (3, 0, 30, 0),
     }
     for mode, expected_values in expected_by_mode.items():
         row = mechanical_control_row_name(mode)
@@ -51,7 +60,7 @@ def test_mechanical_control_counter_contracts() -> None:
             full_action_transformer_calls=counts["full_action_transformer_calls"],
             generation_loop_updates=counts["generation_loop_updates"],
             action_transformer_decodes=(
-                counts["full_action_transformer_calls"] // 3
+                counts["full_action_transformer_calls"] // row_spec(row).n_g
             ),
             observation_encoder_calls=0,
         )
@@ -136,9 +145,43 @@ def _bare_policy(mode: str) -> SynchronizedMechanicalControlPolicy:
     return policy
 
 
+def _bare_full_nfe10_replay_policy() -> SynchronizedFullNFE10ChunkReplayPolicy:
+    policy = object.__new__(SynchronizedFullNFE10ChunkReplayPolicy)
+    policy.control_mode = FULL_NFE10_REPLAY_MODE
+    policy.mode = mechanical_control_row_name(FULL_NFE10_REPLAY_MODE)
+    policy.row_name = policy.mode
+    policy.k_c = 2
+    policy.n_g = 10
+    policy.query_index = 0
+    policy.action_queue = deque()
+    policy.query_trace = []
+    policy.action_chunk_records = []
+    policy.log_action_chunks = False
+    policy.cached_action_chunk = None
+    policy.metrics = SimpleNamespace(
+        counters=defaultdict(int), latencies=defaultdict(list)
+    )
+    anchor = torch.arange(70, dtype=torch.float32).reshape(1, 10, 7)
+
+    def full_refresh(batch, *, policy_query_index):  # type: ignore[no-untyped-def]
+        del batch, policy_query_index
+        policy.metrics.counters["num_full_vlm_calls"] += 1
+        policy.metrics.counters["num_action_transformer_calls"] += 10
+        policy.metrics.counters["num_action_transformer_decodes"] += 1
+        policy.cached_action_chunk = anchor.clone()
+        return torch.ones(1, 2, 3), anchor.clone(), 100
+
+    policy._full_refresh = full_refresh
+    return policy
+
+
 def test_mechanical_control_skipped_query_semantics() -> None:
     for mode in MECHANICAL_CONTROL_MODES:
-        policy = _bare_policy(mode)
+        policy = (
+            _bare_full_nfe10_replay_policy()
+            if mode == FULL_NFE10_REPLAY_MODE
+            else _bare_policy(mode)
+        )
         policy._refill_action_queue({"proprio": torch.zeros(1, 8)})
         policy.action_queue.clear()
         policy.cached_executed_action = torch.full((7,), 55.0)
@@ -146,7 +189,7 @@ def test_mechanical_control_skipped_query_semantics() -> None:
         queued = torch.stack([action for action, _ in policy.action_queue])
         sources = {source for _, source in policy.action_queue}
         assert len(queued) == 5
-        if mode == "native_chunk_replay":
+        if mode in {"native_chunk_replay", FULL_NFE10_REPLAY_MODE}:
             expected = torch.arange(70, dtype=torch.float32).reshape(10, 7)[5:10]
             assert torch.equal(queued, expected)
             assert sources == {"native_action_chunk"}
@@ -261,4 +304,77 @@ def test_mechanical_control_aggregate_uses_exact_paired_episode_set(tmp_path) ->
     assert result["verdict"] == "MECHANICAL_CONTROL_COMPARISON_COMPLETE"
     assert set(result["paired_primary_vs_control"]) == {
         mechanical_control_row_name(mode) for mode in MECHANICAL_CONTROL_MODES
+    }
+
+
+def test_replay_control_aggregate_requires_complete_three_seed_cells(tmp_path) -> None:
+    cells = []
+    manifests = []
+    for seed_index, seed in enumerate(REPLAY_SEEDS):
+        digest = f"{seed_index + 1}" * 64
+        manifests.append(f"{seed}={digest}")
+        for row_index, row in enumerate(REPLAY_ROWS):
+            root = tmp_path / seed / row
+            root.mkdir(parents=True)
+            successes = 480 - row_index
+            (root / "row_summary.json").write_text(
+                json.dumps(
+                    {
+                        "row": row,
+                        "inference_seed": seed,
+                        "manifest_sha256": digest,
+                        "verdict": "MECHANICAL_CONTROL_ROW_PASS",
+                        "classification": "RB2_CONFIRMATORY_EGL",
+                        "paper_runtime_match": True,
+                        "successes": successes,
+                        "latency_per_executed_action_ms": 10.0 + row_index,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            counts = expected_call_counts(row, 2)
+            episodes = [
+                {
+                    "task_id": task,
+                    "trial_id": trial,
+                    "success": int(task * 50 + trial < successes),
+                    "num_policy_queries": 2,
+                    "num_full_vlm_calls": counts["full_vlm_calls"],
+                    "num_condition_updater_calls": counts[
+                        "condition_updater_calls"
+                    ],
+                    "num_full_action_transformer_evaluations": counts[
+                        "full_action_transformer_calls"
+                    ],
+                    "num_generation_loop_updates": counts[
+                        "generation_loop_updates"
+                    ],
+                    "num_integration_updates": counts["integration_updates"],
+                }
+                for task in range(10)
+                for trial in range(50)
+            ]
+            with (root / "episode_metrics.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(episodes[0]))
+                writer.writeheader()
+                writer.writerows(episodes)
+            cells.append(f"{seed}:{row}={root}")
+
+    result = aggregate_replay_controls(
+        SimpleNamespace(
+            output=str(tmp_path / "aggregate"),
+            cell=cells,
+            manifest_sha256=manifests,
+        )
+    )
+    assert result["verdict"] == "REPLAY_CONTROL_THREE_SEED_COMPLETE"
+    assert len(result["rows"]) == len(REPLAY_ROWS)
+    assert set(result["paired"]) == {
+        "full_vs_pure_replay",
+        "pure_vs_learned_replay",
+        "pure_replay_vs_coupled",
+        "learned_replay_vs_coupled",
+        "kc2_naive_vs_coupled",
     }

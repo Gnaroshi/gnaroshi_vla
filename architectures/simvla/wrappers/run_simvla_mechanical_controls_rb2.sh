@@ -39,6 +39,7 @@ ROWS=(
   condition_kc2_ng3
   mechanical_hold_condition_kc2_ng3
   mechanical_native_chunk_replay_kc2_ng3
+  mechanical_full_nfe10_native_chunk_replay_kc2
   mechanical_hold_action_kc2_ng3
   mechanical_no_observation_kc2_ng3
 )
@@ -285,6 +286,7 @@ aggregate_controls() {
     --row "condition_kc2_ng3=${RESULT}/rows/condition_kc2_ng3/merged" \
     --row "mechanical_hold_condition_kc2_ng3=${RESULT}/rows/mechanical_hold_condition_kc2_ng3/merged" \
     --row "mechanical_native_chunk_replay_kc2_ng3=${RESULT}/rows/mechanical_native_chunk_replay_kc2_ng3/merged" \
+    --row "mechanical_full_nfe10_native_chunk_replay_kc2=${RESULT}/rows/mechanical_full_nfe10_native_chunk_replay_kc2/merged" \
     --row "mechanical_hold_action_kc2_ng3=${RESULT}/rows/mechanical_hold_action_kc2_ng3/merged" \
     --row "mechanical_no_observation_kc2_ng3=${RESULT}/rows/mechanical_no_observation_kc2_ng3/merged" \
     2>&1 | tee -a "${LOG_ROOT}/aggregate.log"

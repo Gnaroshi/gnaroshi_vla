@@ -14,13 +14,143 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_pol
     RealSimVLAGenerationPolicy,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
+    FULL_NFE10_REPLAY_MODE,
+    FULL_NFE10_REPLAY_ROW,
     expected_call_counts,
     mechanical_control_row_name,
+)
+from architectures.simvla.adapters.latentloop.native_v0_long_eval import (
+    _SynchronizedFullPolicy,
 )
 from architectures.simvla.adapters.latentloop.native_v0_policy import (
     RealSimVLANativeV0Policy,
 )
 from methods.latentloop.modules.simvla_generation_loop import SimVLAGenerationLoop
+
+
+class SynchronizedFullNFE10ChunkReplayPolicy(_SynchronizedFullPolicy):
+    """Official NFE=10 anchor decode followed by its unused H=10 chunk tail."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.control_mode = FULL_NFE10_REPLAY_MODE
+        self.mode = FULL_NFE10_REPLAY_ROW
+        self.row_name = FULL_NFE10_REPLAY_ROW
+        self.k_c = 2
+        self.refresh_every = 2
+        self.n_g = 10
+        self.query_trace: list[dict[str, Any]] = []
+
+    def reset(self) -> None:
+        super().reset()
+        self.query_trace = []
+
+    def _record_anchor_chunk(
+        self,
+        *,
+        query: int,
+        seed: int | None,
+        action_chunk: torch.Tensor,
+    ) -> None:
+        if not self.log_action_chunks:
+            return
+        if seed is None:
+            raise RuntimeError("full-NFE replay anchor requires paired noise")
+        self.action_chunk_records.append(
+            {
+                "suite": self.suite,
+                "task_id": self.task_id,
+                "trial_id": self.trial_id,
+                "episode_step_index": int(self.step_index),
+                "policy_query_index": query,
+                "row_name": self.row_name,
+                "mode": self.mode,
+                "k": self.k_c,
+                "queue_mode": "full_refresh",
+                "refreshed": True,
+                "full_vlm_called": True,
+                "condition_updater_called": False,
+                "paired_action_noise": True,
+                "action_noise_seed": int(seed),
+                "action_chunk_shape": list(action_chunk.shape),
+                "action_chunk": action_chunk.detach().cpu().float(),
+            }
+        )
+
+    def _refill_action_queue(
+        self, batch: dict[str, torch.Tensor]
+    ) -> dict[str, Any]:
+        self.metrics.counters["num_policy_queries"] += 1
+        query = int(self.query_index)
+        age = query % self.k_c
+        refreshed = age == 0
+        seed: int | None = None
+
+        if refreshed:
+            _, action_chunk, seed = self._full_refresh(
+                batch, policy_query_index=query
+            )
+            if action_chunk.shape[1] != 10:
+                raise RuntimeError("full-NFE replay requires exact H=10 anchor chunk")
+            source = "full_refresh"
+            self._record_anchor_chunk(
+                query=query, seed=seed, action_chunk=action_chunk
+            )
+        else:
+            if self.cached_action_chunk is None or self.cached_action_chunk.shape[1] != 10:
+                raise RuntimeError("full-NFE replay has no exact H=10 anchor chunk")
+            action_chunk = self.cached_action_chunk[:, 5:10]
+            if action_chunk.shape[1] != 5:
+                raise RuntimeError("full-NFE replay must execute anchor actions 5:10")
+            source = "native_action_chunk"
+            self.metrics.counters["num_native_chunk_replay_queries"] += 1
+
+        self.action_queue.clear()
+        for action in action_chunk[0, :5]:
+            self.action_queue.append((action.detach(), source))
+        if len(self.action_queue) != 5:
+            raise RuntimeError("full-NFE replay must enqueue exactly R=5 actions")
+
+        self.query_trace.append(
+            {
+                "policy_query_index": query,
+                "age": age,
+                "source": source,
+                "full_vlm_called": refreshed,
+                "condition_updater_called": False,
+                "action_decoder_called": refreshed,
+                "action_noise_seed": seed,
+                "action_horizon": 10,
+                "execution_horizon": 5,
+                "k_c": self.k_c,
+                "n_g": self.n_g,
+            }
+        )
+        self.query_index += 1
+        expected = expected_call_counts(self.row_name, self.query_index)
+        counters = self.metrics.counters
+        observed = {
+            "full_vlm_calls": int(counters["num_full_vlm_calls"]),
+            "condition_updater_calls": int(counters["num_condition_updater_calls"]),
+            "full_action_transformer_calls": int(
+                counters["num_action_transformer_calls"]
+            ),
+            "generation_loop_updates": int(
+                counters["num_generation_decoder_only_steps"]
+            ),
+            "integration_updates": int(counters["num_action_transformer_calls"])
+            + int(counters["num_generation_decoder_only_steps"]),
+        }
+        if observed != expected:
+            raise RuntimeError(
+                f"full-NFE replay counter drift: observed={observed} expected={expected}"
+            )
+        return {
+            "refreshed": refreshed,
+            "age": age,
+            "queue_mode": source,
+            "action_noise_seed": seed,
+        }
 
 
 class SynchronizedMechanicalControlPolicy(RealSimVLANativeV0Policy):

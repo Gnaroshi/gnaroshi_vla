@@ -63,10 +63,12 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_cont
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.kc_frontier_contracts import (
     EVAL_ROWS,
+    FULL_NFE10_REPLAY_ROW,
     expected_call_counts,
     row_spec,
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.mechanical_control_policy import (
+    SynchronizedFullNFE10ChunkReplayPolicy,
     SynchronizedMechanicalControlPolicy,
 )
 from architectures.simvla.adapters.latentloop.native_v0_long_eval import (
@@ -703,6 +705,12 @@ def _make_policy(
             **full_common,
             flow_steps=10,
             row_name=FULL_ROW,
+        )
+    if row == FULL_NFE10_REPLAY_ROW:
+        return SynchronizedFullNFE10ChunkReplayPolicy(
+            **full_common,
+            flow_steps=10,
+            row_name=FULL_NFE10_REPLAY_ROW,
         )
     if spec.mechanical_control is not None:
         if condition_updater is None:
