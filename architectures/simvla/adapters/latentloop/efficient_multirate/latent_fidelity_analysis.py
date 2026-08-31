@@ -15,8 +15,9 @@ import os
 import subprocess
 import time
 from collections import defaultdict
+from itertools import combinations
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 import torch
@@ -48,6 +49,12 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_hid
 )
 from architectures.simvla.adapters.latentloop.native_v0_checkpoint import (
     load_native_v0_checkpoint,
+)
+from architectures.simvla.adapters.latentloop.native_v0_condition_hook import (
+    extract_action_condition,
+)
+from architectures.simvla.adapters.latentloop.native_v0_prepare import (
+    _official_training_image_inputs,
 )
 from architectures.simvla.adapters.latentloop.native_v0_runtime import (
     DEFAULT_CHECKPOINT,
@@ -88,6 +95,18 @@ ACTION_METRICS = (
     "nfe10_translation_l1",
     "nfe10_rotation_l1",
     "nfe10_gripper_l1",
+)
+GENERATION_METHODS = (
+    "original_nfe10",
+    "naive_nfe3",
+    "ours_generation_ng3",
+    "coupled_generation_ng3",
+)
+GATE_ABLATIONS = (
+    "learned_gate",
+    "fixed_sample_mean_gate",
+    "unit_gate",
+    "hold_condition",
 )
 
 
@@ -324,6 +343,58 @@ def assign_change_quartiles(rows: list[dict[str, Any]]) -> None:
         )
 
 
+def valid_generation_schedules(
+    *, exact_steps: int = 3, total_steps: int = 10, max_skipped_age: int = 3
+) -> tuple[tuple[int, ...], ...]:
+    """Enumerate schedules supported by the frozen age-1/2/3 updater."""
+
+    if exact_steps < 1 or total_steps < exact_steps or max_skipped_age < 0:
+        raise ValueError("invalid generation schedule bounds")
+    schedules: list[tuple[int, ...]] = []
+    for suffix in combinations(range(1, total_steps), exact_steps - 1):
+        schedule = (0, *suffix)
+        age = 0
+        supported = True
+        full = set(schedule)
+        for step in range(total_steps):
+            if step in full:
+                age = 0
+            else:
+                age += 1
+                if age > max_skipped_age:
+                    supported = False
+                    break
+        if supported:
+            schedules.append(schedule)
+    return tuple(schedules)
+
+
+def gate_ablation_conditions(
+    previous: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Build causal gate controls while preserving the learned residual."""
+
+    mask = valid_mask.bool().unsqueeze(-1)
+    weight = mask.to(dtype=gate.dtype)
+    sample_mean = (gate * weight).sum(dim=1, keepdim=True) / weight.sum(
+        dim=1, keepdim=True
+    ).clamp_min(1.0)
+
+    def apply(selected_gate: torch.Tensor) -> torch.Tensor:
+        candidate = previous + selected_gate * residual
+        return torch.where(mask, candidate, previous)
+
+    return {
+        "learned_gate": apply(gate),
+        "fixed_sample_mean_gate": apply(sample_mean),
+        "unit_gate": apply(torch.ones_like(gate)),
+        "hold_condition": previous,
+    }
+
+
 @torch.no_grad()
 def _generation_trace(
     *,
@@ -335,6 +406,7 @@ def _generation_trace(
     normalized_proprio: torch.Tensor,
     noise: torch.Tensor,
     code: torch.Tensor,
+    full_step_indices: Sequence[int] = GENERATION_SCHEDULES[3],
 ) -> tuple[Any, torch.Tensor]:
     def full_step(
         noisy_action: torch.Tensor, tau: torch.Tensor
@@ -352,13 +424,72 @@ def _generation_trace(
     trace = loop(
         noise,
         full_step=full_step,
-        full_step_indices=GENERATION_SCHEDULES[3],
+        full_step_indices=full_step_indices,
         proprio=normalized_proprio,
         condition=condition,
         condition_valid_mask=valid_mask,
         condition_change_code=code,
     )
     return trace, action_space.postprocess(trace.final_noisy_action)
+
+
+def _method_fidelity_rows(
+    *,
+    method: str,
+    prediction: torch.Tensor,
+    original: torch.Tensor,
+    teacher: torch.Tensor,
+    dataset_indices: Sequence[int],
+    query_age: int,
+    schedule: Sequence[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    versus_original = _action_metrics(prediction, original, prefix="vs_original")
+    versus_teacher = _action_metrics(prediction, teacher, prefix="vs_teacher")
+    rows: list[dict[str, Any]] = []
+    step_rows: list[dict[str, Any]] = []
+    schedule_text = "" if schedule is None else ",".join(map(str, schedule))
+    for local, dataset_index in enumerate(dataset_indices):
+        flat_prediction = prediction[local].float().reshape(1, -1)
+        flat_original = original[local].float().reshape(1, -1)
+        first_prediction = prediction[local, :5].float().reshape(1, -1)
+        first_original = original[local, :5].float().reshape(1, -1)
+        rows.append(
+            {
+                "dataset_index": int(dataset_index),
+                "query_age": int(query_age),
+                "method": method,
+                "schedule": schedule_text,
+                "vs_original_full_cosine": float(
+                    F.cosine_similarity(flat_prediction, flat_original).item()
+                ),
+                "vs_original_first5_cosine": float(
+                    F.cosine_similarity(first_prediction, first_original).item()
+                ),
+                **versus_original[local],
+                **versus_teacher[local],
+            }
+        )
+        for action_step in range(prediction.shape[1]):
+            predicted_step = prediction[local, action_step].float()
+            original_step = original[local, action_step].float()
+            step_rows.append(
+                {
+                    "dataset_index": int(dataset_index),
+                    "query_age": int(query_age),
+                    "method": method,
+                    "schedule": schedule_text,
+                    "action_step": int(action_step),
+                    "vs_original_l1": float(
+                        (predicted_step - original_step).abs().mean().item()
+                    ),
+                    "vs_original_cosine": float(
+                        F.cosine_similarity(
+                            predicted_step.unsqueeze(0), original_step.unsqueeze(0)
+                        ).item()
+                    ),
+                }
+            )
+    return rows, step_rows
 
 
 @torch.no_grad()
@@ -446,6 +577,217 @@ def _group_summary(
     return result
 
 
+def _timing_summary(values: Sequence[float]) -> dict[str, float | int]:
+    result = _summary(values)
+    result["minimum"] = float(np.min(np.asarray(values, dtype=np.float64)))
+    result["maximum"] = float(np.max(np.asarray(values, dtype=np.float64)))
+    return result
+
+
+@torch.no_grad()
+def _benchmark_cuda(
+    label: str,
+    function: Callable[[], Any],
+    *,
+    warmup: int,
+    repeats: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    for _ in range(warmup):
+        function()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    samples: list[float] = []
+    for _ in range(repeats):
+        start.record()
+        function()
+        end.record()
+        end.synchronize()
+        samples.append(float(start.elapsed_time(end)))
+    return (
+        {"component": label, "clock": "cuda_event", **_timing_summary(samples)},
+        [
+            {"component": label, "clock": "cuda_event", "repeat": index, "milliseconds": value}
+            for index, value in enumerate(samples)
+        ],
+    )
+
+
+def _benchmark_cpu(
+    label: str,
+    function: Callable[[], Any],
+    *,
+    warmup: int,
+    repeats: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    for _ in range(warmup):
+        function()
+    samples: list[float] = []
+    for _ in range(repeats):
+        started = time.perf_counter()
+        function()
+        samples.append((time.perf_counter() - started) * 1000.0)
+    return (
+        {"component": label, "clock": "perf_counter", **_timing_summary(samples)},
+        [
+            {"component": label, "clock": "perf_counter", "repeat": index, "milliseconds": value}
+            for index, value in enumerate(samples)
+        ],
+    )
+
+
+@torch.no_grad()
+def _latency_decomposition(
+    *,
+    model: Any,
+    processor: Any,
+    action_adapter: Any,
+    condition_adapter: NativeSimVLAV0,
+    generation_loop: SimVLAGenerationLoop,
+    generation_updater: Any,
+    sample: dict[str, Any],
+    device: torch.device,
+    warmup: int,
+    repeats: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Measure batch-one module latency with explicit CUDA synchronization."""
+
+    def preprocess() -> dict[str, torch.Tensor]:
+        result = _official_training_image_inputs(
+            sample["image_sequence"][1],
+            image_size=int(getattr(processor, "image_size", 384)),
+            num_views=int(getattr(processor, "num_views", 3)),
+        )
+        result.update(processor.encode_language([sample["language_instruction"]]))
+        return result
+
+    processed_cpu = preprocess()
+    processed = {key: value.to(device) for key, value in processed_cpu.items()}
+    tokenizer = processor.tokenizer
+
+    def encode_condition() -> Any:
+        return extract_action_condition(
+            model,
+            input_ids=processed["input_ids"],
+            image_input=processed["image_input"],
+            image_mask=processed["image_mask"],
+            pad_token_id=getattr(tokenizer, "pad_token_id", None),
+            special_token_ids=getattr(tokenizer, "all_special_ids", ()),
+        )
+
+    previous = sample["anchor_condition"].unsqueeze(0).to(device)
+    condition = sample["teacher_conditions"][0].unsqueeze(0).to(device)
+    valid_mask = sample["valid_mask"].unsqueeze(0).to(device)
+    group_ids = sample["group_ids"].unsqueeze(0).to(device)
+    proprio = sample["proprio_sequence"][1].unsqueeze(0).to(device)
+    normalized_proprio = action_adapter.normalize_proprio(proprio)
+    noise = sample["explicit_noises"][0].unsqueeze(0).to(device)
+    pair = NativeV0ObservationPair(
+        previous_images=sample["image_sequence"][0].unsqueeze(0).to(device),
+        current_images=sample["image_sequence"][1].unsqueeze(0).to(device),
+        previous_proprio=sample["proprio_sequence"][0].unsqueeze(0).to(device),
+        current_proprio=proprio,
+    )
+    code = condition_adapter.delta_encoder(pair)
+
+    def delta_encoder() -> Any:
+        return condition_adapter.delta_encoder(pair)
+
+    def condition_updater() -> Any:
+        return condition_adapter.condition_updater(
+            previous, code, valid_mask=valid_mask, group_ids=group_ids, age=1
+        )
+
+    zero_code = noise.new_zeros((1, int(generation_updater.condition_code_dim)))
+
+    def original_nfe10() -> Any:
+        return action_adapter.decode_action_from_condition(
+            condition, proprio, steps=10, initial_noise=noise, requires_grad=False
+        )
+
+    def naive_nfe3() -> Any:
+        return action_adapter.decode_action_from_condition(
+            condition, proprio, steps=3, initial_noise=noise, requires_grad=False
+        )
+
+    def generation_ng3() -> Any:
+        return _generation_trace(
+            loop=generation_loop,
+            transformer=model.transformer,
+            action_space=action_adapter.action_space,
+            condition=condition,
+            valid_mask=valid_mask,
+            normalized_proprio=normalized_proprio,
+            noise=noise,
+            code=zero_code,
+            full_step_indices=GENERATION_SCHEDULES[3],
+        )
+
+    tau_before = noise.new_ones((1,))
+    first = full_generation_step_with_hidden(
+        model.transformer,
+        condition=condition,
+        noisy_action=noise,
+        proprio=normalized_proprio,
+        tau=tau_before,
+        dt=-0.1,
+    )
+    noisy_after = noise - 0.1 * first.velocity
+    tau_after = noise.new_full((1,), 0.9)
+
+    def full_action_transformer_step() -> Any:
+        return model.transformer(
+            vlm_features=condition,
+            action_with_noise=noise,
+            proprio=normalized_proprio,
+            t=tau_before,
+        )
+
+    def generation_hidden_updater() -> Any:
+        return generation_updater(
+            first.action_hidden,
+            noise,
+            noisy_after,
+            tau_before=tau_before,
+            tau_after=tau_after,
+            proprio=normalized_proprio,
+            condition_change_code=zero_code,
+            condition=condition,
+            condition_valid_mask=valid_mask,
+            generator_age=1,
+        )
+
+    update = generation_hidden_updater()
+
+    def frozen_action_decoder() -> Any:
+        return model.transformer.action_decoder(update.hidden)
+
+    summaries: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    cpu_summary, cpu_rows = _benchmark_cpu(
+        "image_language_preprocess", preprocess, warmup=warmup, repeats=repeats
+    )
+    summaries.append(cpu_summary)
+    rows.extend(cpu_rows)
+    for label, function in (
+        ("vlm_condition_encoder", encode_condition),
+        ("delta_encoder", delta_encoder),
+        ("condition_updater", condition_updater),
+        ("full_action_transformer_step", full_action_transformer_step),
+        ("generation_hidden_updater", generation_hidden_updater),
+        ("frozen_action_decoder", frozen_action_decoder),
+        ("original_action_generation_nfe10", original_nfe10),
+        ("naive_action_generation_nfe3", naive_nfe3),
+        ("ours_action_generation_ng3", generation_ng3),
+    ):
+        summary, component_rows = _benchmark_cuda(
+            label, function, warmup=warmup, repeats=repeats
+        )
+        summaries.append(summary)
+        rows.extend(component_rows)
+    return summaries, rows
+
+
 def _artifact_contract(
     *,
     coupled_payload: dict[str, Any],
@@ -521,9 +863,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         smolvlm_model=args.smolvlm_model,
         device=device,
     )
-    del processor
-    dropped = _drop_unused_vlm(frozen_model)
     freeze_module(frozen_model)
+    parent_loop = SimVLAGenerationLoop(
+        parent_updater, frozen_model.transformer.action_decoder
+    ).to(device).eval()
     coupled_loop = SimVLAGenerationLoop(
         coupled_updater, frozen_model.transformer.action_decoder
     ).to(device).eval()
@@ -536,13 +879,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     selected = _balanced_indices(
         dataset.identities, limit=args.condition_windows, seed=args.seed
     )
+    if not selected:
+        raise RuntimeError("analysis selected no heldout windows")
+    latency_summary, latency_rows = _latency_decomposition(
+        model=frozen_model,
+        processor=processor,
+        action_adapter=action_adapter,
+        condition_adapter=condition_adapter,
+        generation_loop=parent_loop,
+        generation_updater=parent_updater,
+        sample=dataset[selected[0]],
+        device=device,
+        warmup=args.latency_warmup,
+        repeats=args.latency_repeats,
+    )
+    del processor
+    dropped = _drop_unused_vlm(frozen_model)
     partners = deterministic_task_partner_indices(dataset.identities)
     kc2_keys = [(index, age) for index in selected for age in (1, 3)]
     action_keys = set(kc2_keys[: min(args.action_queries, len(kc2_keys))])
     generation_keys = set(kc2_keys[: min(args.generation_queries, len(kc2_keys))])
+    schedule_keys = set(kc2_keys[: min(args.schedule_queries, len(kc2_keys))])
+    candidate_schedules = valid_generation_schedules()
     condition_rows: list[dict[str, Any]] = []
     hidden_rows: list[dict[str, Any]] = []
+    gate_rows: list[dict[str, Any]] = []
+    generation_method_rows: list[dict[str, Any]] = []
+    action_step_rows: list[dict[str, Any]] = []
+    schedule_rows: list[dict[str, Any]] = []
     row_lookup: dict[tuple[int, int, str], dict[str, Any]] = {}
+    gate_row_lookup: dict[tuple[int, int, str], dict[str, Any]] = {}
 
     with torch.no_grad():
         for start in tqdm(
@@ -628,6 +994,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 target = exact_conditions[age]
                 changes = _observation_change(sequence, age)
                 variant_outputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+                learned_gate_state: tuple[torch.Tensor, torch.Tensor] | None = None
                 for variant in OBSERVATION_VARIANTS:
                     prediction, code, gate, residual = _condition_update(
                         condition_adapter,
@@ -639,6 +1006,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         variant=variant,
                     )
                     variant_outputs[variant] = (prediction, code)
+                    if variant == "ours_full_observation":
+                        learned_gate_state = (residual, gate)
                     metrics = masked_condition_metrics(
                         prediction, target, previous, sequence["valid_mask"]
                     )
@@ -674,6 +1043,40 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         condition_rows.append(row)
                         row_lookup[(dataset_index, age, variant)] = row
 
+                if learned_gate_state is None:
+                    raise RuntimeError("learned gate state was not captured")
+                residual, learned_gate = learned_gate_state
+                gate_candidates = gate_ablation_conditions(
+                    previous,
+                    residual,
+                    learned_gate,
+                    sequence["valid_mask"],
+                )
+                for gate_mode, candidate in gate_candidates.items():
+                    metrics = masked_condition_metrics(
+                        candidate, target, previous, sequence["valid_mask"]
+                    )
+                    for local, dataset_index in enumerate(batch_indices):
+                        row = {
+                            "dataset_index": int(dataset_index),
+                            "task_id": int(sequence["task_id"][local].item()),
+                            "episode_id": sequence["episode_id"][local],
+                            "anchor_query_index": int(
+                                sequence["anchor_query_index"][local].item()
+                            ),
+                            "age": int(age),
+                            "gate_mode": gate_mode,
+                            "learned_gate_mean": float(
+                                learned_gate[local, :, 0]
+                                .float()[sequence["valid_mask"][local].bool()]
+                                .mean()
+                                .item()
+                            ),
+                            **metrics[local],
+                        }
+                        gate_rows.append(row)
+                        gate_row_lookup[(dataset_index, age, gate_mode)] = row
+
                 action_positions = [
                     local
                     for local, dataset_index in enumerate(batch_indices)
@@ -699,6 +1102,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     for local, dataset_index in enumerate(selected_dataset_indices):
                         row_lookup[(dataset_index, age, variant)].update(action_metrics[local])
+
+                for gate_mode, candidate in gate_candidates.items():
+                    gate_action = action_adapter.decode_action_from_condition(
+                        candidate.index_select(0, position),
+                        proprio,
+                        steps=10,
+                        initial_noise=noise,
+                        requires_grad=False,
+                    )
+                    gate_metrics = _action_metrics(
+                        gate_action, target_action, prefix="nfe10"
+                    )
+                    for local, dataset_index in enumerate(selected_dataset_indices):
+                        gate_row_lookup[(dataset_index, age, gate_mode)].update(
+                            gate_metrics[local]
+                        )
 
                 generation_positions = [
                     local
@@ -731,50 +1150,142 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     initial_noise=generation_noise,
                     requires_grad=False,
                 )
-                for code_mode, code in (
-                    ("real_observation_code", actual_code),
-                    ("zero_observation_code", torch.zeros_like(actual_code)),
+                generation_valid_mask = sequence["valid_mask"].index_select(
+                    0, position
+                ).index_select(0, generation_position)
+                zero_code = torch.zeros_like(actual_code)
+                naive_action = action_adapter.decode_action_from_condition(
+                    actual_condition,
+                    generation_proprio,
+                    steps=3,
+                    initial_noise=generation_noise,
+                    requires_grad=False,
+                )
+                parent_trace, parent_generated = _generation_trace(
+                    loop=parent_loop,
+                    transformer=frozen_model.transformer,
+                    action_space=action_adapter.action_space,
+                    condition=actual_condition,
+                    valid_mask=generation_valid_mask,
+                    normalized_proprio=normalized_proprio,
+                    noise=generation_noise,
+                    code=zero_code,
+                )
+                coupled_trace, coupled_generated = _generation_trace(
+                    loop=coupled_loop,
+                    transformer=frozen_model.transformer,
+                    action_space=action_adapter.action_space,
+                    condition=actual_condition,
+                    valid_mask=generation_valid_mask,
+                    normalized_proprio=normalized_proprio,
+                    noise=generation_noise,
+                    code=actual_code,
+                )
+                for method, generated, schedule in (
+                    ("original_nfe10", local_oracle, tuple(range(10))),
+                    ("naive_nfe3", naive_action, None),
+                    (
+                        "ours_generation_ng3",
+                        parent_generated,
+                        GENERATION_SCHEDULES[3],
+                    ),
+                    (
+                        "coupled_generation_ng3",
+                        coupled_generated,
+                        GENERATION_SCHEDULES[3],
+                    ),
                 ):
-                    trace, generated = _generation_trace(
-                        loop=coupled_loop,
+                    method_rows, step_rows = _method_fidelity_rows(
+                        method=method,
+                        prediction=generated,
+                        original=local_oracle,
+                        teacher=generation_target,
+                        dataset_indices=generation_dataset_indices,
+                        query_age=age,
+                        schedule=schedule,
+                    )
+                    generation_method_rows.extend(method_rows)
+                    action_step_rows.extend(step_rows)
+
+                hidden_rows.extend(
+                    _hidden_fidelity_rows(
+                        mode="parent_zero_observation_code",
+                        trace=parent_trace,
                         transformer=frozen_model.transformer,
-                        action_space=action_adapter.action_space,
                         condition=actual_condition,
-                        valid_mask=sequence["valid_mask"].index_select(0, position).index_select(
-                            0, generation_position
-                        ),
                         normalized_proprio=normalized_proprio,
-                        noise=generation_noise,
-                        code=code,
+                        dataset_indices=generation_dataset_indices,
+                        query_age=age,
                     )
-                    local_metrics = _action_metrics(
-                        generated, local_oracle, prefix=f"{code_mode}_vs_local_oracle"
+                )
+                hidden_rows.extend(
+                    _hidden_fidelity_rows(
+                        mode="coupled_real_observation_code",
+                        trace=coupled_trace,
+                        transformer=frozen_model.transformer,
+                        condition=actual_condition,
+                        normalized_proprio=normalized_proprio,
+                        dataset_indices=generation_dataset_indices,
+                        query_age=age,
                     )
-                    teacher_metrics = _action_metrics(
-                        generated, generation_target, prefix=f"{code_mode}_vs_teacher"
+                )
+
+                schedule_positions = [
+                    local
+                    for local, dataset_index in enumerate(generation_dataset_indices)
+                    if (dataset_index, age) in schedule_keys
+                ]
+                if schedule_positions:
+                    schedule_position = torch.tensor(
+                        schedule_positions, device=device, dtype=torch.long
                     )
-                    for local, dataset_index in enumerate(generation_dataset_indices):
-                        row_lookup[
-                            (dataset_index, age, "ours_full_observation")
-                        ].update(local_metrics[local])
-                        row_lookup[
-                            (dataset_index, age, "ours_full_observation")
-                        ].update(teacher_metrics[local])
-                    hidden_rows.extend(
-                        _hidden_fidelity_rows(
-                            mode=code_mode,
-                            trace=trace,
+                    schedule_condition = actual_condition.index_select(
+                        0, schedule_position
+                    )
+                    schedule_normalized_proprio = normalized_proprio.index_select(
+                        0, schedule_position
+                    )
+                    schedule_noise = generation_noise.index_select(0, schedule_position)
+                    schedule_target = generation_target.index_select(0, schedule_position)
+                    schedule_oracle = local_oracle.index_select(0, schedule_position)
+                    schedule_valid_mask = generation_valid_mask.index_select(
+                        0, schedule_position
+                    )
+                    schedule_code = zero_code.index_select(0, schedule_position)
+                    schedule_dataset_indices = [
+                        generation_dataset_indices[value] for value in schedule_positions
+                    ]
+                    for schedule in candidate_schedules:
+                        _, scheduled_action = _generation_trace(
+                            loop=parent_loop,
                             transformer=frozen_model.transformer,
-                            condition=actual_condition,
-                            normalized_proprio=normalized_proprio,
-                            dataset_indices=generation_dataset_indices,
-                            query_age=age,
+                            action_space=action_adapter.action_space,
+                            condition=schedule_condition,
+                            valid_mask=schedule_valid_mask,
+                            normalized_proprio=schedule_normalized_proprio,
+                            noise=schedule_noise,
+                            code=schedule_code,
+                            full_step_indices=schedule,
                         )
-                    )
+                        method_rows, _ = _method_fidelity_rows(
+                            method="ours_generation_ng3_schedule",
+                            prediction=scheduled_action,
+                            original=schedule_oracle,
+                            teacher=schedule_target,
+                            dataset_indices=schedule_dataset_indices,
+                            query_age=age,
+                            schedule=schedule,
+                        )
+                        schedule_rows.extend(method_rows)
 
     assign_change_quartiles(condition_rows)
     _write_csv(output / "condition_fidelity_rows.csv", condition_rows)
     _write_csv(output / "generation_hidden_fidelity_rows.csv", hidden_rows)
+    _write_csv(output / "gate_ablation_rows.csv", gate_rows)
+    _write_csv(output / "generation_method_fidelity_rows.csv", generation_method_rows)
+    _write_csv(output / "generation_action_step_rows.csv", action_step_rows)
+    _write_csv(output / "generation_schedule_rows.csv", schedule_rows)
+    _write_csv(output / "latency_samples.csv", latency_rows)
     condition_summary = _group_summary(
         condition_rows,
         group_fields=("regime", "age", "variant"),
@@ -796,9 +1307,57 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "velocity_cosine",
         ),
     )
+    gate_summary = _group_summary(
+        gate_rows,
+        group_fields=("age", "gate_mode"),
+        metrics=(
+            "condition_normalized_mse",
+            "condition_cosine",
+            "condition_delta_cosine",
+            "nfe10_first5_l1",
+            "nfe10_full_chunk_l1",
+        ),
+    )
+    generation_method_summary = _group_summary(
+        generation_method_rows,
+        group_fields=("method",),
+        metrics=(
+            "vs_original_first5_l1",
+            "vs_original_full_chunk_l1",
+            "vs_original_translation_l1",
+            "vs_original_rotation_l1",
+            "vs_original_gripper_l1",
+            "vs_original_first5_cosine",
+            "vs_original_full_cosine",
+            "vs_teacher_first5_l1",
+        ),
+    )
+    action_step_summary = _group_summary(
+        action_step_rows,
+        group_fields=("method", "action_step"),
+        metrics=("vs_original_l1", "vs_original_cosine"),
+    )
+    schedule_summary = _group_summary(
+        schedule_rows,
+        group_fields=("schedule",),
+        metrics=(
+            "vs_original_first5_l1",
+            "vs_original_full_chunk_l1",
+            "vs_original_first5_cosine",
+            "vs_teacher_first5_l1",
+        ),
+    )
     all_numeric = [
         float(value)
-        for row in condition_rows + hidden_rows
+        for row in (
+            condition_rows
+            + hidden_rows
+            + gate_rows
+            + generation_method_rows
+            + action_step_rows
+            + schedule_rows
+            + latency_rows
+        )
         for value in row.values()
         if isinstance(value, (float, int)) and not isinstance(value, bool)
     ]
@@ -811,6 +1370,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "latent_approximation": "Exact teacher latent and same-noise downstream action fidelity.",
             "observation_importance": "Paired current/stale/partial/same-task-shuffled observation counterfactuals.",
             "generation_approximation": "Skipped action-transformer hidden state versus a local exact call at the same flow state.",
+            "naive_control": "Same-condition and same-noise direct Original NFE10, Naive NFE3, and learned N_G=3 action comparison.",
+            "gate_causality": "Inference-only learned/fixed/unit/hold gate controls with the same learned residual.",
+            "latency": "Batch-one RTX 5090 module timings with CUDA-event synchronization.",
         },
         "dataset": {
             "heldout_windows_available": len(dataset),
@@ -819,6 +1381,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "action_queries_analyzed": len(action_keys),
             "generation_queries_requested": args.generation_queries,
             "generation_queries_analyzed": len(generation_keys),
+            "schedule_queries_requested": args.schedule_queries,
+            "schedule_queries_analyzed": len(schedule_keys),
             "split_sha256": dataset.split_sha256,
             "split_seed": args.split_seed,
         },
@@ -837,6 +1401,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "condition_summary": condition_summary,
         "observation_change_strata": observation_strata,
         "generation_hidden_summary": generation_summary,
+        "gate_ablation_summary": gate_summary,
+        "generation_method_summary": generation_method_summary,
+        "generation_action_step_summary": action_step_summary,
+        "generation_schedule_summary": schedule_summary,
+        "valid_generation_schedules": [list(value) for value in candidate_schedules],
+        "latency_summary": latency_summary,
         "elapsed_seconds": time.perf_counter() - started,
         "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
         "git_commit": subprocess.check_output(
@@ -861,6 +1431,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--condition-windows", type=int, default=0)
     parser.add_argument("--action-queries", type=int, default=512)
     parser.add_argument("--generation-queries", type=int, default=256)
+    parser.add_argument("--schedule-queries", type=int, default=128)
+    parser.add_argument("--latency-warmup", type=int, default=10)
+    parser.add_argument("--latency-repeats", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--heldout-fraction", type=float, default=0.2)
     parser.add_argument("--split-seed", type=int, default=20260822)

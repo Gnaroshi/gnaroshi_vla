@@ -14,7 +14,7 @@ PYTHON="${SIMVLA_PYTHON:-${STORAGE}/envs/simvla/libero_mujoco237/bin/python}"
 GPU="${SIMVLA_ANALYSIS_GPU:-0}"
 MIN_FREE_MIB="${SIMVLA_ANALYSIS_MIN_FREE_MIB:-28000}"
 WAIT_SECONDS="${SIMVLA_ANALYSIS_WAIT_SECONDS:-120}"
-RESULT_ROOT="${SIMVLA_ANALYSIS_RESULT_ROOT:-${STORAGE}/results/simvla/analysis/latent_fidelity_observation_v1}"
+RESULT_ROOT="${SIMVLA_ANALYSIS_RESULT_ROOT:-${STORAGE}/results/simvla/analysis/reviewer_mechanism_v1}"
 CACHE="${SIMVLA_EXACT_CACHE:-${STORAGE}/results/simvla/latentloop/simvla_efficient_coupled_multirate_latentloop_sigfix_v1/03_exact_teacher_cache}"
 CONDITION_CKPT="${SIMVLA_CONDITION_CHECKPOINT:-${STORAGE}/artifacts/simvla/fixed_2x2_inputs_v1/condition/native_v0_step_150000.pt}"
 PARENT_GENERATION_CKPT="${SIMVLA_PARENT_GENERATION_CHECKPOINT:-${STORAGE}/artifacts/simvla/generation_eval_bundle_20260824_v1/checkpoint/generation_step_030000.pt}"
@@ -79,6 +79,9 @@ run_analysis() {
   local condition_windows=$2
   local action_queries=$3
   local generation_queries=$4
+  local schedule_queries=$5
+  local latency_warmup=$6
+  local latency_repeats=$7
   local final="${RESULT_ROOT}/${label}"
   local summary="${final}/latent_fidelity_analysis.json"
   if test -f "${summary}" && grep -q 'LATENT_FIDELITY_ANALYSIS_COMPLETE' "${summary}"; then
@@ -111,10 +114,17 @@ run_analysis() {
     --condition-windows "${condition_windows}" \
     --action-queries "${action_queries}" \
     --generation-queries "${generation_queries}" \
+    --schedule-queries "${schedule_queries}" \
+    --latency-warmup "${latency_warmup}" \
+    --latency-repeats "${latency_repeats}" \
     --batch-size 4 \
     --seed 20260831 \
     --physical-gpu "${GPU}"
   test -f "${staging}/latent_fidelity_analysis.json"
+  test -f "${staging}/generation_method_fidelity_rows.csv"
+  test -f "${staging}/gate_ablation_rows.csv"
+  test -f "${staging}/generation_schedule_rows.csv"
+  test -f "${staging}/latency_samples.csv"
   grep -q 'LATENT_FIDELITY_ANALYSIS_COMPLETE' "${staging}/latent_fidelity_analysis.json"
   mv "${staging}" "${final}"
   echo "ANALYSIS_COMPLETE label=${label} output=${final}"
@@ -127,13 +137,13 @@ if [[ "${MODE}" == "--preflight" ]]; then
 fi
 
 wait_for_gpu
-run_analysis smoke 8 8 4
+run_analysis smoke 8 8 4 4 1 3
 if [[ "${MODE}" == "--smoke" ]]; then
   printf 'verdict=LATENT_FIDELITY_SMOKE_COMPLETE\nexit_code=0\nstage=smoke\n' > "${STATUS}"
   exit 0
 fi
 
-run_analysis full 0 512 256
+run_analysis full 0 512 512 128 10 50
 printf 'verdict=LATENT_FIDELITY_ANALYSIS_COMPLETE\nexit_code=0\nstage=complete\nresult=%s\n' \
   "${RESULT_ROOT}/full" > "${STATUS}"
 echo "LATENT_FIDELITY_ANALYSIS_COMPLETE output=${RESULT_ROOT}/full"
