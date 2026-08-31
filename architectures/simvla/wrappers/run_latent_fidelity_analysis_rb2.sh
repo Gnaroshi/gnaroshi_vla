@@ -143,7 +143,7 @@ if [[ "${MODE}" == "--smoke" ]]; then
   exit 0
 fi
 
-run_analysis full 0 512 512 128 10 50
+run_analysis full 512 512 512 128 10 50
 printf 'verdict=LATENT_FIDELITY_ANALYSIS_COMPLETE\nexit_code=0\nstage=complete\nresult=%s\n' \
   "${RESULT_ROOT}/full" > "${STATUS}"
 echo "LATENT_FIDELITY_ANALYSIS_COMPLETE output=${RESULT_ROOT}/full"
