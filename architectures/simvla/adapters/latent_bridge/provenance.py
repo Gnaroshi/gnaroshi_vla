@@ -35,7 +35,13 @@ INTEGRATION_FILES = (
     "architectures/simvla/adapters/latent_bridge/policy.py",
     "architectures/simvla/adapters/latent_bridge/prepare_cache.py",
     "architectures/simvla/adapters/latent_bridge/provenance.py",
+    "architectures/simvla/adapters/latent_bridge/recipe.py",
+    "architectures/simvla/adapters/latent_bridge/summarize.py",
     "architectures/simvla/adapters/latent_bridge/train.py",
+    "architectures/simvla/wrappers/simvla_latent_bridge_collect_sync.sh",
+    "architectures/simvla/wrappers/simvla_latent_bridge_eval.sh",
+    "architectures/simvla/wrappers/simvla_latent_bridge_paper_pipeline.sh",
+    "architectures/simvla/wrappers/simvla_latent_bridge_train.sh",
 )
 SIMVLA_CONTRACT_FILES = (
     "models/modeling_smolvlm_vla.py",

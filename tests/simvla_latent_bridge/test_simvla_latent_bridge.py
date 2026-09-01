@@ -16,6 +16,9 @@ from architectures.simvla.adapters.latent_bridge.condition_hook import (
     SimVLAConditionWithStableHook,
     resolve_text_layers,
 )
+from architectures.simvla.adapters.latent_bridge.collect_sync import (
+    _adjacent_feature_statistics,
+)
 from architectures.simvla.adapters.latent_bridge.dataset import (
     DAGGER_SCHEMA,
     SYNC_SCHEMA,
@@ -27,12 +30,24 @@ from architectures.simvla.adapters.latent_bridge.model import (
     SimVLALatentBridge,
     SimVLALatentBridgeConfig,
 )
+from architectures.simvla.adapters.latent_bridge.eval import parser as eval_parser
 from architectures.simvla.adapters.latent_bridge.provenance import (
     OFFICIAL_COMMIT,
     latent_bridge_source_manifest,
     resolve_upstream_root,
     simvla_latent_bridge_integration_manifest,
 )
+from architectures.simvla.adapters.latent_bridge.recipe import (
+    EVALUATION_ROWS,
+    SIMVLA_TOKEN_EVIDENCE,
+    evaluation_row,
+    scientific_contract,
+)
+from architectures.simvla.adapters.latent_bridge.train import (
+    apply_training_recipe,
+    parser as train_parser,
+)
+from architectures.simvla.adapters.latent_bridge.summarize import summarize
 from architectures.simvla.adapters.latentloop.native_v0_dataset import (
     stable_episode_partition,
 )
@@ -68,13 +83,130 @@ def test_official_source_is_pinned_clean_and_hash_exact(official_root: Path) -> 
 
 def test_default_bridge_matches_official_capacity(bridge: SimVLALatentBridge) -> None:
     assert bridge.parameter_audit() == {
-        "total": 183_584_448,
-        "trainable": 183_584_448,
-        "total_millions": 183.584448,
+        "total": 183_622_848,
+        "trainable": 183_622_848,
+        "total_millions": 183.622848,
     }
     assert bridge.config.feature_dim == 960
-    assert bridge.config.sequence_length == 72
-    assert bridge.config.token_mode == "image_only"
+    assert bridge.config.sequence_length == 122
+    assert bridge.config.token_mode == "all"
+
+
+def test_simvla_primary_token_contract_is_evidence_backed() -> None:
+    evidence = SIMVLA_TOKEN_EVIDENCE
+    assert evidence["episodes"] == 20
+    assert evidence["policy_queries"] == 1062
+    assert evidence["adjacent_cosine"]["language_positions_50"] < 0.9999
+    assert scientific_contract()["training_recipes"]["r0"]["token_mode"] == "all"
+
+
+def test_canonical_eval_rows_bind_names_to_fixed_refresh_periods() -> None:
+    assert set(EVALUATION_ROWS) == {
+        "baseline_k1",
+        "latent_bridge_f3",
+        "latent_bridge_f4",
+    }
+    assert evaluation_row("baseline_k1").refresh_every == 1
+    assert evaluation_row("latent_bridge_f3").refresh_every == 3
+    assert evaluation_row("latent_bridge_f4").refresh_every == 4
+    args = eval_parser().parse_args(["--output", "out", "--norm-stats", "norm.json"])
+    assert args.rows == ["baseline_k1", "latent_bridge_f3", "latent_bridge_f4"]
+    assert args.num_trials == 20
+    assert not hasattr(args, "refresh_every")
+    assert args.bridge_precision == "bf16"
+    assert args.compile_bridge is False
+
+
+def test_r0_and_r1_recipe_defaults_are_stage_specific() -> None:
+    r0 = train_parser().parse_args(
+        ["--stage", "r0", "--sync-root", "sync", "--output", "r0"]
+    )
+    apply_training_recipe(r0)
+    assert r0.epochs == 200
+    assert r0.learning_rate == pytest.approx(3e-4)
+    assert r0.weight_decay == pytest.approx(1e-4)
+    assert r0.cosine_weight == pytest.approx(1.0)
+    assert r0.precision == "bf16"
+    assert r0.token_mode == "all"
+    assert r0.recipe_contract["effective_batch_size"] == 64
+    assert r0.recipe_contract["compliant"] is True
+
+    r1 = train_parser().parse_args(
+        ["--stage", "r1", "--sync-root", "sync", "--output", "r1"]
+    )
+    apply_training_recipe(r1)
+    assert r1.epochs == 100
+    assert r1.learning_rate == pytest.approx(3e-5)
+
+
+def test_recipe_rejects_unlabeled_effective_batch_deviation() -> None:
+    args = train_parser().parse_args(
+        [
+            "--stage",
+            "r0",
+            "--sync-root",
+            "sync",
+            "--output",
+            "r0",
+            "--batch-size",
+            "4",
+            "--gradient-accumulation-steps",
+            "1",
+        ]
+    )
+    with pytest.raises(ValueError, match="effective_batch_size"):
+        apply_training_recipe(args)
+
+
+def test_three_seed_summary_requires_complete_canonical_rows(tmp_path: Path) -> None:
+    root = tmp_path / "eval"
+    for seed in (0, 1, 2):
+        seed_root = root / f"seed{seed}"
+        seed_root.mkdir(parents=True)
+        (seed_root / "environment_metadata.json").write_text(
+            json.dumps(
+                {
+                    "evaluation_seed": seed,
+                    "rows": list(EVALUATION_ROWS),
+                    "trials_per_task": 20,
+                    "renderer": {"MUJOCO_GL": "egl"},
+                    "checkpoint": "base",
+                    "bridge_checkpoint": "bridge",
+                    "norm_stats_sha256": "norm",
+                }
+            ),
+            encoding="utf-8",
+        )
+        summaries = {}
+        for index, row_name in enumerate(EVALUATION_ROWS):
+            summaries[row_name] = {
+                "episodes": 200,
+                "success_rate": 0.95 + 0.01 * index,
+                "latency_per_executed_action_ms": 20.0 - index,
+                "speedup_vs_baseline": 20.0 / (20.0 - index),
+                "refresh_every": evaluation_row(row_name).refresh_every,
+                "expected_full_vlm_call_saving": evaluation_row(
+                    row_name
+                ).full_vlm_call_saving,
+                "observed_full_vlm_call_saving": evaluation_row(
+                    row_name
+                ).full_vlm_call_saving,
+            }
+        (seed_root / "comparison_summary.json").write_text(
+            json.dumps(
+                {
+                    "verdict": "SIMVLA_LATENT_BRIDGE_EVAL_COMPLETE",
+                    "summaries": summaries,
+                }
+            ),
+            encoding="utf-8",
+        )
+    result = summarize(root, tmp_path / "summary")
+    assert result["verdict"] == "SIMVLA_LATENT_BRIDGE_THREE_SEED_SUMMARY_COMPLETE"
+    assert result["rows"]["latent_bridge_f4"]["episodes"] == 600
+    assert result["rows"]["latent_bridge_f4"]["success_rate_mean"] == pytest.approx(
+        0.97
+    )
 
 
 def test_zero_initialized_bridge_is_identity(official_root: Path) -> None:
@@ -152,6 +284,17 @@ def test_external_hook_captures_middle_layer_without_model_patch() -> None:
         )
     assert torch.equal(output.stable, torch.ones(1, 3, 4))
     assert torch.equal(output.condition, torch.full((1, 3, 4), 3.0))
+
+
+def test_adjacent_feature_audit_uses_flattened_cosine() -> None:
+    records = [
+        {"stable": torch.tensor([[1.0, 0.0], [0.0, 1.0]])},
+        {"stable": torch.tensor([[2.0, 0.0], [0.0, 2.0]])},
+        {"stable": torch.tensor([[0.0, 1.0], [1.0, 0.0]])},
+    ]
+    values = _adjacent_feature_statistics(records, "stable")
+    assert values[0] == pytest.approx(1.0)
+    assert values[1] == pytest.approx(0.0)
 
 
 def test_checkpoint_roundtrip_preserves_config_and_weights(

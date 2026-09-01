@@ -32,6 +32,7 @@ from .provenance import (
     latent_bridge_source_manifest,
     simvla_latent_bridge_integration_manifest,
 )
+from .recipe import scientific_contract, training_recipe
 
 
 def set_seed(seed: int) -> None:
@@ -75,6 +76,69 @@ def _autocast(device: torch.device, precision: str) -> Any:
     return nullcontext()
 
 
+def apply_training_recipe(args: argparse.Namespace) -> argparse.Namespace:
+    """Resolve and enforce the paper feature-bridge training contract."""
+
+    recipe = training_recipe(args.stage)
+    defaults = {
+        "epochs": recipe.epochs,
+        "learning_rate": recipe.learning_rate,
+        "weight_decay": recipe.weight_decay,
+        "cosine_weight": recipe.cosine_weight,
+        "precision": recipe.precision,
+        "token_mode": recipe.token_mode,
+    }
+    for name, expected in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, expected)
+
+    deviations: dict[str, dict[str, Any]] = {}
+    checked = {
+        **defaults,
+        "max_grad_norm": recipe.max_grad_norm,
+        "hidden_dim": recipe.hidden_dim,
+        "num_heads": recipe.num_heads,
+        "num_blocks": recipe.num_blocks,
+        "stable_layer_index": recipe.stable_layer_index,
+        "flow_matching": recipe.flow_matching,
+    }
+    for name, expected in checked.items():
+        observed = getattr(args, name)
+        if observed != expected:
+            deviations[name] = {"expected": expected, "observed": observed}
+
+    effective_batch = args.batch_size * args.gradient_accumulation_steps
+    if effective_batch != recipe.effective_batch_size:
+        deviations["effective_batch_size"] = {
+            "expected": recipe.effective_batch_size,
+            "observed": effective_batch,
+        }
+    if args.max_steps is not None:
+        deviations["max_steps"] = {
+            "expected": None,
+            "observed": args.max_steps,
+        }
+    if deviations and not args.allow_recipe_deviation:
+        details = ", ".join(
+            f"{name}={item['observed']!r} (expected {item['expected']!r})"
+            for name, item in sorted(deviations.items())
+        )
+        raise ValueError(
+            f"paper feature-bridge recipe deviation: {details}; "
+            "use --allow-recipe-deviation only for a labeled ablation or smoke test"
+        )
+    args.recipe_contract = {
+        "name": "paper_feature_bridge",
+        "stage": recipe.serializable(),
+        "compliant": not deviations,
+        "deviations": deviations,
+        "micro_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "effective_batch_size": effective_batch,
+    }
+    return args
+
+
 def evaluate(
     model: SimVLALatentBridge,
     loader: DataLoader[Any],
@@ -106,6 +170,7 @@ def evaluate(
 
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
+    args = apply_training_recipe(args)
     if args.epochs < 1 or args.batch_size < 1 or args.gradient_accumulation_steps < 1:
         raise ValueError("epochs, batch_size, and gradient_accumulation_steps must be positive")
     if args.max_steps is not None and args.max_steps < 1:
@@ -117,6 +182,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "R1 DAgger training requires --resume <R0 checkpoint> and "
             "--weights-only-resume"
         )
+    if args.stage == "r0" and args.dagger_root:
+        raise ValueError("R0 cannot consume DAgger data")
+    if args.stage == "r1" and not args.dagger_root:
+        raise ValueError("R1 requires --dagger-root")
     output = Path(args.output).expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"refusing existing training output: {output}")
@@ -207,6 +276,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "combined_sha256"
     ]:
         raise RuntimeError("training data and runtime SimVLA integration source differ")
+    stable_layer_contract = data_manifest.get("stable_layer_contract")
+    if args.sync_root and not (
+        isinstance(stable_layer_contract, dict)
+        and stable_layer_contract.get("passed") is True
+    ):
+        raise RuntimeError(
+            "R0 sync data does not verify the Latent Bridge stable-layer premise; "
+            "inspect stable_layer_contract before training"
+        )
     generator = torch.Generator().manual_seed(args.seed)
     training_source: Any = train_dataset
     dagger_dataset = None
@@ -244,6 +322,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
         model = SimVLALatentBridge(config).to(device)
         resume_payload = None
+    config_checks = {
+        "hidden_dim": config.hidden_dim == args.hidden_dim,
+        "num_heads": config.num_heads == args.num_heads,
+        "num_blocks": config.num_blocks == args.num_blocks,
+        "stable_layer_index": config.stable_layer_index == args.stable_layer_index,
+        "token_mode": config.token_mode == args.token_mode,
+    }
+    failed_config = [name for name, passed in config_checks.items() if not passed]
+    if failed_config:
+        raise RuntimeError(
+            f"checkpoint/model configuration violates requested recipe: {failed_config}"
+        )
     if int(data_manifest["stable_layer_index"]) != config.stable_layer_index:
         raise RuntimeError("bridge configuration and training-data stable layer differ")
     if dagger_dataset is not None:
@@ -309,6 +399,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "dagger_manifest": (
             dagger_dataset.manifest if dagger_dataset is not None else None
         ),
+        "stable_layer_contract": stable_layer_contract,
     }
     run_config = vars(args).copy()
     run_config.update(
@@ -318,10 +409,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "micro_batch_size": args.batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "effective_batch_size": args.batch_size * args.gradient_accumulation_steps,
+            "scientific_contract": scientific_contract(),
             "official_recipe_relation": (
-                "SingleStepDiT architecture and R0/R1 optimizer defaults; "
-                "epoch-wise cosine schedule matches the pinned trainer; direct delta is selected "
-                "because the pinned official CLI marks --no_flow recommended"
+                "Paper feature-bridge hyperparameters are the scientific contract. "
+                "The pinned SingleStepDiT supplies released model mechanics. Direct "
+                "delta follows the released trainer's recommended --no_flow path. "
+                "R1 restarts optimizer/epoch state from R0 weights because the data "
+                "distribution and learning rate change."
             ),
         }
     )
@@ -428,6 +522,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 model,
                 provenance=source,
                 training=checkpoint_training,
+                optimizer=optimizer,
             )
         if stop:
             break
@@ -442,6 +537,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "last_checkpoint": str(output / "last.pt"),
         "parameter_audit": model.parameter_audit(),
         "flow_matching": bool(args.flow_matching),
+        "recipe_contract": args.recipe_contract,
     }
     (output / "run_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -451,28 +547,29 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
+    value.add_argument("--stage", choices=("r0", "r1"), required=True)
     value.add_argument("--sync-root")
     value.add_argument("--sidecar")
     value.add_argument("--output", required=True)
     value.add_argument("--resume")
     value.add_argument("--weights-only-resume", action="store_true")
     value.add_argument("--dagger-root")
-    value.add_argument("--epochs", type=int, default=100)
+    value.add_argument("--epochs", type=int)
     value.add_argument("--max-steps", type=int)
-    value.add_argument("--batch-size", type=int, default=64)
-    value.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    value.add_argument("--learning-rate", type=float, default=3e-4)
-    value.add_argument("--weight-decay", type=float, default=0.01)
+    value.add_argument("--batch-size", type=int, default=4)
+    value.add_argument("--gradient-accumulation-steps", type=int, default=16)
+    value.add_argument("--learning-rate", type=float)
+    value.add_argument("--weight-decay", type=float)
     value.add_argument("--num-workers", type=int, default=4)
     value.add_argument("--hidden-dim", type=int, default=768)
     value.add_argument("--num-heads", type=int, default=12)
     value.add_argument("--num-blocks", type=int, default=12)
     value.add_argument("--low-rank", type=int, default=0)
     value.add_argument("--stable-layer-index", type=int, default=10)
-    value.add_argument("--token-mode", choices=("all", "image_only"), default="image_only")
+    value.add_argument("--token-mode", choices=("all", "image_only"))
     value.add_argument("--flow-matching", action="store_true")
-    value.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
-    value.add_argument("--cosine-weight", type=float, default=0.0)
+    value.add_argument("--precision", choices=("fp32", "bf16"))
+    value.add_argument("--cosine-weight", type=float)
     value.add_argument("--max-grad-norm", type=float, default=1.0)
     value.add_argument("--heldout-fraction", type=float, default=0.1)
     value.add_argument("--split-seed", type=int, default=42)
@@ -480,6 +577,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--log-interval", type=int, default=20)
     value.add_argument("--skip-sidecar-hashes", action="store_true")
     value.add_argument("--allow-nonproduction-flow-steps", action="store_true")
+    value.add_argument("--allow-recipe-deviation", action="store_true")
     value.add_argument("--device", default="cuda")
     return value
 

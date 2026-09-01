@@ -14,7 +14,7 @@ from .provenance import load_official_bridge_core
 @dataclass(frozen=True)
 class SimVLALatentBridgeConfig:
     feature_dim: int = 960
-    sequence_length: int = 72
+    sequence_length: int = 122
     hidden_dim: int = 768
     num_heads: int = 12
     num_blocks: int = 12
@@ -24,7 +24,7 @@ class SimVLALatentBridgeConfig:
     action_dim: int = 7
     low_rank: int = 0
     stable_layer_index: int = 10
-    token_mode: str = "image_only"
+    token_mode: str = "all"
     image_token_count: int = 72
 
     def validate(self) -> None:
@@ -48,8 +48,9 @@ class SimVLALatentBridgeConfig:
 class SimVLALatentBridge(nn.Module):
     """Single-step feature-delta predictor with the official Latent Bridge DiT core.
 
-    The wiring matches official ``SingleStepDiT``. The primary configuration uses
-    SimVLA's 72 image-token positions from its pre-action-projection condition.
+    The wiring matches official ``SingleStepDiT``. The primary SimVLA
+    configuration predicts all 122 fused action-condition positions because
+    both visual and language positions change materially across policy queries.
     """
 
     def __init__(

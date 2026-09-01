@@ -35,6 +35,7 @@ from .provenance import (
     latent_bridge_source_manifest,
     simvla_latent_bridge_integration_manifest,
 )
+from .recipe import EVALUATION_ROWS, evaluation_row, scientific_contract
 
 
 def _configure_paths() -> tuple[Path, Path]:
@@ -149,6 +150,7 @@ def _make_policy(
     task_id: int,
     trial_id: int,
 ) -> Any:
+    row_contract = evaluation_row(row)
     common = dict(
         model=model,
         processor=processor,
@@ -165,7 +167,7 @@ def _make_policy(
         action_noise_seed_base=args.action_noise_seed_base,
         log_action_chunks=False,
     )
-    if row == "baseline_k1":
+    if not row_contract.uses_bridge:
         return SynchronizedFullPolicy(
             dcld_core=None, mode="full", refresh_every=1, **common
         )
@@ -173,21 +175,29 @@ def _make_policy(
         raise RuntimeError("Latent Bridge row requires a bridge checkpoint")
     return RealSimVLALatentBridgePolicy(
         bridge=bridge,
-        refresh_every=args.refresh_every,
+        refresh_every=row_contract.refresh_every,
         collect_dagger_teacher=args.collect_dagger_teacher,
         **common,
     )
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
-    supported_rows = {"baseline_k1", "latent_bridge_k4"}
+    supported_rows = set(EVALUATION_ROWS)
     unknown_rows = set(args.rows) - supported_rows
     if unknown_rows:
         raise ValueError(f"unsupported rows: {sorted(unknown_rows)}")
-    if args.refresh_every < 1:
-        raise ValueError("refresh_every must be positive")
     if args.trial_offset < 0 or args.num_trials < 1:
         raise ValueError("trial_offset must be non-negative and num_trials positive")
+    if args.collect_dagger_teacher and args.rows != ["latent_bridge_f3"]:
+        raise ValueError(
+            "paper feature-bridge DAgger collection must use only latent_bridge_f3"
+        )
+    if args.collect_dagger_teacher and args.compile_bridge:
+        raise ValueError("DAgger collection uses the uncompiled bridge training path")
+    if args.environment_seed is None:
+        args.environment_seed = args.seed
+    if args.action_noise_seed_base is None:
+        args.action_noise_seed_base = args.seed
     upstream, libero = _configure_paths()
     output = Path(args.output).expanduser().resolve()
     if output.exists():
@@ -197,12 +207,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     model, processor = _load_simvla(args, device)
     bridge = None
     bridge_payload = None
-    if any(row != "baseline_k1" for row in args.rows):
+    bridge_parameter_audit = None
+    if any(evaluation_row(row).uses_bridge for row in args.rows):
         if not args.bridge_checkpoint:
             raise ValueError("--bridge-checkpoint is required for Latent Bridge rows")
         bridge, bridge_payload = load_bridge_checkpoint(
             args.bridge_checkpoint, device=device
         )
+        bridge_parameter_audit = bridge.parameter_audit()
+        if args.bridge_precision == "bf16":
+            if device.type != "cuda":
+                raise ValueError("bf16 bridge evaluation requires CUDA")
+            bridge = bridge.to(dtype=torch.bfloat16)
         bridge.eval()
         for parameter in bridge.parameters():
             parameter.requires_grad_(False)
@@ -214,6 +230,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         current_norm_hash = sha256_file(args.norm_stats)
         if checkpoint_identity.get("norm_stats_sha256") != current_norm_hash:
             raise RuntimeError("bridge training and evaluation norm stats differ")
+        if args.compile_bridge:
+            bridge = torch.compile(bridge, mode="max-autotune")
+            sequence_length = bridge.config.sequence_length
+            feature_dim = bridge.config.feature_dim
+            bridge_dtype = next(bridge.parameters()).dtype
+            with torch.inference_mode():
+                bridge.predict_next(
+                    torch.zeros(
+                        1, sequence_length, feature_dim, device=device, dtype=bridge_dtype
+                    ),
+                    torch.zeros(
+                        1, sequence_length, feature_dim, device=device, dtype=bridge_dtype
+                    ),
+                    torch.zeros(1, bridge.config.state_dim, device=device, dtype=bridge_dtype),
+                    torch.zeros(1, bridge.config.action_dim, device=device, dtype=bridge_dtype),
+                )
+            torch.cuda.synchronize(device)
     from libero.libero import benchmark
 
     suite = benchmark.get_benchmark_dict()[args.suite]()
@@ -230,7 +263,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             if args.bridge_checkpoint
             else None
         ),
-        "bridge_parameter_audit": bridge.parameter_audit() if bridge is not None else None,
+        "bridge_parameter_audit": bridge_parameter_audit,
         "latent_bridge_source": latent_bridge_source_manifest(),
         "simvla_latent_bridge_integration": simvla_latent_bridge_integration_manifest(),
         "simvla_upstream_root": str(upstream),
@@ -240,10 +273,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "trials_per_task": args.num_trials,
         "trial_offset": args.trial_offset,
         "rows": args.rows,
+        "row_contracts": {
+            row: evaluation_row(row).serializable() for row in args.rows
+        },
         "action_horizon": 10,
         "execution_horizon": 5,
         "flow_steps": 10,
-        "refresh_every": args.refresh_every,
+        "evaluation_seed": args.seed,
         "client_resize_size": 224,
         "num_wait_steps": 10,
         "max_policy_actions": args.max_policy_steps,
@@ -253,10 +289,21 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             key: os.environ.get(key)
             for key in ("MUJOCO_GL", "PYOPENGL_PLATFORM", "EGL_DEVICE_ID")
         },
+        "runtime_stack": {
+            "bridge_precision": args.bridge_precision,
+            "bridge_compile": bool(args.compile_bridge),
+            "bridge_compile_mode": "max-autotune" if args.compile_bridge else None,
+            "comparison_axis": (
+                "official_optimized_secondary"
+                if args.compile_bridge
+                else "matched_eager_primary"
+            ),
+        },
         "comparison_label": (
             "official-algorithm SimVLA adaptation; not official Latent Bridge "
             "SimVLA code"
         ),
+        "scientific_contract": scientific_contract(),
         "bridge_checkpoint_provenance": (
             bridge_payload.get("provenance") if bridge_payload is not None else None
         ),
@@ -265,6 +312,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     all_rows: list[dict[str, Any]] = []
     summaries: dict[str, Any] = {}
     for row_name in args.rows:
+        row_contract = evaluation_row(row_name)
         row_output = output / row_name
         row_output.mkdir()
         episode_rows: list[dict[str, Any]] = []
@@ -358,7 +406,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     episode_rows.append(episode)
                     all_rows.append(episode)
                     _append_jsonl(row_output / "progress.jsonl", episode)
-                    if args.collect_dagger_teacher and row_name != "baseline_k1":
+                    if args.collect_dagger_teacher and row_contract.uses_bridge:
                         dagger_dir = row_output / "dagger"
                         dagger_dir.mkdir(exist_ok=True)
                         dagger_path = dagger_dir / f"task{task_id:02d}_trial{trial_id:03d}.pt"
@@ -413,6 +461,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "full_vlm_calls": sum(item["num_full_vlm_calls"] for item in episode_rows),
             "bridge_calls": sum(item["num_condition_updater_calls"] for item in episode_rows),
+            "refresh_every": row_contract.refresh_every,
+            "expected_full_vlm_call_saving": row_contract.full_vlm_call_saving,
         }
         if dagger_entries:
             _write_json(
@@ -435,7 +485,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     "trial_offset": args.trial_offset,
                     "trials_per_task": args.num_trials,
                     "episodes": len(dagger_entries),
-                    "refresh_every": args.refresh_every,
+                    "refresh_every": row_contract.refresh_every,
                     "action_horizon": 10,
                     "execution_horizon": 5,
                     "flow_steps": 10,
@@ -454,8 +504,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         _write_json(row_output / "summary.json", summaries[row_name])
     if "baseline_k1" in summaries:
         baseline_ms = summaries["baseline_k1"]["latency_per_executed_action_ms"]
+        baseline_calls = summaries["baseline_k1"]["full_vlm_calls"]
         for row_name, summary in summaries.items():
             summary["speedup_vs_baseline"] = baseline_ms / summary["latency_per_executed_action_ms"]
+            summary["observed_full_vlm_call_saving"] = (
+                1.0 - summary["full_vlm_calls"] / baseline_calls
+                if baseline_calls
+                else None
+            )
     result = {
         "verdict": "SIMVLA_LATENT_BRIDGE_EVAL_COMPLETE",
         "summaries": summaries,
@@ -473,20 +529,26 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--smolvlm-model", default=DEFAULT_SMOLVLM)
     value.add_argument("--norm-stats", required=True)
     value.add_argument("--bridge-checkpoint")
-    value.add_argument("--rows", nargs="+", default=["baseline_k1", "latent_bridge_k4"])
+    value.add_argument(
+        "--rows",
+        nargs="+",
+        default=["baseline_k1", "latent_bridge_f3", "latent_bridge_f4"],
+    )
     value.add_argument(
         "--suite",
         choices=("libero_10", "libero_spatial", "libero_object", "libero_goal"),
         default="libero_10",
     )
-    value.add_argument("--num-trials", type=int, default=10)
+    value.add_argument("--num-trials", type=int, default=20)
     value.add_argument("--trial-offset", type=int, default=0)
     value.add_argument("--max-tasks", type=int)
     value.add_argument("--max-policy-steps", type=int, default=900)
-    value.add_argument("--refresh-every", type=int, default=4)
-    value.add_argument("--action-noise-seed-base", type=int, default=20260901)
-    value.add_argument("--environment-seed", type=int, default=7)
+    value.add_argument("--seed", type=int, default=0)
+    value.add_argument("--action-noise-seed-base", type=int)
+    value.add_argument("--environment-seed", type=int)
     value.add_argument("--collect-dagger-teacher", action="store_true")
+    value.add_argument("--bridge-precision", choices=("fp32", "bf16"), default="bf16")
+    value.add_argument("--compile-bridge", action="store_true")
     value.add_argument("--save-video", action="store_true")
     value.add_argument("--video-stride", type=int, default=2)
     value.add_argument("--video-failures-only", action="store_true")

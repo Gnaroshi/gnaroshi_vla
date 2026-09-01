@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn import functional as F
 from tqdm.auto import tqdm
 
 from architectures.simvla.adapters.latentloop.native_v0_runtime import (
@@ -29,6 +30,7 @@ from .provenance import (
     latent_bridge_source_manifest,
     simvla_latent_bridge_integration_manifest,
 )
+from .recipe import STABLE_LAYER_MIN_COSINE
 
 
 def _git(path: Path) -> str:
@@ -105,6 +107,17 @@ def _transitions(records: list[dict[str, torch.Tensor]]) -> list[dict[str, Any]]
     ]
 
 
+def _adjacent_feature_statistics(
+    records: list[dict[str, torch.Tensor]], key: str
+) -> list[float]:
+    values: list[float] = []
+    for index in range(len(records) - 1):
+        left = records[index][key].float().reshape(1, -1)
+        right = records[index + 1][key].float().reshape(1, -1)
+        values.append(float(F.cosine_similarity(left, right, dim=-1).item()))
+    return values
+
+
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     if args.num_trials < 2 or args.trial_offset < 0:
         raise ValueError("sync collection requires at least two trials and non-negative offset")
@@ -122,6 +135,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     task_count = min(int(suite.get_num_tasks()), args.max_tasks or int(suite.get_num_tasks()))
     task_ids = list(reversed(range(task_count)))
     shards: list[dict[str, Any]] = []
+    stable_adjacent_cosines: list[float] = []
+    final_adjacent_cosines: list[float] = []
     successes = 0
     progress = tqdm(
         total=task_count * args.num_trials, desc="full SimVLA sync collection", dynamic_ncols=True
@@ -169,6 +184,12 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
                 finally:
                     policy.close()
                 transitions = _transitions(policy.records)
+                stable_adjacent_cosines.extend(
+                    _adjacent_feature_statistics(policy.records, "stable")
+                )
+                final_adjacent_cosines.extend(
+                    _adjacent_feature_statistics(policy.records, "condition")
+                )
                 shard = temporary / f"task{task_id:02d}_trial{trial_id:03d}.pt"
                 torch.save(
                     {
@@ -199,6 +220,20 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         finally:
             env.close()
     progress.close()
+    if not stable_adjacent_cosines or not final_adjacent_cosines:
+        raise RuntimeError("sync collection produced no adjacent feature pairs")
+    stable_mean = float(sum(stable_adjacent_cosines) / len(stable_adjacent_cosines))
+    final_mean = float(sum(final_adjacent_cosines) / len(final_adjacent_cosines))
+    stable_layer_contract = {
+        "metric": "mean flattened adjacent-query cosine",
+        "threshold_source": "Latent Bridge paper Section 3.2, stable layer cosine > 0.999",
+        "threshold": STABLE_LAYER_MIN_COSINE,
+        "stable_layer_index": args.stable_layer_index,
+        "stable_adjacent_cosine": stable_mean,
+        "final_condition_adjacent_cosine": final_mean,
+        "pairs": len(stable_adjacent_cosines),
+        "passed": stable_mean > STABLE_LAYER_MIN_COSINE,
+    }
     manifest = {
         "schema_version": SYNC_SCHEMA,
         "data_role": "on_policy_frozen_full_simvla_rollouts",
@@ -221,6 +256,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         "execution_horizon": 5,
         "flow_steps": 10,
         "stable_layer_index": args.stable_layer_index,
+        "stable_layer_contract": stable_layer_contract,
         "shards": shards,
         "episodes": len(shards),
         "successes": successes,
@@ -239,6 +275,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         "episodes": len(shards),
         "successes": successes,
         "transitions": manifest["total_transitions"],
+        "stable_layer_contract": stable_layer_contract,
     }
 
 
