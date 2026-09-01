@@ -46,8 +46,9 @@ ckpts/
 
 # Upstream architecture clones kept as separate git repositories unless
 # intentionally converted to git submodules.
-architectures/simvla/upstream/
-architectures/openpi/upstream/
+architectures/simvla/upstream
+architectures/openpi/upstream
+architectures/latent_bridge/upstream
 
 # Experiment results stay local. Keep only the repository-level schema.
 results/**
