@@ -456,7 +456,7 @@ def parser() -> argparse.ArgumentParser:
         choices=("libero_10", "libero_spatial", "libero_object", "libero_goal"),
         default="libero_10",
     )
-    value.add_argument("--num-trials", type=int, default=20)
+    value.add_argument("--num-trials", type=int, default=50)
     value.add_argument("--trial-offset", type=int, default=0)
     value.add_argument("--max-tasks", type=int)
     value.add_argument("--max-policy-steps", type=int, default=900)

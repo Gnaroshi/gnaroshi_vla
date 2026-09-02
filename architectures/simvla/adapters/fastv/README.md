@@ -105,7 +105,7 @@ bash architectures/simvla/wrappers/simvla_fastv_eval.sh \
   --device cuda
 ```
 
-For the paper comparison, remove `--max-tasks 1`, set `--num-trials 20`, and
+For the paper comparison, remove `--max-tasks 1`, set `--num-trials 50`, and
 run the same paired rows for each approved seed. The output records source
 hashes, environment metadata, per-episode outcomes, actual token counters,
 latencies, and videos when `--save-video` is enabled.

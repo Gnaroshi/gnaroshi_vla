@@ -236,6 +236,16 @@ def test_wrapper_has_a_heavy_run_guard_and_valid_shell_syntax() -> None:
     subprocess.run(["bash", "-n", str(wrapper)], check=True)
 
 
+def test_libero_long_launcher_is_guarded_and_fixed_to_primary_rows() -> None:
+    launcher = ROOT / "architectures/simvla/wrappers/simvla_fastv_libero_long.sh"
+    text = launcher.read_text(encoding="utf-8")
+    assert "SIMVLA_FASTV_LONG_RUN" in text
+    assert "--num-trials 50" in text
+    assert "--rows baseline_k1 fastv_k2_r50" in text
+    assert "fastv_k2_r50_hf_last_token" not in text
+    subprocess.run(["bash", "-n", str(launcher)], check=True)
+
+
 def test_default_rows_do_not_include_hf_diagnostic() -> None:
     assert set(EVALUATION_ROWS) == {
         "baseline_k1",
