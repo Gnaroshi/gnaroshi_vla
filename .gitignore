@@ -49,6 +49,7 @@ ckpts/
 architectures/simvla/upstream
 architectures/openpi/upstream
 architectures/latent_bridge/upstream
+architectures/fastv/upstream
 
 # Experiment results stay local. Keep only the repository-level schema.
 results/**
