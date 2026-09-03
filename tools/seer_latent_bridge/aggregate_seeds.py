@@ -53,19 +53,20 @@ def main() -> None:
                 "total_env_steps": sum(item["total_env_steps"] for item in seeds),
             }
         )
+    seed_count = len(payloads)
     result = {
-        "status": "SEER_LATENT_BRIDGE_THREE_EXECUTION_SEEDS_COMPLETE",
+        "status": "SEER_LATENT_BRIDGE_EXECUTION_SEED_AGGREGATION_COMPLETE",
         "replication_unit": (
-            "three execution seeds for one frozen Seer checkpoint and one trained bridge; "
-            "not three independent training seeds"
+            f"{seed_count} execution seed(s) for one frozen Seer checkpoint and one "
+            "trained bridge; not independent training seeds"
         ),
         "rows": rows,
         "per_seed_payloads": payloads,
     }
-    (output / "three_execution_seed_summary.json").write_text(
+    (output / "execution_seed_summary.json").write_text(
         json.dumps(result, indent=2), encoding="utf-8"
     )
-    with (output / "three_execution_seed_rows.csv").open("w", newline="", encoding="utf-8") as stream:
+    with (output / "execution_seed_rows.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         for row in rows:

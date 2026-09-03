@@ -8,10 +8,13 @@ import torch
 
 from .determinism import configure_deterministic_inference
 from .provenance import PUBLIC_SEER_33_SHA256, require_file_hash
+from .rendering import configured_renderer_backend
 from .runtime import seer_import_context
 
 
 def _build_profiled_wrapper(base_wrapper, determinism):
+    renderer = configured_renderer_backend()
+
     class ProfiledBaselineWrapper(base_wrapper):
         def __init__(self, *args, **kwargs):
             kwargs["lrnode_eval_profile_full_action_head"] = 1
@@ -39,7 +42,7 @@ def _build_profiled_wrapper(base_wrapper, determinism):
                 {
                     "method": "frozen_seer_baseline",
                     "peak_gpu_memory_bytes": int(self._baseline_peak_memory_bytes),
-                    "renderer_backend": "osmesa",
+                    "renderer_backend": renderer,
                     "determinism": determinism,
                 }
             )

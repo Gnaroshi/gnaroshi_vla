@@ -14,6 +14,7 @@ from .dataset import BridgeTransition, StreamingBridgeTransitionWriter
 from .hooks import SeerBoundaryCapture
 from .layout import SeerTokenLayout
 from .provenance import PUBLIC_SEER_33_SHA256, require_file_hash, sha256_file
+from .rendering import configured_renderer_backend
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -31,6 +32,7 @@ class LatentBridgePolicyMixin:
     """
 
     def _latent_bridge_initialize(self) -> None:
+        self._latent_bridge_renderer = configured_renderer_backend()
         checkpoint_path = Path(os.environ["SEER_LATENT_BRIDGE_CHECKPOINT"])
         bridge, payload = load_bridge_checkpoint(checkpoint_path, map_location="cpu")
         self._latent_bridge_provenance = validate_bridge_runtime_provenance(payload)
@@ -334,7 +336,7 @@ class LatentBridgePolicyMixin:
                     "three-token prediction with temporal ensembling; one executed action"
                 ),
                 "checkpoint_provenance": self._latent_bridge_provenance,
-                "renderer_backend": "osmesa",
+                "renderer_backend": self._latent_bridge_renderer,
                 "torch_deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
             }
         )
@@ -353,7 +355,7 @@ class LatentBridgePolicyMixin:
                     "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
                     "stable_layer": self._latent_bridge_config.stable_layer,
                     "stable_token_group": self._latent_bridge_config.stable_token_group,
-                    "renderer": "osmesa",
+                    "renderer": self._latent_bridge_renderer,
                     "action_protocol": "three-token prediction with temporal ensembling; one executed action",
                 }
             )

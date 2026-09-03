@@ -3,8 +3,19 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-os.environ["PYOPENGL_PLATFORM"] = "osmesa"
-os.environ['MUJOCO_GL'] = 'osmesa'
+_libero_gl_backend = os.environ.get("LIBERO_GL_BACKEND", "osmesa").strip().lower()
+if _libero_gl_backend not in {"egl", "osmesa"}:
+    raise ValueError(
+        f"LIBERO_GL_BACKEND must be 'egl' or 'osmesa', got {_libero_gl_backend!r}"
+    )
+os.environ["LIBERO_GL_BACKEND"] = _libero_gl_backend
+os.environ["PYOPENGL_PLATFORM"] = _libero_gl_backend
+os.environ['MUJOCO_GL'] = _libero_gl_backend
+_RENDERER_BACKEND_METADATA = {
+    "requested_backend": _libero_gl_backend,
+    "effective_backend": _libero_gl_backend,
+    "actual_context_verified": False,
+}
 
 from pathlib import Path
 import copy
@@ -65,6 +76,73 @@ def _is_rank0() -> bool:
         return (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)
     except Exception:
         return True
+
+
+def _renderer_gpu_device_id(local_device_id: int) -> int:
+    """Map torch local rank to the physical GPU expected by this robosuite EGL."""
+    if _RENDERER_BACKEND_METADATA["effective_backend"] != "egl":
+        return int(local_device_id)
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return int(local_device_id)
+    try:
+        physical_ids = [int(item.strip()) for item in visible.split(",")]
+    except ValueError as exc:
+        raise RuntimeError(
+            "this robosuite EGL backend requires numeric CUDA_VISIBLE_DEVICES entries; "
+            f"got {visible!r}"
+        ) from exc
+    if not 0 <= int(local_device_id) < len(physical_ids):
+        raise RuntimeError(
+            f"local render device {local_device_id} is outside CUDA_VISIBLE_DEVICES={visible!r}"
+        )
+    return physical_ids[int(local_device_id)]
+
+
+def _verify_renderer_backend(env, render_gpu_device_id: int) -> None:
+    """Verify the active GL context and reject software fallback for strict EGL runs."""
+    context = getattr(env.sim, "_render_context_offscreen", None)
+    gl_context = getattr(context, "gl_ctx", None)
+    if gl_context is None or not hasattr(gl_context, "make_current"):
+        raise RuntimeError("LIBERO offscreen renderer has no inspectable GL context")
+    gl_context.make_current()
+    from OpenGL import GL
+
+    def decode(value):
+        if value is None:
+            return None
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+
+    vendor = decode(GL.glGetString(GL.GL_VENDOR))
+    renderer = decode(GL.glGetString(GL.GL_RENDERER))
+    version = decode(GL.glGetString(GL.GL_VERSION))
+    combined = " ".join(value or "" for value in (vendor, renderer)).lower()
+    software = any(
+        token in combined
+        for token in ("llvmpipe", "softpipe", "software rasterizer", "mesa/x.org")
+    )
+    _RENDERER_BACKEND_METADATA.update(
+        {
+            "render_gpu_device_id": int(render_gpu_device_id),
+            "actual_gl_vendor": vendor,
+            "actual_gl_renderer": renderer,
+            "actual_gl_version": version,
+            "actual_context_verified": bool(vendor and renderer and version),
+            "software_renderer": software,
+        }
+    )
+    strict = os.environ.get("LIBERO_GL_REQUIRE_ACTUAL", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if strict and (not _RENDERER_BACKEND_METADATA["actual_context_verified"] or software):
+        raise RuntimeError(
+            f"strict EGL renderer verification failed: {_RENDERER_BACKEND_METADATA}"
+        )
+
+
+def get_renderer_backend_metadata() -> dict:
+    """Return a copy of the requested and runtime-verified renderer contract."""
+    return dict(_RENDERER_BACKEND_METADATA)
 
 
 def _atomic_write_json(path: Path, payload) -> None:
@@ -1364,7 +1442,7 @@ def evaluate_policy_ddp(args, model):
             "bddl_file_name": task_bddl_file,
             "camera_heights": args.libero_img_size,
             "camera_widths": args.libero_img_size,
-            "render_gpu_device_id": device_id,
+            "render_gpu_device_id": _renderer_gpu_device_id(device_id),
             "control_freq": int(round(control_hz)),
             "horizon": env_horizon,
         }
@@ -1380,6 +1458,7 @@ def evaluate_policy_ddp(args, model):
         env.task_name = task_name
         env.task_suite_name = args.finetune_type
         env.reset()
+        _verify_renderer_backend(env, env_args["render_gpu_device_id"])
         env.seed(args.seed)
 
         # set initial state
@@ -1469,7 +1548,27 @@ def merge_lrnode_stats(stats_list):
         "shadow_action_l2_sum": 0.0,
         "shadow_action_hold_l1_sum": 0.0,
         "shadow_by_age": {},
+        "bridge_calls": 0,
+        "bridge_latency_sum": 0.0,
+        "peak_gpu_memory_bytes": 0,
+        "bridge_compile_warmup_seconds_excluded": 0.0,
     }
+    invariant_fields = (
+        "method",
+        "renderer_backend",
+        "base_checkpoint_sha256",
+        "refresh_period",
+        "action_protocol",
+        "bridge_parameters",
+        "bridge_precision",
+        "bridge_compile",
+        "bridge_compile_mode",
+        "stable_layer",
+        "stable_token_group",
+        "checkpoint_provenance",
+        "torch_deterministic_algorithms",
+        "determinism",
+    )
     for item in stats_list:
         if item is None:
             continue
@@ -1479,6 +1578,7 @@ def merge_lrnode_stats(stats_list):
         fast_encoder_calls = int(item.get("fast_encoder_calls", 0))
         action_head_calls = int(item.get("action_head_calls", 0))
         shadow_calls = int(item.get("shadow_full_forward_calls", 0))
+        bridge_calls = int(item.get("bridge_calls", 0))
         merged["num_env_steps"] += env_steps
         merged["full_forward_calls"] += full_calls
         merged["lrnode_update_calls"] += lrnode_calls
@@ -1509,6 +1609,24 @@ def merge_lrnode_stats(stats_list):
         merged["shadow_action_l1_sum"] += float(item.get("shadow_action_l1", 0.0)) * shadow_calls
         merged["shadow_action_l2_sum"] += float(item.get("shadow_action_l2", 0.0)) * shadow_calls
         merged["shadow_action_hold_l1_sum"] += float(item.get("shadow_action_hold_l1", 0.0)) * shadow_calls
+        merged["bridge_calls"] += bridge_calls
+        merged["bridge_latency_sum"] += float(item.get("avg_bridge_latency_sec", 0.0)) * bridge_calls
+        merged["peak_gpu_memory_bytes"] = max(
+            merged["peak_gpu_memory_bytes"], int(item.get("peak_gpu_memory_bytes", 0))
+        )
+        merged["bridge_compile_warmup_seconds_excluded"] = max(
+            merged["bridge_compile_warmup_seconds_excluded"],
+            float(item.get("bridge_compile_warmup_seconds_excluded", 0.0)),
+        )
+        for field in invariant_fields:
+            if field not in item:
+                continue
+            if field in merged and merged[field] != item[field]:
+                raise RuntimeError(
+                    f"evaluation ranks disagree on {field}: "
+                    f"{merged[field]!r} != {item[field]!r}"
+                )
+            merged[field] = item[field]
         for age_key, age_item in item.get("shadow_by_age", {}).items():
             target = merged["shadow_by_age"].setdefault(
                 age_key,
@@ -1569,6 +1687,11 @@ def merge_lrnode_stats(stats_list):
     merged["avg_env_step_latency_sec"] = (
         merged["env_step_latency_sum"] / merged["num_env_steps"]
         if merged["num_env_steps"]
+        else 0.0
+    )
+    merged["avg_bridge_latency_sec"] = (
+        merged["bridge_latency_sum"] / merged["bridge_calls"]
+        if merged["bridge_calls"]
         else 0.0
     )
     merged["effective_query_reduction"] = merged["lrnode_update_calls"] / total_calls if total_calls else 0.0
@@ -1752,6 +1875,7 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
                 "EVAL_SCALE_SETTLE_STEPS_WITH_HZ",
                 os.environ.get("EVAL_SCALE_MAX_STEPS_WITH_HZ", "1"),
             ),
+            "renderer": get_renderer_backend_metadata(),
         },
         "lrnode": {
             "enabled": bool(args.use_lrnode_latent_update),

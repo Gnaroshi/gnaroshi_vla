@@ -30,6 +30,8 @@ from architectures.seer.adapters.latent_bridge.layout import SeerTokenLayout
 from methods.latent_bridge import TrainingContract, bridge_distillation_loss, should_full_refresh
 from architectures.seer.adapters.latent_bridge.train import ExactDistributedEvalSampler
 from tools.seer_latent_bridge.aggregate_evaluations import _validate_runtime_contract
+from tools.seer_latent_bridge.validate_eval_row import validate_eval_row
+from architectures.seer.adapters.latent_bridge.rendering import configured_renderer_backend
 
 
 def test_public33_token_layout_is_259_tokens():
@@ -264,3 +266,64 @@ def test_evaluation_aggregation_fails_closed_on_runtime_contract():
     tampered = {**summary, "lrnode": {**summary["lrnode"], "renderer_backend": "egl"}}
     with pytest.raises(RuntimeError, match="renderer"):
         _validate_runtime_contract("f4", tampered, manifest)
+
+
+def test_renderer_contract_rejects_conflicting_environment(monkeypatch):
+    for name in ("LIBERO_GL_BACKEND", "MUJOCO_GL", "PYOPENGL_PLATFORM"):
+        monkeypatch.delenv(name, raising=False)
+    assert configured_renderer_backend() == "osmesa"
+    monkeypatch.setenv("LIBERO_GL_BACKEND", "egl")
+    monkeypatch.setenv("MUJOCO_GL", "egl")
+    monkeypatch.setenv("PYOPENGL_PLATFORM", "egl")
+    assert configured_renderer_backend() == "egl"
+    monkeypatch.setenv("MUJOCO_GL", "osmesa")
+    with pytest.raises(RuntimeError, match="conflicting renderer"):
+        configured_renderer_backend()
+
+
+def test_eval_row_validation_checks_exact_episode_identity(tmp_path: Path):
+    import csv
+    import json
+
+    root = tmp_path / "row"
+    analysis = root / "analysis"
+    analysis.mkdir(parents=True)
+    rows = [
+        {"task_id": task, "episode_id": episode, "seed": 42, "success": int(episode == 0)}
+        for task in range(2)
+        for episode in range(2)
+    ]
+    with (analysis / "eval_episode_metrics.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    (analysis / "eval_summary.json").write_text(
+        json.dumps(
+            {
+                "success_rate": 0.5,
+                "lrnode": {"renderer_backend": "egl"},
+                "environment": {
+                    "renderer": {
+                        "requested_backend": "egl",
+                        "effective_backend": "egl",
+                        "actual_context_verified": True,
+                        "software_renderer": False,
+                        "actual_gl_vendor": "NVIDIA Corporation",
+                        "actual_gl_renderer": "NVIDIA RTX 3090",
+                        "actual_gl_version": "4.6",
+                    }
+                },
+                "task_results": [
+                    {"task_id": 0, "num_episodes": 2},
+                    {"task_id": 1, "num_episodes": 2},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (analysis / "eval_latency_profile.json").write_text("{}\n", encoding="utf-8")
+    payload = validate_eval_row(
+        root, seed=42, episodes_per_task=2, num_tasks=2, renderer="egl"
+    )
+    assert payload["episodes"] == 4
+    assert payload["successes"] == 2

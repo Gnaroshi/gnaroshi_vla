@@ -25,11 +25,10 @@ def main() -> None:
     parser.add_argument("--num-tasks", type=int, default=10)
     parser.add_argument("--episodes-per-task", type=int, default=20)
     parser.add_argument("--renderer", choices=("osmesa", "egl"), default="osmesa")
+    parser.add_argument("--reuse-if-matching", action="store_true")
     args = parser.parse_args()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists():
-        raise FileExistsError(output)
     os.environ["PYOPENGL_PLATFORM"] = args.renderer
     os.environ["MUJOCO_GL"] = args.renderer
     sys.path.insert(0, args.libero_path)
@@ -83,6 +82,21 @@ def main() -> None:
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     payload["manifest_sha256"] = hashlib.sha256(canonical).hexdigest()
+    if output.exists():
+        if not args.reuse_if_matching:
+            raise FileExistsError(output)
+        existing = json.loads(output.read_text(encoding="utf-8"))
+        if existing != payload:
+            raise RuntimeError(
+                f"existing manifest differs from the requested evaluation contract: {output}"
+            )
+        print(
+            json.dumps(
+                {"status": "REUSED", "episodes": len(episodes), "output": str(output)},
+                indent=2,
+            )
+        )
+        return
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(json.dumps({"status": "PASS", "episodes": len(episodes), "output": str(output)}, indent=2))
 

@@ -15,6 +15,7 @@ from .dataset import BridgeTransition, StreamingBridgeTransitionWriter
 from .hooks import SeerBoundaryCapture
 from .layout import SeerTokenLayout
 from .provenance import PUBLIC_SEER_33_SHA256
+from .rendering import configured_renderer_backend
 
 
 DEFAULT_LAYERS = (0, 3, 7, 11, 15, 19, 23)
@@ -49,6 +50,7 @@ class ContinuityModelWrapperMixin:
     """Mixin applied to upstream ``ModelWrapper`` without modifying upstream."""
 
     def _continuity_initialize(self) -> None:
+        self._continuity_renderer = configured_renderer_backend()
         base = self.model.module if hasattr(self.model, "module") else self.model
         self._continuity_layout = SeerTokenLayout.from_model(base)
         requested = os.environ.get("LATENT_BRIDGE_CONTINUITY_LAYERS", "")
@@ -233,7 +235,7 @@ class ContinuityModelWrapperMixin:
                     "stable_token_group": self._continuity_stable_group,
                     "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
                     "eval_seed": self._continuity_eval_seed,
-                    "renderer": "osmesa",
+                    "renderer": self._continuity_renderer,
                     "action_protocol": "three-token prediction with temporal ensembling; one executed action",
                 }
             )
@@ -249,7 +251,19 @@ class ContinuityModelWrapperMixin:
         (self._continuity_output / f"continuity_rank{self._continuity_rank}.meta.json").write_text(
             json.dumps(metadata, indent=2), encoding="utf-8"
         )
-        return super().get_lrnode_stats()
+        stats = super().get_lrnode_stats()
+        stats.update(
+            {
+                "method": "frozen_seer_continuity_collection",
+                "renderer_backend": self._continuity_renderer,
+                "base_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+                "refresh_period": 1,
+                "action_protocol": (
+                    "three-token prediction with temporal ensembling; one executed action"
+                ),
+            }
+        )
+        return stats
 
 
 def build_continuity_wrapper(base_wrapper):

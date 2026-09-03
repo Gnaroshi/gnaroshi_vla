@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reset and step one real LIBERO-Long environment under OSMesa."""
+"""Reset and step one real LIBERO-Long environment under a selected renderer."""
 
 from __future__ import annotations
 
@@ -13,18 +13,22 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from architectures.seer.adapters.latent_bridge.rendering import renderer_gpu_device_id
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--libero-path", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--renderer", choices=("egl", "osmesa"), required=True)
     args = parser.parse_args()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise FileExistsError(output)
-    os.environ["PYOPENGL_PLATFORM"] = "osmesa"
-    os.environ["MUJOCO_GL"] = "osmesa"
+    os.environ["LIBERO_GL_BACKEND"] = args.renderer
+    os.environ["PYOPENGL_PLATFORM"] = args.renderer
+    os.environ["MUJOCO_GL"] = args.renderer
     sys.path.insert(0, args.libero_path)
     from libero.libero import benchmark
     from libero.libero.envs import OffScreenRenderEnv
@@ -36,7 +40,7 @@ def main() -> None:
     init_states = torch.load(init_path)
     env = OffScreenRenderEnv(
         bddl_file_name=str(bddl), camera_heights=224, camera_widths=224,
-        render_gpu_device_id=0, control_freq=20, horizon=620,
+        render_gpu_device_id=renderer_gpu_device_id(0), control_freq=20, horizon=620,
     )
     try:
         env.reset()
@@ -54,7 +58,7 @@ def main() -> None:
             raise RuntimeError("renderer returned a constant image")
         payload = {
             "status": "PASS",
-            "renderer": "osmesa",
+            "renderer": args.renderer,
             "task": task.name,
             "bddl_sha256": hashlib.sha256(bddl.read_bytes()).hexdigest(),
             "init_states_sha256": hashlib.sha256(init_path.read_bytes()).hexdigest(),

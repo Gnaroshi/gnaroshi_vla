@@ -51,6 +51,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument("--resume-checkpoint")
+    parser.add_argument("--checkpoint-every-epochs", type=int, default=1)
     parser.add_argument("--smoke", action="store_true")
     return parser
 
@@ -225,7 +227,18 @@ def main() -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     contract.validate()
+    if args.checkpoint_every_epochs < 1:
+        raise ValueError("--checkpoint-every-epochs must be positive")
     official = verify_official_source(args.official_source)
+    resume_path = Path(args.resume_checkpoint) if args.resume_checkpoint else None
+    resume_payload = None
+    if resume_path is not None and resume_path.exists():
+        bridge, resume_payload = load_bridge_checkpoint(resume_path, map_location="cpu")
+        validate_bridge_runtime_provenance(resume_payload)
+        if resume_payload["stage"] != args.stage:
+            raise RuntimeError(
+                f"resume stage mismatch: expected={args.stage}, actual={resume_payload['stage']}"
+            )
 
     if args.stage == "R0":
         if args.dagger_root or args.initial_checkpoint:
@@ -233,22 +246,36 @@ def main() -> None:
         required = (args.stable_layer, args.stable_token_group, args.stable_seq_len)
         if any(value is None for value in required):
             raise ValueError("R0 requires measured stable layer/group/sequence length")
-        config = SeerFeatureBridgeConfig.from_preset(
+        expected_config = SeerFeatureBridgeConfig.from_preset(
             args.preset,
             stable_seq_len=args.stable_seq_len,
             stable_layer=args.stable_layer,
             stable_token_group=args.stable_token_group,
         )
-        bridge = SeerFeatureBridge(config)
+        if resume_payload is None:
+            config = expected_config
+            bridge = SeerFeatureBridge(config)
+        else:
+            config = bridge.config
+            if config != expected_config:
+                raise RuntimeError(
+                    "R0 resume bridge config differs from the requested measured context"
+                )
     else:
         if not args.dagger_root or not args.initial_checkpoint:
             raise ValueError("R1 requires --dagger-root and --initial-checkpoint")
-        bridge, initial_payload = load_bridge_checkpoint(args.initial_checkpoint, map_location="cpu")
+        initial_bridge, initial_payload = load_bridge_checkpoint(
+            args.initial_checkpoint, map_location="cpu"
+        )
         validate_bridge_runtime_provenance(initial_payload)
-        if bridge.config.preset != args.preset:
+        if initial_bridge.config.preset != args.preset:
             raise RuntimeError("R1 preset differs from the R0 checkpoint")
         if initial_payload["stage"] != "R0":
             raise RuntimeError("R1 must initialize from an R0 checkpoint")
+        if resume_payload is None:
+            bridge = initial_bridge
+        elif bridge.config != initial_bridge.config:
+            raise RuntimeError("R1 resume config differs from its R0 initialization checkpoint")
         config = bridge.config
 
     sync_files = _dataset_files(args.sync_root)
@@ -263,6 +290,43 @@ def main() -> None:
     validation = ConcatDataset(validation_parts)
     sync_audit = _audit_transition_files(sync_files, config)
     dagger_audit = _audit_transition_files(dagger_files, config) if dagger_files else None
+    sync_records = [{"path": str(path), "sha256": sha256_file(path)} for path in sync_files]
+    dagger_records = [{"path": str(path), "sha256": sha256_file(path)} for path in dagger_files]
+    base_metadata = {
+        "contract": contract.__dict__,
+        "official_source": official,
+        "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+        "parameter_audit": bridge.parameter_audit(),
+        "sync_files": sync_records,
+        "dagger_files": dagger_records,
+        "precision": args.precision,
+        "world_size": world_size,
+        "training_samples": len(training),
+        "validation_samples": len(validation),
+        "sync_dataset_audit": sync_audit,
+        "dagger_dataset_audit": dagger_audit,
+        "initial_checkpoint_sha256": (
+            sha256_file(args.initial_checkpoint) if args.initial_checkpoint else None
+        ),
+    }
+    if resume_payload is not None:
+        resume_metadata = resume_payload.get("metadata", {})
+        expected_resume_fields = {
+            "contract": base_metadata["contract"],
+            "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+            "sync_files": sync_records,
+            "dagger_files": dagger_records,
+            "precision": args.precision,
+            "world_size": world_size,
+            "initial_checkpoint_sha256": base_metadata["initial_checkpoint_sha256"],
+        }
+        mismatches = {
+            key: {"expected": value, "actual": resume_metadata.get(key)}
+            for key, value in expected_resume_fields.items()
+            if resume_metadata.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(f"resume checkpoint contract mismatch: {mismatches}")
 
     train_sampler = DistributedSampler(training, shuffle=True, seed=args.seed) if world_size > 1 else None
     val_sampler = (
@@ -305,17 +369,49 @@ def main() -> None:
     )
     output = Path(args.output_dir)
     if rank == 0:
-        output.mkdir(parents=True, exist_ok=False)
+        output.mkdir(parents=True, exist_ok=True)
     if dist.is_initialized():
         dist.barrier()
 
     started = time.time()
+    start_epoch = 0
     best_loss = float("inf")
     best_epoch = 0
-    best_state = None
     history = []
+    if resume_payload is not None:
+        if "optimizer_state_dict" not in resume_payload or "scheduler_state_dict" not in resume_payload:
+            raise RuntimeError("resume checkpoint lacks optimizer or scheduler state")
+        optimizer.load_state_dict(resume_payload["optimizer_state_dict"])
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device)
+        scheduler.load_state_dict(resume_payload["scheduler_state_dict"])
+        start_epoch = int(resume_payload["epoch"])
+        resume_state = resume_payload.get("metadata", {}).get("resume_state", {})
+        best_loss = float(resume_state.get("best_validation_total_loss", float("inf")))
+        best_epoch = int(resume_state.get("best_epoch", 0))
+        history = list(resume_state.get("history", []))
+        if len(history) != start_epoch:
+            raise RuntimeError(
+                f"resume history length {len(history)} does not match epoch {start_epoch}"
+            )
+        if rank == 0:
+            print(
+                json.dumps(
+                    {
+                        "status": "SEER_LATENT_BRIDGE_TRAINING_RESUME",
+                        "checkpoint": str(resume_path),
+                        "completed_epochs": start_epoch,
+                        "remaining_epochs": epochs - start_epoch,
+                    }
+                ),
+                flush=True,
+            )
+    if start_epoch > epochs:
+        raise RuntimeError(f"resume epoch {start_epoch} exceeds requested epochs {epochs}")
     use_bf16 = args.precision == "bf16" and device.type == "cuda"
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         model.train()
@@ -373,46 +469,66 @@ def main() -> None:
         history.append(row)
         if rank == 0:
             print(json.dumps(row), flush=True)
+            raw = model.module if hasattr(model, "module") else model
             if validation_metrics["total"] < best_loss:
                 best_loss = validation_metrics["total"]
                 best_epoch = epoch + 1
-                raw = model.module if hasattr(model, "module") else model
-                best_state = {
-                    key: value.detach().cpu().clone() for key, value in raw.state_dict().items()
-                }
+                save_bridge_checkpoint(
+                    output / "best.pt",
+                    raw,
+                    stage=args.stage,
+                    epoch=best_epoch,
+                    metadata={
+                        **base_metadata,
+                        "selection_metric": "validation_total_loss",
+                        "selection_metric_value": best_loss,
+                    },
+                )
+            completed_epoch = epoch + 1
+            if (
+                completed_epoch % args.checkpoint_every_epochs == 0
+                or completed_epoch == epochs
+            ):
+                save_bridge_checkpoint(
+                    output / "resume.pt",
+                    raw,
+                    stage=args.stage,
+                    epoch=completed_epoch,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    metadata={
+                        **base_metadata,
+                        "resume_state": {
+                            "best_validation_total_loss": best_loss,
+                            "best_epoch": best_epoch,
+                            "history": history,
+                        },
+                    },
+                )
+        if dist.is_initialized():
+            dist.barrier()
 
     if rank == 0:
         raw = model.module if hasattr(model, "module") else model
         metadata = {
-            "contract": contract.__dict__,
-            "official_source": official,
-            "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
-            "parameter_audit": raw.parameter_audit(),
-            "sync_files": [{"path": str(path), "sha256": sha256_file(path)} for path in sync_files],
-            "dagger_files": [{"path": str(path), "sha256": sha256_file(path)} for path in dagger_files],
-            "precision": args.precision,
-            "world_size": world_size,
-            "training_samples": len(training),
-            "validation_samples": len(validation),
-            "sync_dataset_audit": sync_audit,
-            "dagger_dataset_audit": dagger_audit,
+            **base_metadata,
+            "resume_state": {
+                "best_validation_total_loss": best_loss,
+                "best_epoch": best_epoch,
+                "history": history,
+            },
         }
         save_bridge_checkpoint(
             output / "last.pt", raw, stage=args.stage, epoch=epochs,
             optimizer=optimizer, scheduler=scheduler, metadata=metadata,
         )
-        if best_state is None:
+        if not (output / "best.pt").is_file() or best_epoch <= 0:
             raise RuntimeError("training completed without a selected validation checkpoint")
-        best_model = SeerFeatureBridge(config)
-        best_model.load_state_dict(best_state, strict=True)
-        save_bridge_checkpoint(
-            output / "best.pt", best_model, stage=args.stage, epoch=best_epoch,
-            metadata={**metadata, "selection_metric": "validation_total_loss"},
-        )
         summary = {
             "status": "SEER_LATENT_BRIDGE_TRAINING_COMPLETE",
             "stage": args.stage,
             "elapsed_seconds": time.time() - started,
+            "resumed_from_epoch": start_epoch,
             "epochs": epochs,
             "best_validation_total_loss": best_loss,
             "best_epoch": best_epoch,

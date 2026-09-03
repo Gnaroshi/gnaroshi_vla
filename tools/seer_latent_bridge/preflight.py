@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--libero-path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--visible-devices", default="4,5,6,7")
+    parser.add_argument("--renderer", choices=("egl", "osmesa"), required=True)
     return parser.parse_args()
 
 
@@ -113,9 +114,13 @@ def main() -> None:
             for name, recipe in recipes.items()
         },
         "allowed_visible_devices": args.visible_devices,
+        "renderer": args.renderer,
         "source_files": {
             str(path.relative_to(repo)): sha256_file(path)
-            for path in sorted((repo / "architectures/seer/adapters/latent_bridge").glob("*.py"))
+            for path in sorted(
+                list((repo / "architectures/seer/adapters/latent_bridge").glob("*.py"))
+                + [repo / "architectures/seer/upstream/utils/eval_utils_libero.py"]
+            )
         },
     }
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")

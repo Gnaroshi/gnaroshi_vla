@@ -12,13 +12,25 @@ LATENT_BRIDGE_VIT="${LATENT_BRIDGE_VIT:-/home/mingyujung/shared/nvme1/mingyujung
 LATENT_BRIDGE_DATASET_ROOT="${LATENT_BRIDGE_DATASET_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/seer_node2/LIBERO_DATASETS/libero_10_converted}"
 LATENT_BRIDGE_LIBERO_PATH="${LATENT_BRIDGE_LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
 LATENT_BRIDGE_RESULT_ROOT="${LATENT_BRIDGE_RESULT_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/latent_bridge/public33_libero_long}"
+LATENT_BRIDGE_RENDERER="${LATENT_BRIDGE_RENDERER:-osmesa}"
+
+case "${LATENT_BRIDGE_RENDERER}" in
+    egl|osmesa) ;;
+    *) echo "[ERROR] LATENT_BRIDGE_RENDERER must be egl or osmesa" >&2; exit 1 ;;
+esac
 
 export PYTHONPATH="${LATENT_BRIDGE_REPO_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
-export PYOPENGL_PLATFORM=osmesa
-export MUJOCO_GL=osmesa
-export LIBERO_GL_BACKEND=osmesa
+export LATENT_BRIDGE_RENDERER
+export PYOPENGL_PLATFORM="${LATENT_BRIDGE_RENDERER}"
+export MUJOCO_GL="${LATENT_BRIDGE_RENDERER}"
+export LIBERO_GL_BACKEND="${LATENT_BRIDGE_RENDERER}"
+if [[ "${LATENT_BRIDGE_RENDERER}" == "egl" ]]; then
+    export LIBERO_GL_REQUIRE_ACTUAL=1
+else
+    export LIBERO_GL_REQUIRE_ACTUAL=0
+fi
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-/tmp/numba_cache_${USER}}"
@@ -43,23 +55,86 @@ latent_bridge_require_runtime() {
         latent_bridge_fail "invalid LIBERO path: ${LATENT_BRIDGE_LIBERO_PATH}"
     [[ -e "${LATENT_BRIDGE_OFFICIAL_SOURCE}/.git" ]] || \
         latent_bridge_fail "official Latent Bridge source is absent"
+    [[ "${NODE_NUM:-4}" == "4" ]] || \
+        latent_bridge_fail "the locked training/evaluation contract requires NODE_NUM=4"
+}
+
+latent_bridge_next_backup() {
+    local source_root="$1"
+    local attempt=1
+    local backup
+    while true; do
+        printf -v backup '%s.failed_attempt_%03d' "${source_root}" "${attempt}"
+        if [[ ! -e "${backup}" ]]; then
+            printf '%s\n' "${backup}"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+    done
+}
+
+latent_bridge_archive_partial() {
+    local source_root="$1"
+    [[ -e "${source_root}" ]] || return 0
+    local backup
+    backup="$(latent_bridge_next_backup "${source_root}")"
+    mv "${source_root}" "${backup}"
+    echo "[RECOVERY] preserved partial output: ${backup}"
 }
 
 latent_bridge_prepare_stage() {
     local stage_root="$1"
+    local recovery_mode="${2:-restart}"
     if [[ -s "${stage_root}/COMPLETE" ]]; then
         echo "[SKIP] completed stage: ${stage_root}"
         return 1
     fi
     if [[ -e "${stage_root}" ]]; then
-        if [[ "${LATENT_BRIDGE_RETRY_PARTIAL:-0}" != "1" ]]; then
-            latent_bridge_fail "partial stage exists (set LATENT_BRIDGE_RETRY_PARTIAL=1): ${stage_root}"
-        fi
-        local backup="${stage_root}.failed_attempt"
-        [[ ! -e "${backup}" ]] || latent_bridge_fail "retry backup already exists: ${backup}"
-        mv "${stage_root}" "${backup}"
+        case "${recovery_mode}" in
+            resume)
+                echo "[RECOVERY] resuming partial stage: ${stage_root}"
+                return 0
+                ;;
+            restart)
+                if [[ "${LATENT_BRIDGE_RETRY_PARTIAL:-0}" != "1" ]]; then
+                    latent_bridge_fail \
+                        "partial stage exists (set LATENT_BRIDGE_RETRY_PARTIAL=1): ${stage_root}"
+                fi
+                latent_bridge_archive_partial "${stage_root}"
+                ;;
+            *) latent_bridge_fail "unknown recovery mode: ${recovery_mode}" ;;
+        esac
     fi
     mkdir -p "${stage_root}"
+    return 0
+}
+
+latent_bridge_eval_row_is_complete() {
+    local output_root="$1"
+    local seed="$2"
+    local episodes_per_task="$3"
+    local num_tasks="$4"
+    [[ -s "${output_root}/EVAL_COMPLETE" ]] || return 1
+    python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/validate_eval_row.py" \
+        --root "${output_root}" --seed "${seed}" \
+        --episodes-per-task "${episodes_per_task}" --num-tasks "${num_tasks}" \
+        --renderer "${LATENT_BRIDGE_RENDERER}" >/dev/null
+}
+
+latent_bridge_prepare_eval_row() {
+    local output_root="$1"
+    local seed="$2"
+    local episodes_per_task="$3"
+    local num_tasks="$4"
+    if latent_bridge_eval_row_is_complete \
+        "${output_root}" "${seed}" "${episodes_per_task}" "${num_tasks}"; then
+        echo "[SKIP] validated evaluation row: ${output_root}"
+        return 1
+    fi
+    if [[ -e "${output_root}" ]]; then
+        latent_bridge_archive_partial "${output_root}"
+    fi
+    mkdir -p "${output_root}/analysis"
     return 0
 }
 
@@ -106,18 +181,31 @@ latent_bridge_run_eval() {
     export EVAL_NUM_EPISODES_PER_TASK="${episodes_per_task}"
     export EVAL_NUM_TASKS="${num_tasks}"
     export SAVE_VIDEO=0
+    local eval_rc=0
+    set +e
     if [[ -n "${entry_module}" ]]; then
         python -m torch.distributed.run \
             --nnodes=1 --nproc_per_node="${node_num}" --master_port="${master_port}" \
             --module "${entry_module}" "${args[@]}" 2>&1 | tee "${output_root}/run.log"
+        eval_rc="${PIPESTATUS[0]}"
     else
         python -m torch.distributed.run \
             --nnodes=1 --nproc_per_node="${node_num}" --master_port="${master_port}" \
             "${LATENT_BRIDGE_SEER_UPSTREAM}/eval_libero.py" "${args[@]}" 2>&1 | \
             tee "${output_root}/run.log"
+        eval_rc="${PIPESTATUS[0]}"
     fi
-    [[ -s "${output_root}/analysis/eval_summary.json" ]] || \
-        latent_bridge_fail "evaluation summary missing: ${output_root}"
-    [[ -s "${output_root}/analysis/eval_episode_metrics.csv" ]] || \
-        latent_bridge_fail "episode metrics missing: ${output_root}"
+    set -e
+    if python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/validate_eval_row.py" \
+        --root "${output_root}" --seed "${seed}" \
+        --episodes-per-task "${episodes_per_task}" --num-tasks "${num_tasks}" \
+        --renderer "${LATENT_BRIDGE_RENDERER}" --write-complete; then
+        if [[ "${eval_rc}" -ne 0 ]]; then
+            echo "[WARN] evaluator exited rc=${eval_rc}, but all expected artifacts passed validation"
+        fi
+        return 0
+    fi
+    [[ "${eval_rc}" -eq 0 ]] || \
+        latent_bridge_fail "evaluation exited rc=${eval_rc} with incomplete artifacts: ${output_root}"
+    latent_bridge_fail "evaluation artifacts failed validation: ${output_root}"
 }
