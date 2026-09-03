@@ -24,10 +24,10 @@ python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/verify_condition_hoo
     --output-dir "${stage}/hook_equivalence" --device cuda:0
 
 python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/bridge_smoke.py" \
-    --preset full --stable-seq-len 14 --device cuda:0 --compile \
+    --preset full --stable-seq-len 14 --batch-size 2 --device cuda:0 --compile \
     --output "${stage}/full_bridge_gpu_smoke.json"
 python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/bridge_smoke.py" \
-    --preset small --stable-seq-len 14 --device cuda:0 --compile \
+    --preset small --stable-seq-len 14 --batch-size 2 --device cuda:0 --compile \
     --output "${stage}/small_bridge_gpu_compile_smoke.json"
 python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/renderer_smoke.py" \
     --libero-path "${LATENT_BRIDGE_LIBERO_PATH}" \

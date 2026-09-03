@@ -20,10 +20,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--preset", choices=("full", "small"), required=True)
     parser.add_argument("--stable-seq-len", type=int, required=True)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output", required=True)
     parser.add_argument("--compile", action="store_true")
     args = parser.parse_args()
+    if args.batch_size < 1:
+        raise ValueError("batch-size must be positive")
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
@@ -38,7 +41,7 @@ def main() -> None:
     model = SeerFeatureBridge(config).to(device)
     initial_parameter_audit = model.parameter_audit()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
-    batch = 1
+    batch = args.batch_size
     inputs = (
         torch.randn(batch, 3, 384, device=device),
         torch.randn(batch, args.stable_seq_len, 384, device=device),
@@ -67,6 +70,7 @@ def main() -> None:
         "status": "PASS",
         "preset": args.preset,
         "device": str(device),
+        "batch_size": batch,
         "loss": float(loss.item()),
         "output_shape": list(prediction.shape),
         "initial_parameter_audit": initial_parameter_audit,
