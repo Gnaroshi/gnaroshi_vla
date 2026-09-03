@@ -16,6 +16,12 @@ import torch
 from architectures.seer.adapters.latent_bridge.provenance import sha256_file
 
 
+def _atomic_json(path: Path, payload: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--libero-path", required=True)
@@ -97,7 +103,7 @@ def main() -> None:
             )
         )
         return
-    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _atomic_json(output, payload)
     print(json.dumps({"status": "PASS", "episodes": len(episodes), "output": str(output)}, indent=2))
 
 

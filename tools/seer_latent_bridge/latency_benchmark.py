@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -204,7 +205,9 @@ def main() -> None:
             "baseline implementation remains eager; both statuses are reported explicitly."
         ),
     }
-    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(output)
     print(json.dumps({"status": "PASS", "output": str(output)}, indent=2))
 
 

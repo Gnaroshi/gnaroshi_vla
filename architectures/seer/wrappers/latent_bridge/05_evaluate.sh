@@ -54,7 +54,9 @@ for seed in "${seeds[@]}"; do
         row_args+=(--row "f${period}=${row}")
     done
     comparison_root="${seed_root}/comparison"
-    if [[ ! -s "${comparison_root}/comparison.json" ]]; then
+    if [[ ! -s "${comparison_root}/COMPLETE" ]] || ! latent_bridge_json_has_status \
+        "${comparison_root}/comparison.json" \
+        "SEER_LATENT_BRIDGE_EVALUATION_AGGREGATION_PASS"; then
         [[ ! -e "${comparison_root}" ]] || latent_bridge_archive_partial "${comparison_root}"
         python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/aggregate_evaluations.py" \
             --manifest "${manifest}" "${row_args[@]}" --baseline f1 \
@@ -64,13 +66,16 @@ for seed in "${seeds[@]}"; do
 done
 
 seed_summary="${stage}/execution_seed_summary"
-if [[ ! -s "${seed_summary}/execution_seed_summary.json" ]]; then
+if [[ ! -s "${seed_summary}/COMPLETE" ]] || ! latent_bridge_json_has_status \
+    "${seed_summary}/execution_seed_summary.json" \
+    "SEER_LATENT_BRIDGE_EXECUTION_SEED_AGGREGATION_COMPLETE"; then
     [[ ! -e "${seed_summary}" ]] || latent_bridge_archive_partial "${seed_summary}"
     python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/aggregate_seeds.py" \
         "${comparisons[@]}" --output-dir "${seed_summary}"
 fi
 latency_output="${stage}/component_latency_rtx3090.json"
-if [[ ! -s "${latency_output}" ]]; then
+if ! latent_bridge_json_has_status "${latency_output}" "PASS"; then
+    [[ ! -e "${latency_output}" ]] || latent_bridge_archive_partial "${latency_output}"
     python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/latency_benchmark.py" \
         --checkpoint "${LATENT_BRIDGE_PUBLIC33}" --vit-checkpoint "${LATENT_BRIDGE_VIT}" \
         --dataset-root "${LATENT_BRIDGE_DATASET_ROOT}" --libero-path "${LATENT_BRIDGE_LIBERO_PATH}" \

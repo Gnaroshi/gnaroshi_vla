@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,21 @@ from architectures.seer.adapters.latent_bridge.provenance import PUBLIC_SEER_33_
 
 
 ACTION_PROTOCOL = "three-token prediction with temporal ensembling; one executed action"
+
+
+def _atomic_text(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _atomic_csv(path: Path, rows: list[dict]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
 
 
 def _require_equal(name: str, field: str, actual, expected) -> None:
@@ -171,11 +187,9 @@ def main() -> None:
         "rows": serializable_rows,
         "paired_comparisons": comparisons,
     }
-    (output / "comparison.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    with (output / "paired_success.csv").open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(comparisons[0]))
-        writer.writeheader()
-        writer.writerows(comparisons)
+    _atomic_text(output / "comparison.json", json.dumps(payload, indent=2))
+    _atomic_csv(output / "paired_success.csv", comparisons)
+    _atomic_text(output / "COMPLETE", payload["status"] + "\n")
     print(json.dumps({"status": payload["status"], "output": str(output)}, indent=2))
 
 

@@ -109,6 +109,15 @@ latent_bridge_prepare_stage() {
     return 0
 }
 
+latent_bridge_json_has_status() {
+    local path="$1"
+    local expected_status="$2"
+    [[ -s "${path}" ]] || return 1
+    python -c \
+        'import json, sys; payload=json.load(open(sys.argv[1])); raise SystemExit(0 if payload.get("status") == sys.argv[2] else 1)' \
+        "${path}" "${expected_status}" >/dev/null 2>&1
+}
+
 latent_bridge_eval_row_is_complete() {
     local output_root="$1"
     local seed="$2"

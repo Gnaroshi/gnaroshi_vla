@@ -6,10 +6,27 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+
+
+def _atomic_text(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _atomic_csv(path: Path, rows: list[dict]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({**row, "seed_success_rates": json.dumps(row["seed_success_rates"])})
+    temporary.replace(path)
 
 
 def main() -> None:
@@ -63,14 +80,9 @@ def main() -> None:
         "rows": rows,
         "per_seed_payloads": payloads,
     }
-    (output / "execution_seed_summary.json").write_text(
-        json.dumps(result, indent=2), encoding="utf-8"
-    )
-    with (output / "execution_seed_rows.csv").open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({**row, "seed_success_rates": json.dumps(row["seed_success_rates"])})
+    _atomic_text(output / "execution_seed_summary.json", json.dumps(result, indent=2))
+    _atomic_csv(output / "execution_seed_rows.csv", rows)
+    _atomic_text(output / "COMPLETE", result["status"] + "\n")
     print(json.dumps({"status": result["status"], "output": str(output)}, indent=2))
 
 
