@@ -1,0 +1,3 @@
+[submodule "architectures/latent_bridge/upstream"]
+	path = architectures/latent_bridge/upstream
+	url = https://github.com/1999Lyd/Latent-Bridge.git
