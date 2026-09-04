@@ -50,7 +50,13 @@ if [[ -n "${remote_destination}" ]]; then
     echo "[data] transferring validated dataset to ${remote_destination}"
     ssh "${remote_host}" mkdir -p "${remote_path}"
     rsync -aH --partial --info=progress2 "${output_root}/" "${remote_host}:${remote_path}/"
-    ssh "${remote_host}" test -f "${remote_path}/manifest.json"
+    local_manifest_sha=$(sha256sum "${output_root}/manifest.json" | awk '{print $1}')
+    remote_manifest_sha=$(
+        ssh "${remote_host}" sha256sum "${remote_path}/manifest.json" | awk '{print $1}'
+    )
+    [[ "${local_manifest_sha}" == "${remote_manifest_sha}" ]] \
+        || fail "Remote manifest checksum differs from the validated local manifest"
+    echo "[data] remote manifest checksum verified: ${remote_manifest_sha}"
 fi
 
 echo "REAL_DATASET_PREPARATION_COMPLETE"
