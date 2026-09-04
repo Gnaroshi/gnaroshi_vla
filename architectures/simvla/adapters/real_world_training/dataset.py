@@ -61,6 +61,30 @@ def decode_jpeg(value: np.ndarray) -> np.ndarray:
         return np.asarray(image.convert("RGB"), dtype=np.uint8)
 
 
+def build_real_image_transform(*, training: bool) -> transforms.Compose:
+    """Build the one shared 224-to-384 transform for training and deployment."""
+
+    augmentation = []
+    if training:
+        augmentation.append(
+            transforms.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.0
+            )
+        )
+    return transforms.Compose(
+        [
+            transforms.Resize(
+                (384, 384),
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            ),
+            *augmentation,
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
+        ]
+    )
+
+
 class RealEpisodeStore:
     """Worker-local HDF5 handles and random access to compact episodes."""
 
@@ -135,25 +159,7 @@ class RealSimVLADataset(Dataset[dict[str, Any]]):
             )
         if not self.samples:
             raise ValueError(f"split {split!r} contains no full H={action_horizon} samples")
-        augmentation = []
-        if self.training:
-            augmentation.append(
-                transforms.ColorJitter(
-                    brightness=0.2, contrast=0.2, saturation=0.2, hue=0.0
-                )
-            )
-        self.image_transform = transforms.Compose(
-            [
-                transforms.Resize(
-                    (384, 384),
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True,
-                ),
-                *augmentation,
-                transforms.ToTensor(),
-                transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
-            ]
-        )
+        self.image_transform = build_real_image_transform(training=self.training)
 
     def __len__(self) -> int:
         return len(self.samples)

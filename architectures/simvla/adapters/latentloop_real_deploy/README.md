@@ -11,6 +11,9 @@ queries (`K_C=2`) and evaluates the full action transformer three times per
 ten-step flow trajectory (`N_G=3`). The baseline uses `K_C=1,N_G=10` under the
 same observation, action, and H=10/R=5 execution contract.
 
+All deployment methods use the same resize-with-pad-224 then bicubic-384 image
+transform as the real condition cache and action-head training path.
+
 The real baseline starts from every tensor in the released SimVLA-LIBERO
 checkpoint, freezes its VLM, and fine-tunes the existing action transformer;
 there is no scratch or reinitialized-head ablation. LatentLoop updaters must be

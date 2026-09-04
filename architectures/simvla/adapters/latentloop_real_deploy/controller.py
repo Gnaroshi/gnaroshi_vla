@@ -214,6 +214,14 @@ class SimVLARealController:
                 enable_reuse=deployment_method == "vla_cache",
                 **common,
             )
+        from architectures.simvla.adapters.real_world_training.dataset import (
+            build_real_image_transform,
+        )
+
+        # The action head and both updaters were trained from the FP32 condition
+        # cache produced with bicubic 224-to-384 resizing. Keep every real-world
+        # deployment method on that exact shared preprocessing implementation.
+        policy.image_transform = build_real_image_transform(training=False)
         controller = cls(
             contract=contract,
             deployment_method=deployment_method,

@@ -22,8 +22,8 @@ and records the SHA-256 of its complete official parent.
 - A transition whose capture interval differs from one nominal period by more
   than half a period is excluded. Every H=10 window crossing such a gap is
   omitted from training and counted in the dataset manifest.
-- Exterior and wrist RGB are kept in that order and follow the same
-  resize-with-pad-224 then bicubic-384 preprocessing as evaluation.
+- Exterior and wrist RGB are kept in that order. Cache creation, training, and
+  deployment call the same resize-with-pad-224 then bicubic-384 transform.
 - State is `[TCP xyz, TCP rotation-vector, +finger opening, -finger opening]`.
 - `control[:6]` is an absolute joint command and is deliberately ignored.
 - Each action is reconstructed from consecutive TCP poses as

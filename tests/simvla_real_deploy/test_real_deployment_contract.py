@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from torchvision.transforms import InterpolationMode
 
 from architectures.simvla.adapters.latentloop_real_deploy.contracts import (
     load_deployment_contract,
@@ -17,6 +18,9 @@ from architectures.simvla.adapters.latentloop_real_deploy.contracts import (
 from architectures.simvla.adapters.latentloop_real_deploy.controller import (
     convert_model_action,
     encode_robot_state,
+)
+from architectures.simvla.adapters.real_world_training.dataset import (
+    build_real_image_transform,
 )
 from architectures.simvla.adapters.latentloop_real_deploy.source_lock import (
     verify_source_snapshots,
@@ -76,6 +80,7 @@ def _manifest(tmp_path: Path) -> Path:
             "condition_dim": 960,
             "model_image_size": 384,
             "client_resize_size": 224,
+            "image_interpolation": "bicubic",
             "action_horizon": 10,
             "execution_horizon": 5,
             "flow_steps": 10,
@@ -234,6 +239,12 @@ def test_real_state_and_action_conventions_are_explicit():
     np.testing.assert_allclose(pos, [0.1, -0.2, 0.3])
     np.testing.assert_allclose(rotation, [0.4, -0.5, 0.6])
     assert gripper == 1.0
+
+
+def test_real_image_transform_is_shared_and_bicubic():
+    transform = build_real_image_transform(training=False)
+    assert transform.transforms[0].interpolation == InterpolationMode.BICUBIC
+    assert transform.transforms[0].antialias is True
 
 
 def test_read_only_runtime_has_no_robot_control_or_command_calls():

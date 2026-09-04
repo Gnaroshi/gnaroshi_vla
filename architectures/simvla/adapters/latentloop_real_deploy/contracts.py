@@ -173,6 +173,7 @@ def _validate_policy(payload: Mapping[str, Any]) -> None:
         "condition_dim": 960,
         "model_image_size": 384,
         "client_resize_size": 224,
+        "image_interpolation": "bicubic",
         "action_horizon": 10,
         "execution_horizon": 5,
         "flow_steps": 10,
