@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "sources": {
+    "architectures/simvla/third_party/3dflow_real_deploy/deploy.py": "ff6d3f518f0681688105804d635a4598ecb916bc31d50fb5d6367f567feb6d85",
+    "architectures/simvla/third_party/3dflow_real_deploy/deploy_gui.py": "ea44180a64b4b37d7af97fce165f1f6adddeb86618921c41f875757bd7b3f97e",
+    "architectures/simvla/third_party/3dflow_real_deploy/real_controller/controller.py": "e38058ead24158e69edb2a7c28f993236d593170b0623de3ad094e5667161d6c",
+    "architectures/simvla/third_party/3dflow_real_deploy/real_controller/robotiq_gripper.py": "8c479d2cbe8d35ce00d658ec2d14ae71c38883d3c3bd786916ccb7c8f9697165",
+    "architectures/simvla/third_party/3dflow_real_deploy/scripts/REAL/deploy_gui.sh": "a0af7019e6581e6866ba4530649e4d7edac1ddaef5a073f3969701424bfa1589",
+    "architectures/simvla/third_party/simvla_upstream_32700d0/LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "architectures/simvla/third_party/simvla_upstream_32700d0/models/__init__.py": "2212346641579ac1740c0e4c551d411d09dc85ebbdd62520c1e2d003520c5686",
+    "architectures/simvla/third_party/simvla_upstream_32700d0/models/action_hub.py": "662d50b99ee57d7d79dae4a44224df3d530a718818798af8df03c0e3b0d675d6",
+    "architectures/simvla/third_party/simvla_upstream_32700d0/models/configuration_smolvlm_vla.py": "1c1b4b62e5116069d55f6bf1a844a0673fd422cd97d1311da5bf512200c1c3c0",
+    "architectures/simvla/third_party/simvla_upstream_32700d0/models/modeling_smolvlm_vla.py": "b585d68d0a23037771ae5b60c608c73f132db3c7d37f58695b2cfe2ad62f3978",
+    "architectures/simvla/third_party/simvla_upstream_32700d0/models/processing_smolvlm_vla.py": "6957b4e618fe2334ebb56e73f37b551d992a69af31c4ce99ecb602fa15c8adc9",
+    "architectures/simvla/third_party/simvla_upstream_32700d0/models/transformer_smolvlm.py": "f5606db5ac74d2f77eeac663043a40a03fa2a77e756b5b688b45866b914c099f"
+  },
+  "byte_identical_reference_pairs": {
+    "architectures/simvla/third_party/3dflow_real_deploy/deploy.py": "architectures/seer/third_party/3dflow_real_deploy/deploy.py",
+    "architectures/simvla/third_party/3dflow_real_deploy/deploy_gui.py": "architectures/seer/third_party/3dflow_real_deploy/deploy_gui.py",
+    "architectures/simvla/third_party/3dflow_real_deploy/real_controller/controller.py": "architectures/seer/third_party/3dflow_real_deploy/real_controller/controller.py",
+    "architectures/simvla/third_party/3dflow_real_deploy/real_controller/robotiq_gripper.py": "architectures/seer/third_party/3dflow_real_deploy/real_controller/robotiq_gripper.py",
+    "architectures/simvla/third_party/3dflow_real_deploy/scripts/REAL/deploy_gui.sh": "architectures/seer/third_party/3dflow_real_deploy/scripts/REAL/deploy_gui.sh"
+  }
+}
