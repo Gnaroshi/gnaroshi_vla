@@ -241,6 +241,28 @@ def test_real_state_and_action_conventions_are_explicit():
     assert gripper == 1.0
 
 
+def test_real_gripper_output_is_saturated_without_masking_pose_overflow():
+    _, _, open_gripper = convert_model_action(
+        np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2]),
+        clip_abs=1.0,
+        positive_gripper_means="open",
+    )
+    _, _, closed_gripper = convert_model_action(
+        np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.4]),
+        clip_abs=1.0,
+        positive_gripper_means="open",
+    )
+    assert open_gripper == 1.0
+    assert closed_gripper == -1.0
+
+    with pytest.raises(RuntimeError, match="pose action exceeded"):
+        convert_model_action(
+            np.asarray([1.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            clip_abs=1.0,
+            positive_gripper_means="open",
+        )
+
+
 def test_real_image_transform_is_shared_and_bicubic():
     transform = build_real_image_transform(training=False)
     assert transform.transforms[0].interpolation == InterpolationMode.BICUBIC

@@ -66,11 +66,10 @@ def convert_model_action(
             "SimVLA pose action exceeded the reviewed normalized action bound: "
             f"max={float(np.max(np.abs(value[:6]))):.6f} bound={float(clip_abs):.6f}"
         )
-    gripper = float(value[6])
-    if abs(gripper) > float(clip_abs):
-        raise RuntimeError(
-            f"SimVLA gripper action {gripper:.6f} exceeded bound {float(clip_abs):.6f}"
-        )
+    # The real gripper consumes only the sign (open/close). Flow decoding can
+    # overshoot the supervised {-1, +1} targets slightly, so saturate this
+    # categorical channel while retaining the hard bound for Cartesian motion.
+    gripper = float(np.clip(value[6], -float(clip_abs), float(clip_abs)))
     if positive_gripper_means == "close":
         gripper = -gripper
     elif positive_gripper_means != "open":
