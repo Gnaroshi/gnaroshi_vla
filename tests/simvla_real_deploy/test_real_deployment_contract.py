@@ -8,6 +8,7 @@ import pytest
 from architectures.simvla.adapters.latentloop_real_deploy.contracts import (
     load_deployment_contract,
     require_live_authorization,
+    sha256_directory,
     sha256_file,
 )
 from architectures.simvla.adapters.latentloop_real_deploy.controller import (
@@ -30,30 +31,39 @@ def _manifest(tmp_path: Path) -> Path:
     for directory in (base, processor, updater, stats):
         directory.mkdir()
     files = {
-        "base_model_weights": base / "model.safetensors",
+        "official_base_model_weights": base / "model.safetensors",
         "norm_stats": stats / "real_norm.json",
+        "real_action_transformer": updater / "real_action_transformer.pt",
         "condition_updater": updater / "condition_updater.pt",
         "generation_updater": updater / "generation_updater.pt",
     }
     for index, path in enumerate(files.values()):
         path.write_bytes(f"artifact-{index}".encode("ascii"))
+    (processor / "processor_config.json").write_text("{}", encoding="utf-8")
     identity = "real-simvla-checkpoint-sha256"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "deployment_id": "test-deployment",
         "simvla_upstream_commit": "32700d0ad8991996e123e4b685abe370ce6e9aab",
         "artifacts": {
-            "base_model_directory": str(base),
-            "processor_directory": str(processor),
+            "official_base_model_directory": {
+                "path": str(base),
+                "sha256": sha256_directory(base),
+            },
+            "processor_directory": {
+                "path": str(processor),
+                "sha256": sha256_directory(processor),
+            },
             **{
                 name: {"path": str(path), "sha256": sha256_file(path)}
                 for name, path in files.items()
             },
         },
         "pairing": {
-            "base_model_identity": identity,
-            "condition_source_checkpoint_identity": identity,
-            "generation_source_checkpoint_identity": identity,
+            "official_base_model_identity": "official-test-sha256",
+            "real_baseline_identity": identity,
+            "condition_source_real_baseline_identity": identity,
+            "generation_source_real_baseline_identity": identity,
         },
         "policy": {
             "action_mode": "libero_joint",
@@ -73,9 +83,10 @@ def _manifest(tmp_path: Path) -> Path:
             "deterministic_action_noise": True,
         },
         "state": {
-            "encoding": "open_and_position",
+            "encoding": "opposed_finger_positions",
             "tcp_orientation": "axis_angle_radians",
-            "preflight_vector": [0.4, 0, 0.3, 3.14, 0, 0, 1, 0],
+            "gripper_max_opening_m": 0.04,
+            "preflight_vector": [0.4, 0, 0.3, 3.14, 0, 0, 0.04, -0.04],
         },
         "action": {
             "representation": "normalized_delta_pose",
@@ -154,11 +165,12 @@ def test_contract_verifies_every_artifact_and_fixed_policy(tmp_path):
     assert contract.policy["condition_refresh_interval"] == 2
     assert contract.policy["generation_full_evaluations"] == 3
     assert set(contract.artifacts) == {
-        "base_model_weights",
+        "official_base_model_weights",
         "norm_stats",
+        "real_action_transformer",
         "condition_updater",
         "generation_updater",
-        "base_model_directory",
+        "official_base_model_directory",
         "processor_directory",
     }
 
@@ -172,10 +184,12 @@ def test_contract_rejects_artifact_hash_mismatch(tmp_path):
         load_deployment_contract(manifest)
 
 
-def test_example_manifest_cannot_be_mistaken_for_live_configuration():
+def test_example_manifest_is_valid_but_cannot_authorize_live(monkeypatch):
     example = ROOT / "artifacts/simvla/real_world/deployment_manifest.example.json"
-    with pytest.raises(ValueError, match="model_positive_gripper_means"):
-        load_deployment_contract(example, verify_artifacts=False)
+    contract = load_deployment_contract(example, verify_artifacts=False)
+    assert not contract.live_authorized
+    with pytest.raises(PermissionError):
+        require_live_authorization(contract)
 
 
 def test_live_requires_manifest_and_two_environment_confirmations(tmp_path, monkeypatch):
@@ -204,18 +218,19 @@ def test_real_state_and_action_conventions_are_explicit():
             "gripper_open_state": np.asarray([1], dtype=np.float32),
             "gripper_position": np.asarray([0.25], dtype=np.float32),
         },
-        "open_and_position",
+        "opposed_finger_positions",
         "axis_angle_radians",
+        0.04,
     )
-    np.testing.assert_allclose(state, [0, 1, 2, 0.1, 0.2, 0.3, 1, 0.25])
+    np.testing.assert_allclose(state, [0, 1, 2, 0.1, 0.2, 0.3, 0.03, -0.03])
     pos, rotation, gripper = convert_model_action(
         np.asarray([0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 1.0]),
         clip_abs=1.0,
-        positive_gripper_means="close",
+        positive_gripper_means="open",
     )
     np.testing.assert_allclose(pos, [0.1, -0.2, 0.3])
     np.testing.assert_allclose(rotation, [0.4, -0.5, 0.6])
-    assert gripper == -1.0
+    assert gripper == 1.0
 
 
 def test_read_only_runtime_has_no_robot_control_or_command_calls():

@@ -16,7 +16,10 @@ from .contracts import DeploymentContract
 
 
 def encode_robot_state(
-    robot_state: Mapping[str, Any], encoding: str, tcp_orientation: str
+    robot_state: Mapping[str, Any],
+    encoding: str,
+    tcp_orientation: str,
+    gripper_max_opening_m: float = 0.04,
 ) -> np.ndarray:
     pose = np.asarray(robot_state["pose6d"], dtype=np.float32).reshape(-1)
     if pose.shape != (6,) or not np.isfinite(pose).all():
@@ -38,12 +41,12 @@ def encode_robot_state(
     ).reshape(-1)
     if position.shape != (1,) or open_state.shape != (1,):
         raise ValueError("gripper state and position must each be scalar arrays")
-    if encoding == "open_and_position":
-        state = np.concatenate((pose, open_state, position))
-    elif encoding == "position_repeated":
-        state = np.concatenate((pose, position, position))
-    else:
+    if encoding != "opposed_finger_positions":
         raise ValueError(f"Unsupported state encoding: {encoding}")
+    opening = (1.0 - float(np.clip(position[0], 0.0, 1.0))) * float(
+        gripper_max_opening_m
+    )
+    state = np.concatenate((pose, [opening, -opening]))
     if state.shape != (8,) or not np.isfinite(state).all():
         raise ValueError("encoded SimVLA proprioception must be a finite eight-vector")
     return state.astype(np.float32, copy=False)
@@ -75,57 +78,6 @@ def convert_model_action(
     return value[:3].copy(), value[3:6].copy(), gripper
 
 
-def _checkpoint_source_identity(payload: Mapping[str, Any]) -> str | None:
-    source = payload.get("source_lock")
-    if not isinstance(source, Mapping):
-        return None
-    candidates = (
-        source.get("checkpoint"),
-        source.get("base_checkpoint"),
-        source.get("complete_source_lock"),
-    )
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate:
-            return candidate
-        if not isinstance(candidate, Mapping):
-            continue
-        direct = candidate.get("identifier")
-        if isinstance(direct, str) and direct:
-            return direct
-        nested = candidate.get("checkpoint")
-        if isinstance(nested, Mapping):
-            identifier = nested.get("identifier")
-            if isinstance(identifier, str) and identifier:
-                return identifier
-    return None
-
-
-def _validate_checkpoint_pairing(
-    contract: DeploymentContract,
-    *,
-    condition_payload: Mapping[str, Any],
-    generation_payload: Mapping[str, Any],
-) -> None:
-    expected_condition = str(
-        contract.pairing["condition_source_checkpoint_identity"]
-    )
-    expected_generation = str(
-        contract.pairing["generation_source_checkpoint_identity"]
-    )
-    observed_condition = _checkpoint_source_identity(condition_payload)
-    observed_generation = _checkpoint_source_identity(generation_payload)
-    if observed_condition != expected_condition:
-        raise ValueError(
-            "Condition updater source checkpoint mismatch: "
-            f"observed={observed_condition!r} expected={expected_condition!r}"
-        )
-    if observed_generation != expected_generation:
-        raise ValueError(
-            "Generation updater source checkpoint mismatch: "
-            f"observed={observed_generation!r} expected={expected_generation!r}"
-        )
-
-
 class SimVLARealController:
     """Legacy-GUI-compatible controller with a fresh H=10 chunk every R=5 actions."""
 
@@ -150,7 +102,7 @@ class SimVLARealController:
         self.control_command_monotonic_s: list[float] = []
         self.args = SimpleNamespace(
             resume_from_checkpoint=str(
-                contract.artifacts["base_model_directory"].path
+                contract.artifacts["real_action_transformer"].path
             ),
             vit_checkpoint_path=None,
             real_eval_max_steps=int(contract.runtime["max_steps"]),
@@ -171,36 +123,28 @@ class SimVLARealController:
         device: str | torch.device,
     ) -> "SimVLARealController":
         configure_model_imports()
-        from models.configuration_smolvlm_vla import SmolVLMVLAConfig
-        from models.modeling_smolvlm_vla import SmolVLMVLA
-        from models.processing_smolvlm_vla import SmolVLMVLAProcessor
-
-        from architectures.simvla.adapters.latentloop.efficient_multirate.generation_checkpoint import (
-            load_generation_checkpoint,
-        )
-        from architectures.simvla.adapters.latentloop.native_v0_checkpoint import (
-            load_native_v0_checkpoint,
-        )
         from architectures.simvla.adapters.latentloop.native_v0_runtime import freeze_module
+        from architectures.simvla.adapters.real_world_training.model_io import (
+            load_exact_official_model,
+        )
+        from architectures.simvla.adapters.real_world_training.updater_io import (
+            load_real_updater,
+        )
         from .policy import FullSimVLARealPolicy, LatentLoopSimVLARealPolicy
 
         target_device = torch.device(device)
-        base_directory = contract.artifacts["base_model_directory"].path
+        base_directory = contract.artifacts["official_base_model_directory"].path
         processor_directory = contract.artifacts["processor_directory"].path
-        config = SmolVLMVLAConfig.from_pretrained(
-            str(base_directory), local_files_only=True
-        )
-        config.smolvlm_model_path = str(processor_directory)
-        model = SmolVLMVLA.from_pretrained(
-            str(base_directory), config=config, local_files_only=True
-        ).to(target_device).eval()
-        model.action_space.load_norm_stats(
-            str(contract.artifacts["norm_stats"].path)
+        model, processor, loading_report = load_exact_official_model(
+            model_directory=base_directory,
+            processor_directory=processor_directory,
+            norm_stats=contract.artifacts["norm_stats"].path,
+            real_action_checkpoint=contract.artifacts["real_action_transformer"].path,
+            device=target_device,
+            freeze_vlm=True,
+            freeze_action_transformer=True,
         )
         freeze_module(model)
-        processor = SmolVLMVLAProcessor(
-            smolvlm_model_path=str(processor_directory)
-        )
 
         if str(model.action_mode) != str(contract.policy["action_mode"]):
             raise ValueError(
@@ -221,32 +165,33 @@ class SimVLARealController:
         if deployment_method == "baseline":
             policy = FullSimVLARealPolicy(**common)
         else:
-            condition, condition_payload = load_native_v0_checkpoint(
+            baseline_sha256 = contract.artifacts["real_action_transformer"].sha256
+            condition, _ = load_real_updater(
                 contract.artifacts["condition_updater"].path,
+                kind="condition",
                 device=target_device,
-                require_final_150k=False,
+                expected_baseline_sha256=baseline_sha256,
             )
-            generation, generation_payload = load_generation_checkpoint(
+            generation, _ = load_real_updater(
                 contract.artifacts["generation_updater"].path,
+                kind="generation",
                 device=target_device,
-            )
-            _validate_checkpoint_pairing(
-                contract,
-                condition_payload=condition_payload,
-                generation_payload=generation_payload,
+                expected_baseline_sha256=baseline_sha256,
             )
             policy = LatentLoopSimVLARealPolicy(
                 adapter=condition,
-                checkpoint_id=str(contract.artifacts["condition_updater"].path),
+                checkpoint_id=str(contract.artifacts["real_action_transformer"].path),
                 generation_updater=generation,
                 **common,
             )
-        return cls(
+        controller = cls(
             contract=contract,
             deployment_method=deployment_method,
             policy=policy,
             device=target_device,
         )
+        controller.exact_initialization = loading_report
+        return controller
 
     def attach_session_dir(self, path: str | Path) -> None:
         self.session_dir = Path(path).expanduser().resolve()
@@ -288,6 +233,7 @@ class SimVLARealController:
             observation["robot_state"],
             str(self.contract.state["encoding"]),
             str(self.contract.state["tcp_orientation"]),
+            float(self.contract.state["gripper_max_opening_m"]),
         )
         output = self.policy.act(
             np.asarray(images[0]),
@@ -324,6 +270,7 @@ class SimVLARealController:
             "deployment_id": self.contract.deployment_id,
             "deployment_method": self.deployment_method,
             "manifest": str(self.contract.path),
+            "exact_initialization": getattr(self, "exact_initialization", None),
             "policy_contract": dict(self.contract.policy),
             "state_contract": dict(self.contract.state),
             "action_contract": dict(self.contract.action),

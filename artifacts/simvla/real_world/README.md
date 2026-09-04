@@ -6,17 +6,23 @@ its matching processor and normalization statistics, and Condition/Generation
 updaters trained from that exact base checkpoint.
 
 ```text
-base_model/
+official_base_model/
   config.json
   model.safetensors
 processor/
 norm_stats/
   real_norm.json
+real_action_transformer.pt
 updaters/
   condition_updater.pt
   generation_updater.pt
 deployment_manifest.local.json
 ```
+
+The real action checkpoint is a compact overlay on the complete released
+SimVLA-LIBERO checkpoint. The loader rejects missing, unexpected, or mismatched
+official tensors and applies the overlay strictly to the existing action
+transformer; no action-head parameter is reinitialized.
 
 Copy `deployment_manifest.example.json` to the ignored local filename and fill
 every placeholder. Record SHA-256 values from the files present on the

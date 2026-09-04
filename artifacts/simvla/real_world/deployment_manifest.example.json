@@ -1,16 +1,26 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "deployment_id": "replace-with-reviewed-deployment-id",
   "simvla_upstream_commit": "32700d0ad8991996e123e4b685abe370ce6e9aab",
   "artifacts": {
-    "base_model_directory": "./base_model",
-    "base_model_weights": {
-      "path": "./base_model/model.safetensors",
+    "official_base_model_directory": {
+      "path": "./official_base_model",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     },
-    "processor_directory": "./processor",
+    "official_base_model_weights": {
+      "path": "./official_base_model/model.safetensors",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "processor_directory": {
+      "path": "./processor",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
     "norm_stats": {
       "path": "./norm_stats/real_norm.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "real_action_transformer": {
+      "path": "./real_action_transformer.pt",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     },
     "condition_updater": {
@@ -23,9 +33,10 @@
     }
   },
   "pairing": {
-    "base_model_identity": "replace-with-real-simvla-checkpoint-identity",
-    "condition_source_checkpoint_identity": "replace-with-real-simvla-checkpoint-identity",
-    "generation_source_checkpoint_identity": "replace-with-real-simvla-checkpoint-identity"
+    "official_base_model_identity": "replace-with-official-model-sha256",
+    "real_baseline_identity": "replace-with-real-action-checkpoint-sha256",
+    "condition_source_real_baseline_identity": "replace-with-real-action-checkpoint-sha256",
+    "generation_source_real_baseline_identity": "replace-with-real-action-checkpoint-sha256"
   },
   "policy": {
     "action_mode": "libero_joint",
@@ -45,16 +56,17 @@
     "deterministic_action_noise": true
   },
   "state": {
-    "encoding": "open_and_position",
+    "encoding": "opposed_finger_positions",
     "tcp_orientation": "axis_angle_radians",
-    "preflight_vector": [0.4, 0.0, 0.3, 3.14, 0.0, 0.0, 1.0, 0.0]
+    "gripper_max_opening_m": 0.04,
+    "preflight_vector": [0.4, 0.0, 0.3, 3.14, 0.0, 0.0, 0.04, -0.04]
   },
   "action": {
     "representation": "normalized_delta_pose",
     "translation_scale_m": 0.02,
     "rotation_scale_rad": 0.05,
     "clip_abs": 1.0,
-    "model_positive_gripper_means": "review-open-or-close"
+    "model_positive_gripper_means": "open"
   },
   "hardware": {
     "robot": {

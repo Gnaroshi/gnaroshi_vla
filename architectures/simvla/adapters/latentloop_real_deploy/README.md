@@ -11,10 +11,11 @@ queries (`K_C=2`) and evaluates the full action transformer three times per
 ten-step flow trajectory (`N_G=3`). The baseline uses `K_C=1,N_G=10` under the
 same observation, action, and H=10/R=5 execution contract.
 
-No deployable real-world artifacts were available when this path was created.
-The LIBERO model, LIBERO norm statistics, and LIBERO-trained updaters are
-explicitly rejected as evidence of real-robot readiness. Populate the ignored
-artifact directory and manifest only after real-world fine-tuning.
+The real baseline starts from every tensor in the released SimVLA-LIBERO
+checkpoint, freezes its VLM, and fine-tunes the existing action transformer;
+there is no scratch or reinitialized-head ablation. LatentLoop updaters must be
+trained from that exact real baseline. The deployment loader verifies all three
+SHA-256 identities before constructing either policy.
 
 ## Staged commands
 

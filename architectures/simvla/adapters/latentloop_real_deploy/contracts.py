@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_UPSTREAM_COMMIT = "32700d0ad8991996e123e4b685abe370ce6e9aab"
 
@@ -21,6 +21,20 @@ def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     with Path(path).open("rb") as handle:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_directory(path: str | Path) -> str:
+    root = Path(path).expanduser().resolve()
+    digest = hashlib.sha256()
+    files = sorted(item for item in root.rglob("*") if item.is_file())
+    if not files:
+        raise ValueError(f"artifact directory contains no files: {root}")
+    for item in files:
+        relative = item.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(sha256_file(item)))
     return digest.hexdigest()
 
 
@@ -102,8 +116,9 @@ def _verify_artifacts(
 ) -> dict[str, VerifiedArtifact]:
     raw = _require_mapping(payload, "artifacts")
     file_names = (
-        "base_model_weights",
+        "official_base_model_weights",
         "norm_stats",
+        "real_action_transformer",
         "condition_updater",
         "generation_updater",
     )
@@ -127,11 +142,24 @@ def _verify_artifacts(
             size = path.stat().st_size if path.is_file() else 0
         verified[name] = VerifiedArtifact(name, path, expected, size)
 
-    for name in ("base_model_directory", "processor_directory"):
-        path = _resolve_path(raw.get(name), manifest_dir, name)
-        if verify_files and not path.is_dir():
-            raise FileNotFoundError(f"Missing {name}: {path}")
-        verified[name] = VerifiedArtifact(name, path, "", 0)
+    for name in ("official_base_model_directory", "processor_directory"):
+        spec = _require_mapping(raw, name)
+        path = _resolve_path(spec.get("path"), manifest_dir, name)
+        expected = str(spec.get("sha256", "")).lower()
+        if not SHA256_PATTERN.fullmatch(expected):
+            raise ValueError(f"artifacts.{name}.sha256 must be a 64-character SHA-256")
+        if verify_files:
+            if not path.is_dir():
+                raise FileNotFoundError(f"Missing {name}: {path}")
+            observed = sha256_directory(path)
+            if observed != expected:
+                raise ValueError(
+                    f"{name} SHA-256 mismatch: observed={observed} expected={expected}"
+                )
+            size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+        else:
+            size = 0
+        verified[name] = VerifiedArtifact(name, path, expected, size)
     return verified
 
 
@@ -168,10 +196,9 @@ def _validate_policy(payload: Mapping[str, Any]) -> None:
 
 def _validate_state_action(payload: Mapping[str, Any]) -> None:
     state = _require_mapping(payload, "state")
-    if state.get("encoding") not in {"open_and_position", "position_repeated"}:
-        raise ValueError(
-            "state.encoding must explicitly be open_and_position or position_repeated"
-        )
+    if state.get("encoding") != "opposed_finger_positions":
+        raise ValueError("state.encoding must be opposed_finger_positions")
+    _require_number(state, "gripper_max_opening_m", positive=True)
     if state.get("tcp_orientation") not in {
         "axis_angle_radians",
         "euler_xyz_radians",
@@ -279,17 +306,18 @@ def _validate_hardware_runtime(payload: Mapping[str, Any]) -> None:
 def _validate_pairing(payload: Mapping[str, Any]) -> None:
     pairing = _require_mapping(payload, "pairing")
     for key in (
-        "base_model_identity",
-        "condition_source_checkpoint_identity",
-        "generation_source_checkpoint_identity",
+        "official_base_model_identity",
+        "real_baseline_identity",
+        "condition_source_real_baseline_identity",
+        "generation_source_real_baseline_identity",
     ):
         if not str(pairing.get(key, "")).strip():
             raise ValueError(f"pairing.{key} is required")
-    base = pairing["base_model_identity"]
-    if pairing["condition_source_checkpoint_identity"] != base:
-        raise ValueError("Condition updater was not paired with this base model")
-    if pairing["generation_source_checkpoint_identity"] != base:
-        raise ValueError("Generation updater was not paired with this base model")
+    baseline = pairing["real_baseline_identity"]
+    if pairing["condition_source_real_baseline_identity"] != baseline:
+        raise ValueError("Condition updater was not paired with this real baseline")
+    if pairing["generation_source_real_baseline_identity"] != baseline:
+        raise ValueError("Generation updater was not paired with this real baseline")
 
 
 def load_deployment_contract(
