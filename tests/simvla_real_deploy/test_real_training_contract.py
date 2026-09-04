@@ -1,5 +1,6 @@
 import argparse
 import pickle
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -26,6 +27,16 @@ from architectures.simvla.adapters.real_world_training.updater_io import (
     load_real_updater,
     save_real_updater,
 )
+
+
+def test_training_wrapper_supports_one_gpu_with_matched_effective_batch():
+    repo = Path(__file__).resolve().parents[2]
+    wrapper = repo / "architectures/simvla/wrappers/train_real_stackcupanddoll.sh"
+    subprocess.run(["bash", "-n", str(wrapper)], check=True)
+    source = wrapper.read_text(encoding="utf-8")
+    assert '--nproc_per_node="${world_size}"' in source
+    assert "gradient_accumulation_steps=$((effective_batch_size / microbatches_per_step))" in source
+    assert 'generation_gpu="${gpu_array[1]:-${gpu_array[0]}}"' in source
 
 
 def test_local_delta_pose_round_trip_matches_deployment_composition():
@@ -145,4 +156,3 @@ def test_real_condition_updater_rejects_wrong_baseline(tmp_path):
         expected_baseline_sha256=sha256_file(baseline),
     )
     assert loaded.parameter_audit()["total"] == updater.parameter_audit()["total"]
-

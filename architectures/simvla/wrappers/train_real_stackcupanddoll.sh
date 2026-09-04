@@ -12,7 +12,11 @@ Required environment:
 
 Optional environment:
   SIMVLA_REAL_STORAGE    Output root (default: shared/NVMe when present)
-  SIMVLA_REAL_GPU_IDS    Four physical GPU IDs (default: 4,5,6,7)
+  SIMVLA_REAL_GPU_IDS    One or more physical GPU IDs (default: 4,5,6,7)
+  SIMVLA_REAL_LOCAL_BATCH_SIZE
+                        Per-process baseline microbatch (default: 4)
+  SIMVLA_REAL_EFFECTIVE_BATCH_SIZE
+                        Baseline global effective batch (default: 64)
   SIMVLA_REAL_PYTHON     Python from the simvla_libero environment
   SIMVLA_REAL_BASE       Local YuankaiLuo/SimVLA-LIBERO snapshot
   SIMVLA_REAL_PROCESSOR  Local SmolVLM-500M-Instruct snapshot
@@ -32,10 +36,33 @@ repo_root=$(cd -- "${script_dir}/../../.." && pwd)
 python_bin="${SIMVLA_REAL_PYTHON:-/home/mingyujung/miniconda3/envs/simvla_libero/bin/python}"
 gpu_ids="${SIMVLA_REAL_GPU_IDS:-4,5,6,7}"
 IFS=',' read -r -a gpu_array <<< "${gpu_ids}"
-if [[ ${#gpu_array[@]} -ne 4 ]]; then
-    echo "[ERROR] SIMVLA_REAL_GPU_IDS must contain exactly four IDs" >&2
+world_size=${#gpu_array[@]}
+if (( world_size < 1 )); then
+    echo "[ERROR] SIMVLA_REAL_GPU_IDS must contain at least one ID" >&2
     exit 2
 fi
+for gpu_id in "${gpu_array[@]}"; do
+    [[ "${gpu_id}" =~ ^[0-9]+$ ]] || {
+        echo "[ERROR] Invalid GPU ID: ${gpu_id}" >&2
+        exit 2
+    }
+done
+local_batch_size="${SIMVLA_REAL_LOCAL_BATCH_SIZE:-4}"
+effective_batch_size="${SIMVLA_REAL_EFFECTIVE_BATCH_SIZE:-64}"
+[[ "${local_batch_size}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "[ERROR] SIMVLA_REAL_LOCAL_BATCH_SIZE must be a positive integer" >&2
+    exit 2
+}
+[[ "${effective_batch_size}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "[ERROR] SIMVLA_REAL_EFFECTIVE_BATCH_SIZE must be a positive integer" >&2
+    exit 2
+}
+microbatches_per_step=$((local_batch_size * world_size))
+if (( effective_batch_size % microbatches_per_step != 0 )); then
+    echo "[ERROR] Effective batch ${effective_batch_size} is not divisible by local batch ${local_batch_size} x world size ${world_size}" >&2
+    exit 2
+fi
+gradient_accumulation_steps=$((effective_batch_size / microbatches_per_step))
 
 default_storage="/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/real_world/stackcupanddoll"
 if [[ ! -d "$(dirname "${default_storage}")" ]]; then
@@ -80,6 +107,10 @@ storage=${storage}
 official_checkpoint=${base}
 processor=${processor}
 gpus=${gpu_ids}
+world_size=${world_size}
+local_batch_size=${local_batch_size}
+gradient_accumulation_steps=${gradient_accumulation_steps}
+effective_global_batch=${effective_batch_size}
 protocol=full official initialization; frozen VLM; fresh H=10; execute R=5
 baseline=K_C=1,N_G=10
 ours=K_C=2,N_G=3
@@ -112,7 +143,7 @@ if [[ ! -f "${condition_cache}/manifest.json" ]]; then
     cache_args=()
     [[ -d "$(dirname "${condition_cache}")/.${condition_cache##*/}.building" ]] && cache_args+=(--resume)
     CUDA_VISIBLE_DEVICES="${gpu_ids}" "${python_bin}" -m torch.distributed.run \
-        --standalone --nproc_per_node=4 \
+        --standalone --nproc_per_node="${world_size}" \
         -m architectures.simvla.adapters.real_world_training.condition_cache \
         --dataset-manifest "${dataset_root}/manifest.json" \
         --checkpoint "${base}" \
@@ -130,14 +161,15 @@ if [[ -f "${baseline_root}/resume.pt" && ! -f "${baseline_root}/run_summary.json
 fi
 if [[ ! -f "${baseline_root}/run_summary.json" ]]; then
     CUDA_VISIBLE_DEVICES="${gpu_ids}" "${python_bin}" -m torch.distributed.run \
-        --standalone --nproc_per_node=4 \
+        --standalone --nproc_per_node="${world_size}" \
         -m architectures.simvla.adapters.real_world_training.train_baseline \
         --condition-cache "${condition_cache}" \
         --checkpoint "${base}" \
         --processor "${processor}" \
         --norm-stats "${norm_stats}" \
         --output "${baseline_root}" \
-        --max-steps 3000 --local-batch-size 4 --gradient-accumulation-steps 4 \
+        --max-steps 3000 --local-batch-size "${local_batch_size}" \
+        --gradient-accumulation-steps "${gradient_accumulation_steps}" \
         --save-interval 1000 --keep-checkpoints 2 \
         "${baseline_args[@]}" \
         2>&1 | tee "${storage}/logs/03_baseline_train.log"
@@ -150,9 +182,7 @@ generation_args=()
 [[ -f "${condition_root}/resume.pt" && ! -f "${condition_root}/run_summary.json" ]] && condition_args+=(--resume)
 [[ -f "${generation_root}/resume.pt" && ! -f "${generation_root}/run_summary.json" ]] && generation_args+=(--resume)
 
-pids=()
-names=()
-if [[ ! -f "${condition_root}/run_summary.json" ]]; then
+run_condition_updater() {
     CUDA_VISIBLE_DEVICES="${gpu_array[0]}" "${python_bin}" \
         -m architectures.simvla.adapters.real_world_training.train_updater condition \
         --condition-cache "${condition_cache}" --checkpoint "${base}" \
@@ -160,27 +190,47 @@ if [[ ! -f "${condition_root}/run_summary.json" ]]; then
         --baseline-action-checkpoint "${baseline_checkpoint}" \
         --output "${condition_root}" --max-steps 10000 \
         "${condition_args[@]}" \
-        >"${storage}/logs/04_condition_train.log" 2>&1 &
-    pids+=("$!")
-    names+=("condition")
-fi
-if [[ ! -f "${generation_root}/run_summary.json" ]]; then
-    CUDA_VISIBLE_DEVICES="${gpu_array[1]}" "${python_bin}" \
+        >"${storage}/logs/04_condition_train.log" 2>&1
+}
+
+generation_gpu="${gpu_array[1]:-${gpu_array[0]}}"
+run_generation_updater() {
+    CUDA_VISIBLE_DEVICES="${generation_gpu}" "${python_bin}" \
         -m architectures.simvla.adapters.real_world_training.train_updater generation \
         --condition-cache "${condition_cache}" --checkpoint "${base}" \
         --processor "${processor}" --norm-stats "${norm_stats}" \
         --baseline-action-checkpoint "${baseline_checkpoint}" \
         --output "${generation_root}" --max-steps 10000 \
         "${generation_args[@]}" \
-        >"${storage}/logs/05_generation_train.log" 2>&1 &
-    pids+=("$!")
-    names+=("generation")
-fi
-for index in "${!pids[@]}"; do
-    if ! wait "${pids[$index]}"; then
-        fail "${names[$index]} updater failed; inspect ${storage}/logs"
+        >"${storage}/logs/05_generation_train.log" 2>&1
+}
+
+if (( world_size >= 2 )); then
+    pids=()
+    names=()
+    if [[ ! -f "${condition_root}/run_summary.json" ]]; then
+        run_condition_updater &
+        pids+=("$!")
+        names+=("condition")
     fi
-done
+    if [[ ! -f "${generation_root}/run_summary.json" ]]; then
+        run_generation_updater &
+        pids+=("$!")
+        names+=("generation")
+    fi
+    for index in "${!pids[@]}"; do
+        if ! wait "${pids[$index]}"; then
+            fail "${names[$index]} updater failed; inspect ${storage}/logs"
+        fi
+    done
+else
+    if [[ ! -f "${condition_root}/run_summary.json" ]]; then
+        run_condition_updater || fail "condition updater failed; inspect ${storage}/logs"
+    fi
+    if [[ ! -f "${generation_root}/run_summary.json" ]]; then
+        run_generation_updater || fail "generation updater failed; inspect ${storage}/logs"
+    fi
+fi
 
 condition_checkpoint=$(<"${condition_root}/latest_checkpoint.txt")
 generation_checkpoint=$(<"${generation_root}/latest_checkpoint.txt")

@@ -32,16 +32,18 @@ and records the SHA-256 of its complete official parent.
 The VLM is frozen, so its exact FP32 action conditions are computed once and
 memory-mapped. Baseline fine-tuning then trains only the existing action
 transformer from this cache. The selected defaults are 3,000 optimizer steps,
-four GPUs, local batch 4, accumulation 4, and effective global batch 64. These
-are an engineering protocol for the available 40 demonstrations, not an
-official SimVLA paper setting.
+local batch 4, and effective global batch 64. Gradient accumulation is derived
+from the requested GPU count so that four GPUs use accumulation 4 and one GPU
+uses accumulation 16. These are an engineering protocol for the available 40
+demonstrations, not an official SimVLA paper setting.
 
 After the baseline is fixed, the Condition Updater (`K_C=2`) and Generation
 Updater (`N_G=3`, full evaluations at solver indices 0, 4, and 8) train in
-parallel on separate GPUs. Both checkpoints must name the exact real baseline
-SHA-256 as their teacher. Loss magnitudes are measured deterministically before
-training and normalized to equal contribution; no unexplained hand-selected
-loss weights are embedded in the wrapper.
+parallel when at least two GPUs are available and sequentially on one GPU. Both
+checkpoints must name the exact real baseline SHA-256 as their teacher. Loss
+magnitudes are measured deterministically before training and normalized to
+equal contribution; no unexplained hand-selected loss weights are embedded in
+the wrapper.
 
 ## Comparison contract
 
@@ -73,4 +75,3 @@ bash architectures/simvla/wrappers/train_real_stackcupanddoll.sh --all
 Before live use, run both artifact preflights and the read-only hardware profile
 from `architectures/simvla/wrappers/deploy_latentloop_real.sh`. Live approval is
 intentionally not part of the training wrapper.
-
