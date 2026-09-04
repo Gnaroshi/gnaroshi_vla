@@ -8,10 +8,12 @@ Usage:
   SIMVLA_REAL_TRAIN_RUN=1 train_real_stackcupanddoll.sh --all
 
 Required environment:
-  SIMVLA_REAL_RAW_DATA   Local stackcupanddoll directory containing 40 episode dirs
+  SIMVLA_REAL_RAW_DATA   Local stackcupanddoll directory containing 40 episode dirs,
+                        unless SIMVLA_REAL_DATASET names a converted dataset
 
 Optional environment:
   SIMVLA_REAL_STORAGE    Output root (default: shared/NVMe when present)
+  SIMVLA_REAL_DATASET    Existing converted dataset containing manifest.json
   SIMVLA_REAL_GPU_IDS    One or more physical GPU IDs (default: 4,5,6,7)
   SIMVLA_REAL_LOCAL_BATCH_SIZE
                         Per-process baseline microbatch (default: 4)
@@ -80,7 +82,7 @@ if [[ -z "${processor}" ]]; then
     processor=$(find "${repo_root}/.cache/huggingface/hub/models--HuggingFaceTB--SmolVLM-500M-Instruct/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1 || true)
 fi
 
-dataset_root="${storage}/dataset"
+dataset_root="${SIMVLA_REAL_DATASET:-${storage}/dataset}"
 condition_cache="${storage}/condition_cache_fp32"
 baseline_root="${storage}/baseline"
 condition_root="${storage}/ours/condition_kc2"
@@ -93,7 +95,9 @@ fail() {
     exit 1
 }
 [[ -x "${python_bin}" ]] || fail "Python not found: ${python_bin}"
-[[ -n "${raw_data}" && -d "${raw_data}" ]] || fail "Set SIMVLA_REAL_RAW_DATA to the 40-episode local dataset"
+if [[ ! -f "${dataset_root}/manifest.json" ]]; then
+    [[ -n "${raw_data}" && -d "${raw_data}" ]] || fail "Set SIMVLA_REAL_RAW_DATA, or point SIMVLA_REAL_DATASET to a converted dataset"
+fi
 [[ -f "${base}/model.safetensors" ]] || fail "Official SimVLA snapshot is incomplete: ${base}"
 [[ -f "${processor}/model.safetensors" ]] || fail "SmolVLM processor/model snapshot is incomplete: ${processor}"
 [[ -f "${repo_root}/architectures/simvla/third_party/simvla_upstream_32700d0/models/modeling_smolvlm_vla.py" ]] || fail "Vendored SimVLA source is absent"
@@ -103,6 +107,7 @@ cat <<EOF
 [SimVLA real training]
 repo=${repo_root}
 raw_data=${raw_data}
+dataset=${dataset_root}
 storage=${storage}
 official_checkpoint=${base}
 processor=${processor}
@@ -138,6 +143,7 @@ if [[ ! -f "${dataset_root}/manifest.json" ]]; then
         2>&1 | tee "${storage}/logs/01_convert.log"
 fi
 "${python_bin}" -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["verdict"]=="REAL_DATASET_CONTRACT_PASS"' "${dataset_root}/manifest.json"
+[[ -f "${norm_stats}" ]] || fail "converted dataset norm stats are absent: ${norm_stats}"
 
 if [[ ! -f "${condition_cache}/manifest.json" ]]; then
     cache_args=()

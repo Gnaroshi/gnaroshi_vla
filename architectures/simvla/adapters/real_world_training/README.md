@@ -72,6 +72,11 @@ SIMVLA_REAL_TRAIN_RUN=1 \
 bash architectures/simvla/wrappers/train_real_stackcupanddoll.sh --all
 ```
 
+For a machine that receives an already audited compact dataset, set
+`SIMVLA_REAL_DATASET=/path/to/converted_dataset`. The wrapper verifies its
+manifest and normalization file and skips raw-data conversion; the original
+58 GB teleoperation directory does not need to be duplicated on that machine.
+
 Before live use, run both artifact preflights and the read-only hardware profile
 from `architectures/simvla/wrappers/deploy_latentloop_real.sh`. Live approval is
 intentionally not part of the training wrapper.
