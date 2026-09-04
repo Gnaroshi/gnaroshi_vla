@@ -19,6 +19,10 @@ from architectures.simvla.adapters.latentloop_real_deploy.controller import (
     convert_model_action,
     encode_robot_state,
 )
+from architectures.simvla.adapters.latentloop_real_deploy.hardware import (
+    SafeUR5eDeployEnv,
+    legacy_deploy,
+)
 from architectures.simvla.adapters.real_world_training.dataset import (
     build_real_image_transform,
 )
@@ -239,6 +243,25 @@ def test_real_state_and_action_conventions_are_explicit():
     np.testing.assert_allclose(pos, [0.1, -0.2, 0.3])
     np.testing.assert_allclose(rotation, [0.4, -0.5, 0.6])
     assert gripper == 1.0
+
+
+def test_live_hardware_adapter_preserves_tcp_rotation_vector(monkeypatch):
+    pose6d_euler = np.asarray(
+        [0.45, -0.20, 0.25, 0.25, -0.35, 0.15], dtype=np.float64
+    )
+
+    def fake_robot_state(_self):
+        return {
+            "pose6d": pose6d_euler.copy(),
+            "gripper_open_state": np.asarray([1.0], dtype=np.float32),
+            "gripper_position": np.asarray([0.0], dtype=np.float32),
+        }
+
+    monkeypatch.setattr(legacy_deploy.UR5eDeployEnv, "get_robot_state", fake_robot_state)
+    environment = object.__new__(SafeUR5eDeployEnv)
+    state = environment.get_robot_state()
+    expected = legacy_deploy._pose6d_to_ur_tcp(pose6d_euler)[3:]
+    np.testing.assert_allclose(state["tcp_rotvec"], expected, rtol=0.0, atol=1e-7)
 
 
 def test_real_gripper_output_is_saturated_without_masking_pose_overflow():
