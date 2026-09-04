@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "deployment_id": "replace-with-reviewed-deployment-id",
+  "simvla_upstream_commit": "32700d0ad8991996e123e4b685abe370ce6e9aab",
+  "artifacts": {
+    "base_model_directory": "./base_model",
+    "base_model_weights": {
+      "path": "./base_model/model.safetensors",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "processor_directory": "./processor",
+    "norm_stats": {
+      "path": "./norm_stats/real_norm.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "condition_updater": {
+      "path": "./updaters/condition_updater.pt",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "generation_updater": {
+      "path": "./updaters/generation_updater.pt",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "pairing": {
+    "base_model_identity": "replace-with-real-simvla-checkpoint-identity",
+    "condition_source_checkpoint_identity": "replace-with-real-simvla-checkpoint-identity",
+    "generation_source_checkpoint_identity": "replace-with-real-simvla-checkpoint-identity"
+  },
+  "policy": {
+    "action_mode": "libero_joint",
+    "proprio_dim": 8,
+    "action_dim": 7,
+    "condition_tokens": 122,
+    "condition_dim": 960,
+    "model_image_size": 384,
+    "client_resize_size": 224,
+    "action_horizon": 10,
+    "execution_horizon": 5,
+    "flow_steps": 10,
+    "condition_refresh_interval": 2,
+    "generation_full_evaluations": 3,
+    "control_protocol": "fresh_h10_execute_r5",
+    "generation_condition_coupling": "uncoupled_zero_code",
+    "deterministic_action_noise": true
+  },
+  "state": {
+    "encoding": "open_and_position",
+    "tcp_orientation": "axis_angle_radians",
+    "preflight_vector": [0.4, 0.0, 0.3, 3.14, 0.0, 0.0, 1.0, 0.0]
+  },
+  "action": {
+    "representation": "normalized_delta_pose",
+    "translation_scale_m": 0.02,
+    "rotation_scale_rad": 0.05,
+    "clip_abs": 1.0,
+    "model_positive_gripper_means": "review-open-or-close"
+  },
+  "hardware": {
+    "robot": {
+      "type": "ur5e_robotiq_2f85",
+      "ip": "replace-with-robot-ip",
+      "home_pose": [3.14, -1.57, 1.57, -1.57, -1.57, -1.57, 0.0],
+      "workspace_m": {
+        "min": [0.2, -0.6, 0.05],
+        "max": [0.8, 0.6, 0.8]
+      },
+      "control": {
+        "home_move_duration_s": 3.0,
+        "home_move_hz": 60,
+        "acceleration": 0.5,
+        "velocity": 0.5,
+        "servoj_time_s": 0.002,
+        "servoj_lookahead_s": 0.2,
+        "servoj_gain": 100
+      },
+      "gripper": {
+        "open_position_threshold": 0.1,
+        "speed": 255,
+        "force": 10,
+        "min_command_delta": 3,
+        "min_command_period_s": 0.05
+      }
+    },
+    "cameras": {
+      "model_input_order": ["exterior", "wrist"],
+      "exterior": {"serial": "replace-with-exterior-camera-serial"},
+      "wrist": {"serial": "replace-with-wrist-camera-serial"},
+      "width": 640,
+      "height": 480,
+      "fps": 60
+    }
+  },
+  "runtime": {
+    "control_frequency_hz": 15,
+    "max_steps": 5000,
+    "warmup_steps": 3,
+    "num_rollouts_per_instruction": 15,
+    "seed": 42,
+    "instructions": ["replace-with-real-task-language-instruction"],
+    "results_directory": "./real_deploy_results/simvla",
+    "camera_serials_file": "./real_deploy_results/simvla/camera_serials.json",
+    "save_rollout_media": true
+  },
+  "safety_review": {
+    "live_authorized": false,
+    "model_preflight_passed": false,
+    "read_only_profile_passed": false,
+    "approved_by": "",
+    "approved_at": ""
+  }
+}
