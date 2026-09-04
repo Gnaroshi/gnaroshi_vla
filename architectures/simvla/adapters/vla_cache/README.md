@@ -64,16 +64,3 @@ Each runtime trace records active tokens per decoder layer, actual skipped
 token-layers, selected positions, and whether old K/V was used. The first
 query is always a full computation and is unit-tested to equal the native eager
 decoder exactly.
-
-## Offline real-data comparison
-
-`architectures/simvla/wrappers/run_real_vla_cache_comparison.sh --all` runs the
-five comparison rows on one fixed validation sequence from the converted real
-demonstrations. It uses paired flow noise and the same fresh-H=10/execute-R=5
-contract for every row. The benchmark reports synchronized CUDA latency, peak
-VRAM, action fidelity, and actual token-layer/K/V reuse over 500 queries and
-three repeats by default.
-
-This benchmark does not command a robot and does not measure task success.
-Task-success claims require a separately paired live evaluation on the
-inference computer.
