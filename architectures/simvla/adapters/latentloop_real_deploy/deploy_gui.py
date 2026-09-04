@@ -70,11 +70,12 @@ class SimVLADeployGuiApp(legacy_gui.DeployGuiApp):
             + "\n\nSimVLA deployment\n"
             + f"{metadata['deployment_id']} / {metadata['deployment_method']}\n"
             + "Protocol: fresh H=10, execute R=5\n"
-            + (
-                "Compute: K_C=1, N_G=10"
-                if metadata["deployment_method"] == "baseline"
-                else "Compute: K_C=2, N_G=3"
-            )
+            + {
+                "baseline": "Compute: K_C=1, N_G=10",
+                "latentloop": "Compute: K_C=2, N_G=3",
+                "vla_cache_full": "Compute: VLA-Cache eager reference, no reuse, N_G=10",
+                "vla_cache": "Compute: actual visual-token pruning/KV reuse, N_G=10",
+            }[metadata["deployment_method"]]
         )
 
     def save_results(self):

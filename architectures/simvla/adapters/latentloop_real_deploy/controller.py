@@ -89,8 +89,16 @@ class SimVLARealController:
         policy: Any,
         device: torch.device,
     ) -> None:
-        if deployment_method not in {"baseline", "latentloop"}:
-            raise ValueError("deployment_method must be baseline or latentloop")
+        if deployment_method not in {
+            "baseline",
+            "latentloop",
+            "vla_cache_full",
+            "vla_cache",
+        }:
+            raise ValueError(
+                "deployment_method must be baseline, latentloop, vla_cache_full, "
+                "or vla_cache"
+            )
         self.contract = contract
         self.deployment_method = deployment_method
         self.policy = policy
@@ -164,7 +172,7 @@ class SimVLARealController:
         }
         if deployment_method == "baseline":
             policy = FullSimVLARealPolicy(**common)
-        else:
+        elif deployment_method == "latentloop":
             baseline_sha256 = contract.artifacts["real_action_transformer"].sha256
             condition, _ = load_real_updater(
                 contract.artifacts["condition_updater"].path,
@@ -182,6 +190,15 @@ class SimVLARealController:
                 adapter=condition,
                 checkpoint_id=str(contract.artifacts["real_action_transformer"].path),
                 generation_updater=generation,
+                **common,
+            )
+        else:
+            from architectures.simvla.adapters.vla_cache.policy import (
+                VLACacheSimVLARealPolicy,
+            )
+
+            policy = VLACacheSimVLARealPolicy(
+                enable_reuse=deployment_method == "vla_cache",
                 **common,
             )
         controller = cls(
@@ -266,7 +283,7 @@ class SimVLARealController:
         return target_pos, target_euler, target_gripper, terminal
 
     def deployment_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "deployment_id": self.contract.deployment_id,
             "deployment_method": self.deployment_method,
             "manifest": str(self.contract.path),
@@ -280,6 +297,11 @@ class SimVLARealController:
                 if artifact.sha256
             },
         }
+        cache_runtime = getattr(self.policy, "vla_cache", None)
+        if cache_runtime is not None:
+            metadata["vla_cache_contract"] = cache_runtime.config.to_dict()
+            metadata["vla_cache_reuse_enabled"] = bool(cache_runtime.enable_reuse)
+        return metadata
 
     def runtime_summary(self) -> dict[str, Any]:
         latency = np.asarray(

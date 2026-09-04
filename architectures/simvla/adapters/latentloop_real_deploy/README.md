@@ -41,3 +41,25 @@ Live mode intentionally requires three independent approvals:
 3. `SIMVLA_REAL_DEPLOYMENT_ID` equal to the manifest deployment ID.
 
 The wrapper defaults to `source-preflight`; it never defaults to live mode.
+
+## VLA-Cache comparison
+
+The same manifest also supports the training-free `vla_cache` baseline. It
+performs actual SmolVLM decoder token pruning and fixed-position K/V reuse; it
+does not blend old and new condition outputs. Use `vla_cache_full` as its
+same-backend no-reuse control:
+
+```bash
+bash architectures/simvla/wrappers/deploy_latentloop_real.sh \
+  artifact-preflight --manifest /path/to/deployment_manifest.local.json \
+  --method vla_cache_full
+
+bash architectures/simvla/wrappers/deploy_latentloop_real.sh \
+  artifact-preflight --manifest /path/to/deployment_manifest.local.json \
+  --method vla_cache
+```
+
+Both retain full ten-step flow generation and the same fresh-H10/execute-R5
+control protocol as the standard baseline. See
+`architectures/simvla/adapters/vla_cache/README.md` for the pinned official
+source and the required 256-token to 36-token architecture mapping.

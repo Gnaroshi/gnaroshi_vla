@@ -39,6 +39,12 @@ The staged checks are:
 4. `live`: remains locked until the manifest review fields and both explicit
    environment confirmations are present.
 
+The optional VLA-Cache comparator is training-free and consumes these same
+artifacts. `vla_cache_full` is the matched eager-attention no-reuse control;
+`vla_cache` performs actual decoder token pruning and K/V reuse. Neither mode
+changes the action horizon, execution horizon, action transformer, or robot
+control schedule.
+
 Do not authorize live mode until the real dataset's state encoding, action
 scale, gripper sign, camera order, home pose, and Cartesian workspace have been
 checked on the inference computer.

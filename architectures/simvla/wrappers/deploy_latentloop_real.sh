@@ -5,9 +5,9 @@ usage() {
     cat <<'EOF'
 Usage:
   deploy_latentloop_real.sh source-preflight
-  deploy_latentloop_real.sh artifact-preflight --manifest FILE [--method baseline|latentloop]
-  deploy_latentloop_real.sh read-only-profile --manifest FILE [--method baseline|latentloop] [--steps N]
-  deploy_latentloop_real.sh live --manifest FILE [--method baseline|latentloop]
+  deploy_latentloop_real.sh artifact-preflight --manifest FILE [--method baseline|latentloop|vla_cache_full|vla_cache]
+  deploy_latentloop_real.sh read-only-profile --manifest FILE [--method baseline|latentloop|vla_cache_full|vla_cache] [--steps N]
+  deploy_latentloop_real.sh live --manifest FILE [--method baseline|latentloop|vla_cache_full|vla_cache]
 
 The default path cannot command the robot. Live mode additionally requires the
 manifest safety approval, SIMVLA_REAL_LIVE_RUN=1, and a matching
@@ -64,8 +64,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${method}" in
-    baseline|latentloop) ;;
-    *) echo "[ERROR] --method must be baseline or latentloop" >&2; exit 2 ;;
+    baseline|latentloop|vla_cache_full|vla_cache) ;;
+    *) echo "[ERROR] --method must be baseline, latentloop, vla_cache_full, or vla_cache" >&2; exit 2 ;;
 esac
 if ! [[ "${steps}" =~ ^[0-9]+$ ]]; then
     echo "[ERROR] --steps must be a non-negative integer" >&2

@@ -17,7 +17,11 @@ def parse_args() -> argparse.Namespace:
         choices=("source-preflight", "artifact-preflight", "read-only-profile", "live"),
     )
     parser.add_argument("--manifest")
-    parser.add_argument("--method", choices=("baseline", "latentloop"), default="latentloop")
+    parser.add_argument(
+        "--method",
+        choices=("baseline", "latentloop", "vla_cache_full", "vla_cache"),
+        default="latentloop",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output")
     parser.add_argument("--steps", type=int, default=0)
@@ -98,15 +102,49 @@ def _artifact_preflight(args: argparse.Namespace) -> dict[str, Any]:
     expected = {
         "num_policy_queries": queries,
         "num_action_queue_steps": steps,
-        "num_full_vlm_calls": queries if args.method == "baseline" else (queries + 1) // 2,
-        "num_condition_updater_calls": 0 if args.method == "baseline" else queries // 2,
-        "num_action_transformer_calls": queries * (10 if args.method == "baseline" else 3),
+        "num_action_transformer_calls": queries
+        * (3 if args.method == "latentloop" else 10),
     }
+    if args.method == "baseline":
+        expected.update(
+            {"num_full_vlm_calls": queries, "num_condition_updater_calls": 0}
+        )
+    elif args.method == "latentloop":
+        expected.update(
+            {
+                "num_full_vlm_calls": (queries + 1) // 2,
+                "num_condition_updater_calls": queries // 2,
+            }
+        )
+    else:
+        expected.update(
+            {
+                "num_vlm_queries": queries,
+                "num_vla_cache_anchor_queries": 1,
+                "num_vla_cache_nonanchor_queries": queries - 1,
+            }
+        )
+        if args.method == "vla_cache":
+            expected["num_actual_kv_reuse_queries"] = queries - 1
     mismatch = {
         key: {"observed": int(counters.get(key, 0)), "expected": value}
         for key, value in expected.items()
         if int(counters.get(key, 0)) != value
     }
+    if args.method == "vla_cache" and int(
+        counters.get("skipped_text_token_layers", 0)
+    ) <= 0:
+        mismatch["skipped_text_token_layers"] = {
+            "observed": int(counters.get("skipped_text_token_layers", 0)),
+            "required": "positive",
+        }
+    if args.method == "vla_cache_full" and int(
+        counters.get("skipped_text_token_layers", 0)
+    ) != 0:
+        mismatch["skipped_text_token_layers"] = {
+            "observed": int(counters.get("skipped_text_token_layers", 0)),
+            "required": 0,
+        }
     if mismatch:
         raise RuntimeError(f"Deployment schedule preflight failed: {mismatch}")
     payload = {
