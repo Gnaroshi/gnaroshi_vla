@@ -38,6 +38,7 @@ def test_training_wrapper_supports_one_gpu_with_matched_effective_batch():
     assert "gradient_accumulation_steps=$((effective_batch_size / microbatches_per_step))" in source
     assert 'generation_gpu="${gpu_array[1]:-${gpu_array[0]}}"' in source
     assert 'dataset_root="${SIMVLA_REAL_DATASET:-${storage}/dataset}"' in source
+    assert 'run_condition_updater 2>&1 | tee "${storage}/logs/04_condition_train.log"' in source
 
 
 def test_local_delta_pose_round_trip_matches_deployment_composition():

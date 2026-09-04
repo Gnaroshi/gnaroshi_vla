@@ -195,8 +195,7 @@ run_condition_updater() {
         --processor "${processor}" --norm-stats "${norm_stats}" \
         --baseline-action-checkpoint "${baseline_checkpoint}" \
         --output "${condition_root}" --max-steps 10000 \
-        "${condition_args[@]}" \
-        >"${storage}/logs/04_condition_train.log" 2>&1
+        "${condition_args[@]}"
 }
 
 generation_gpu="${gpu_array[1]:-${gpu_array[0]}}"
@@ -207,20 +206,19 @@ run_generation_updater() {
         --processor "${processor}" --norm-stats "${norm_stats}" \
         --baseline-action-checkpoint "${baseline_checkpoint}" \
         --output "${generation_root}" --max-steps 10000 \
-        "${generation_args[@]}" \
-        >"${storage}/logs/05_generation_train.log" 2>&1
+        "${generation_args[@]}"
 }
 
 if (( world_size >= 2 )); then
     pids=()
     names=()
     if [[ ! -f "${condition_root}/run_summary.json" ]]; then
-        run_condition_updater &
+        run_condition_updater >"${storage}/logs/04_condition_train.log" 2>&1 &
         pids+=("$!")
         names+=("condition")
     fi
     if [[ ! -f "${generation_root}/run_summary.json" ]]; then
-        run_generation_updater &
+        run_generation_updater >"${storage}/logs/05_generation_train.log" 2>&1 &
         pids+=("$!")
         names+=("generation")
     fi
@@ -231,10 +229,12 @@ if (( world_size >= 2 )); then
     done
 else
     if [[ ! -f "${condition_root}/run_summary.json" ]]; then
-        run_condition_updater || fail "condition updater failed; inspect ${storage}/logs"
+        run_condition_updater 2>&1 | tee "${storage}/logs/04_condition_train.log" \
+            || fail "condition updater failed; inspect ${storage}/logs"
     fi
     if [[ ! -f "${generation_root}/run_summary.json" ]]; then
-        run_generation_updater || fail "generation updater failed; inspect ${storage}/logs"
+        run_generation_updater 2>&1 | tee "${storage}/logs/05_generation_train.log" \
+            || fail "generation updater failed; inspect ${storage}/logs"
     fi
 fi
 
