@@ -72,6 +72,7 @@ class SimVLADeployGuiApp(legacy_gui.DeployGuiApp):
             + "Protocol: fresh H=10, execute R=5\n"
             + {
                 "baseline": "Compute: K_C=1, N_G=10",
+                "condition_loop": "Compute: K_C=2, N_G=10",
                 "latentloop": "Compute: K_C=2, N_G=3",
                 "vla_cache_full": "Compute: VLA-Cache eager reference, no reuse, N_G=10",
                 "vla_cache": "Compute: actual visual-token pruning/KV reuse, N_G=10",

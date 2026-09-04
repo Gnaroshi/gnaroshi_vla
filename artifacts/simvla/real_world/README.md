@@ -43,7 +43,9 @@ The optional VLA-Cache comparator is training-free and consumes these same
 artifacts. `vla_cache_full` is the matched eager-attention no-reuse control;
 `vla_cache` performs actual decoder token pruning and K/V reuse. Neither mode
 changes the action horizon, execution horizon, action transformer, or robot
-control schedule.
+control schedule. Use `condition_loop` (K_C=2,N_G=10) for the direct
+backbone-side comparison with ours; use `latentloop` (K_C=2,N_G=3) only for
+the full-system comparison against `baseline` (K_C=1,N_G=10).
 
 Do not authorize live mode until the real dataset's state encoding, action
 scale, gripper sign, camera order, home pose, and Cartesian workspace have been

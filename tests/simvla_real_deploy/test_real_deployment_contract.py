@@ -1,9 +1,12 @@
 import ast
+import collections
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from architectures.simvla.adapters.latentloop_real_deploy.contracts import (
     load_deployment_contract,
@@ -273,3 +276,46 @@ def test_latentloop_reset_preserves_generation_latency_counter():
     policy = object.__new__(LatentLoopSimVLARealPolicy)
     policy.reset()
     assert "generation_loop_ms" in policy.metrics.latencies
+
+
+def test_condition_only_comparator_is_kc2_ng10():
+    from architectures.simvla.adapters.latentloop_real_deploy.policy import (
+        ConditionLoopSimVLARealPolicy,
+    )
+
+    policy = object.__new__(ConditionLoopSimVLARealPolicy)
+    policy.k_c = 2
+    policy.n_g = 10
+    policy.query_index = 0
+    policy.action_queue = collections.deque()
+    policy.query_trace = []
+    policy.metrics = SimpleNamespace(counters=collections.Counter())
+    action_chunk = torch.zeros(1, 10, 7)
+
+    def full_refresh(_batch, *, policy_query_index):
+        policy.metrics.counters["num_full_vlm_calls"] += 1
+        policy.metrics.counters["num_action_transformer_calls"] += 10
+        return torch.zeros(1, 122, 960), action_chunk, policy_query_index
+
+    def condition_update(_batch, *, age, policy_query_index):
+        assert age == 1
+        policy.metrics.counters["num_condition_updater_calls"] += 1
+        policy.metrics.counters["num_action_transformer_calls"] += 10
+        return torch.zeros(1, 122, 960), action_chunk, policy_query_index
+
+    policy._full_refresh = full_refresh
+    policy._v0_update = condition_update
+    for _ in range(4):
+        policy._refill_action_queue({})
+        policy.action_queue.clear()
+
+    assert policy.metrics.counters["num_policy_queries"] == 4
+    assert policy.metrics.counters["num_full_vlm_calls"] == 2
+    assert policy.metrics.counters["num_condition_updater_calls"] == 2
+    assert policy.metrics.counters["num_action_transformer_calls"] == 40
+    assert [item["source"] for item in policy.query_trace] == [
+        "full_refresh",
+        "condition_update",
+        "full_refresh",
+        "condition_update",
+    ]

@@ -19,7 +19,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest")
     parser.add_argument(
         "--method",
-        choices=("baseline", "latentloop", "vla_cache_full", "vla_cache"),
+        choices=(
+            "baseline",
+            "condition_loop",
+            "latentloop",
+            "vla_cache_full",
+            "vla_cache",
+        ),
         default="latentloop",
     )
     parser.add_argument("--device", default="cuda")
@@ -109,7 +115,7 @@ def _artifact_preflight(args: argparse.Namespace) -> dict[str, Any]:
         expected.update(
             {"num_full_vlm_calls": queries, "num_condition_updater_calls": 0}
         )
-    elif args.method == "latentloop":
+    elif args.method in {"condition_loop", "latentloop"}:
         expected.update(
             {
                 "num_full_vlm_calls": (queries + 1) // 2,

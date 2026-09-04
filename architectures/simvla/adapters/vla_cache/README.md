@@ -46,6 +46,11 @@ normalization, two-view preprocessing, deterministic flow noise, fresh H=10
 chunk, R=5 execution, and N_G=10 action-generation path used by the real
 baseline. Only SmolVLM decoder token computation changes.
 
+For a like-for-like backbone comparison, `condition_loop` uses our learned
+condition update at K_C=2 but restores N_G=10. The complete `latentloop`
+operating point remains K_C=2,N_G=3 and is compared against the complete
+K_C=1,N_G=10 baseline rather than presented as a condition-cache-only result.
+
 The attention-entropy rule requires materialized attention probabilities, so
 the reference implementation uses eager attention. `vla_cache_full` executes
 the identical eager path without token reuse. Report both:

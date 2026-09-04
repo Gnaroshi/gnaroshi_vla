@@ -46,10 +46,16 @@ The wrapper defaults to `source-preflight`; it never defaults to live mode.
 
 The same manifest also supports the training-free `vla_cache` baseline. It
 performs actual SmolVLM decoder token pruning and fixed-position K/V reuse; it
-does not blend old and new condition outputs. Use `vla_cache_full` as its
-same-backend no-reuse control:
+does not blend old and new condition outputs. The `condition_loop` mode runs
+our Condition Loop at `K_C=2` while restoring all ten action-network
+evaluations (`N_G=10`), so it is the direct backbone-side comparator. Use
+`vla_cache_full` as VLA-Cache's same-backend no-reuse control:
 
 ```bash
+bash architectures/simvla/wrappers/deploy_latentloop_real.sh \
+  artifact-preflight --manifest /path/to/deployment_manifest.local.json \
+  --method condition_loop
+
 bash architectures/simvla/wrappers/deploy_latentloop_real.sh \
   artifact-preflight --manifest /path/to/deployment_manifest.local.json \
   --method vla_cache_full
@@ -63,3 +69,8 @@ Both retain full ten-step flow generation and the same fresh-H10/execute-R5
 control protocol as the standard baseline. See
 `architectures/simvla/adapters/vla_cache/README.md` for the pinned official
 source and the required 256-token to 36-token architecture mapping.
+
+Report `baseline` versus `latentloop` for the complete system and
+`condition_loop` versus `vla_cache` for the backbone-side comparison.
+`vla_cache_full` isolates the effect of VLA-Cache reuse from the eager
+attention backend it requires.

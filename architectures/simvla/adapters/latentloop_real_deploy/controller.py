@@ -91,13 +91,14 @@ class SimVLARealController:
     ) -> None:
         if deployment_method not in {
             "baseline",
+            "condition_loop",
             "latentloop",
             "vla_cache_full",
             "vla_cache",
         }:
             raise ValueError(
-                "deployment_method must be baseline, latentloop, vla_cache_full, "
-                "or vla_cache"
+                "deployment_method must be baseline, condition_loop, latentloop, "
+                "vla_cache_full, or vla_cache"
             )
         self.contract = contract
         self.deployment_method = deployment_method
@@ -138,7 +139,11 @@ class SimVLARealController:
         from architectures.simvla.adapters.real_world_training.updater_io import (
             load_real_updater,
         )
-        from .policy import FullSimVLARealPolicy, LatentLoopSimVLARealPolicy
+        from .policy import (
+            ConditionLoopSimVLARealPolicy,
+            FullSimVLARealPolicy,
+            LatentLoopSimVLARealPolicy,
+        )
 
         target_device = torch.device(device)
         base_directory = contract.artifacts["official_base_model_directory"].path
@@ -172,7 +177,7 @@ class SimVLARealController:
         }
         if deployment_method == "baseline":
             policy = FullSimVLARealPolicy(**common)
-        elif deployment_method == "latentloop":
+        elif deployment_method in {"condition_loop", "latentloop"}:
             baseline_sha256 = contract.artifacts["real_action_transformer"].sha256
             condition, _ = load_real_updater(
                 contract.artifacts["condition_updater"].path,
@@ -180,18 +185,26 @@ class SimVLARealController:
                 device=target_device,
                 expected_baseline_sha256=baseline_sha256,
             )
-            generation, _ = load_real_updater(
-                contract.artifacts["generation_updater"].path,
-                kind="generation",
-                device=target_device,
-                expected_baseline_sha256=baseline_sha256,
-            )
-            policy = LatentLoopSimVLARealPolicy(
-                adapter=condition,
-                checkpoint_id=str(contract.artifacts["real_action_transformer"].path),
-                generation_updater=generation,
+            condition_common = {
+                "adapter": condition,
+                "checkpoint_id": str(
+                    contract.artifacts["real_action_transformer"].path
+                ),
                 **common,
-            )
+            }
+            if deployment_method == "condition_loop":
+                policy = ConditionLoopSimVLARealPolicy(**condition_common)
+            else:
+                generation, _ = load_real_updater(
+                    contract.artifacts["generation_updater"].path,
+                    kind="generation",
+                    device=target_device,
+                    expected_baseline_sha256=baseline_sha256,
+                )
+                policy = LatentLoopSimVLARealPolicy(
+                    generation_updater=generation,
+                    **condition_common,
+                )
         else:
             from architectures.simvla.adapters.vla_cache.policy import (
                 VLACacheSimVLARealPolicy,
