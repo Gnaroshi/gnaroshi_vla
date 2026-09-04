@@ -27,7 +27,12 @@ from architectures.seer.adapters.latent_bridge.provenance import (
 )
 from architectures.seer.adapters.latent_bridge.hooks import SeerBoundaryCapture
 from architectures.seer.adapters.latent_bridge.layout import SeerTokenLayout
-from methods.latent_bridge import TrainingContract, bridge_distillation_loss, should_full_refresh
+from methods.latent_bridge import (
+    ComputeMatchedTrainingContract,
+    TrainingContract,
+    bridge_distillation_loss,
+    should_full_refresh,
+)
 from architectures.seer.adapters.latent_bridge.train import ExactDistributedEvalSampler
 from tools.seer_latent_bridge.aggregate_evaluations import _validate_runtime_contract
 from tools.seer_latent_bridge.validate_eval_row import validate_eval_row
@@ -121,6 +126,29 @@ def test_official_training_batch_contract_and_schedule():
     assert [should_full_refresh(i, 4) for i in range(8)] == [True, False, False, False] * 2
 
 
+def test_compute_matched_contract_preserves_batch_and_counts_examples():
+    contract = ComputeMatchedTrainingContract(
+        stage="R0",
+        optimizer_steps=50_200,
+        learning_rate=3e-4,
+        per_rank_batch=16,
+        world_size=4,
+        gradient_accumulation_steps=1,
+    )
+    contract.validate()
+    assert contract.effective_batch == 64
+    assert contract.examples_seen == 3_212_800
+    with pytest.raises(ValueError, match="effective batch"):
+        ComputeMatchedTrainingContract(
+            stage="R0",
+            optimizer_steps=1,
+            learning_rate=3e-4,
+            per_rank_batch=8,
+            world_size=4,
+            gradient_accumulation_steps=1,
+        ).validate()
+
+
 def test_distillation_loss_is_mse_plus_cosine():
     target = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
     predicted = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]])
@@ -172,6 +200,41 @@ def test_episode_split_is_deterministic_and_dataset_is_hash_locked(tmp_path: Pat
         stream.write(b"tamper")
     with pytest.raises(RuntimeError, match="SHA256 mismatch"):
         BridgeTransitionDataset(path, split="train", expected_sha256=manifest["dataset_sha256"])
+
+
+def test_preloaded_dataset_is_numerically_identical_to_lazy_dataset(tmp_path: Path):
+    path = tmp_path / "transitions.h5"
+    writer = BridgeTransitionWriter(path)
+    for index in range(20):
+        writer.append(
+            BridgeTransition(
+                previous_condition=np.full((3, 384), index, np.float32),
+                target_condition=np.full((3, 384), index + 1, np.float32),
+                stable_context=np.full((3, 384), index + 2, np.float32),
+                current_state=np.full((8,), index + 3, np.float32),
+                previous_executed_action=np.full((7,), index + 4, np.float32),
+                episode_id=f"episode-{index}",
+                task_id=index % 10,
+                step=index,
+                success=index % 2,
+                source="sync",
+            )
+        )
+    manifest = writer.close({"test": True})
+    lazy = BridgeTransitionDataset(
+        path, split="train", expected_sha256=manifest["dataset_sha256"]
+    )
+    preloaded = BridgeTransitionDataset(
+        path,
+        split="train",
+        expected_sha256=manifest["dataset_sha256"],
+        preload=True,
+    )
+    assert len(lazy) == len(preloaded)
+    assert preloaded.preloaded_bytes > 0
+    for index in range(len(lazy)):
+        for key in lazy[index]:
+            torch.testing.assert_close(preloaded[index][key], lazy[index][key], rtol=0, atol=0)
 
 
 def test_streaming_writer_exposes_partial_then_atomically_finalizes(tmp_path: Path):

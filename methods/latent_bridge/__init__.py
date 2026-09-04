@@ -2,6 +2,7 @@
 
 from .contracts import (
     BridgePreset,
+    ComputeMatchedTrainingContract,
     TrainingContract,
     bridge_distillation_loss,
     should_full_refresh,
@@ -9,6 +10,7 @@ from .contracts import (
 
 __all__ = [
     "BridgePreset",
+    "ComputeMatchedTrainingContract",
     "TrainingContract",
     "bridge_distillation_loss",
     "should_full_refresh",

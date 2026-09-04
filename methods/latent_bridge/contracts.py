@@ -60,6 +60,45 @@ class TrainingContract:
             raise ValueError("Official training contract requires cosine scheduling")
 
 
+@dataclass(frozen=True)
+class ComputeMatchedTrainingContract:
+    """Step-budgeted adapter training with the official global batch size."""
+
+    stage: str
+    optimizer_steps: int
+    learning_rate: float
+    per_rank_batch: int
+    world_size: int
+    gradient_accumulation_steps: int
+    weight_decay: float = 1e-4
+    gradient_clip_norm: float = 1.0
+    scheduler: str = "cosine_per_update"
+    protocol: str = "compute_matched_v1"
+
+    @property
+    def effective_batch(self) -> int:
+        return self.per_rank_batch * self.world_size * self.gradient_accumulation_steps
+
+    @property
+    def examples_seen(self) -> int:
+        return self.optimizer_steps * self.effective_batch
+
+    def validate(self) -> None:
+        if self.stage not in {"R0", "R1"}:
+            raise ValueError(f"stage must be R0 or R1, got {self.stage!r}")
+        if self.optimizer_steps <= 0 or self.learning_rate <= 0:
+            raise ValueError("optimizer_steps and learning_rate must be positive")
+        if self.effective_batch != 64:
+            raise ValueError(
+                "Compute-matched effective batch must be 64: "
+                f"per_rank={self.per_rank_batch}, world_size={self.world_size}, "
+                f"accumulation={self.gradient_accumulation_steps}, "
+                f"effective={self.effective_batch}"
+            )
+        if self.scheduler != "cosine_per_update":
+            raise ValueError("Compute-matched training requires per-update cosine scheduling")
+
+
 def bridge_distillation_loss(
     predicted_next: torch.Tensor,
     target_next: torch.Tensor,

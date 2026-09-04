@@ -179,6 +179,14 @@ def episode_split(episode_id: str, *, validation_fraction: float, seed: int) -> 
 
 
 class BridgeTransitionDataset(Dataset):
+    _TENSOR_FIELDS = (
+        "previous_condition",
+        "target_condition",
+        "stable_context",
+        "current_state",
+        "previous_executed_action",
+    )
+
     def __init__(
         self,
         dataset_path: str | Path,
@@ -187,6 +195,7 @@ class BridgeTransitionDataset(Dataset):
         validation_fraction: float = 0.1,
         split_seed: int = 42,
         expected_sha256: str | None = None,
+        preload: bool = False,
     ):
         self.path = Path(dataset_path)
         if expected_sha256 is not None:
@@ -207,21 +216,30 @@ class BridgeTransitionDataset(Dataset):
             ) == split
         ]
         self._handle = None
+        self._preloaded: dict[str, torch.Tensor] | None = None
+        self.preloaded_bytes = 0
+        if preload and self.indices:
+            selected = np.asarray(self.indices, dtype=np.int64)
+            with h5py.File(self.path, "r") as handle:
+                arrays = {
+                    key: np.asarray(handle[key][selected], dtype=np.float32)
+                    for key in self._TENSOR_FIELDS
+                }
+            self._preloaded = {
+                key: torch.from_numpy(value) for key, value in arrays.items()
+            }
+            self.preloaded_bytes = sum(value.nbytes for value in arrays.values())
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        if self._preloaded is not None:
+            return {key: value[index] for key, value in self._preloaded.items()}
         if self._handle is None:
             self._handle = h5py.File(self.path, "r")
         row = self.indices[index]
         return {
             key: torch.from_numpy(self._handle[key][row])
-            for key in (
-                "previous_condition",
-                "target_condition",
-                "stable_context",
-                "current_state",
-                "previous_executed_action",
-            )
+            for key in self._TENSOR_FIELDS
         }
