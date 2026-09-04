@@ -16,7 +16,12 @@ and records the SHA-256 of its complete official parent.
 ## Data contract
 
 - 40 trajectories are split by episode into 32 train and 8 validation episodes.
-- The source and deployment control rate is 15 Hz.
+- The source and deployment control rate is 15 Hz. Source RGB, pose, and
+  control records remain in their native synchronized order; the converter
+  does not snap an already-15 Hz capture stream onto a second time grid.
+- A transition whose capture interval differs from one nominal period by more
+  than half a period is excluded. Every H=10 window crossing such a gap is
+  omitted from training and counted in the dataset manifest.
 - Exterior and wrist RGB are kept in that order and follow the same
   resize-with-pad-224 then bicubic-384 preprocessing as evaluation.
 - State is `[TCP xyz, TCP rotation-vector, +finger opening, -finger opening]`.

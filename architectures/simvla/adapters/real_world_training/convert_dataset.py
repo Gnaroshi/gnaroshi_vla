@@ -15,7 +15,7 @@ import h5py
 import numpy as np
 from PIL import Image
 
-from .dataset import DATASET_SCHEMA
+from .dataset import DATASET_SCHEMA, valid_action_window_starts
 from .geometry import (
     ACTION_DIM,
     ACTION_HORIZON,
@@ -39,24 +39,6 @@ REQUIRED_KEYS = {"base_rgb", "wrist_rgb", "ee_pos_quat", "gripper_position", "co
 def timestamp_from_path(path: Path) -> float:
     parsed = datetime.fromisoformat(path.stem)
     return (parsed - datetime(1970, 1, 1)).total_seconds()
-
-
-def select_nearest_frames(timestamps: np.ndarray, target_hz: float) -> tuple[np.ndarray, np.ndarray]:
-    if timestamps.ndim != 1 or timestamps.size < 2:
-        raise ValueError("an episode needs at least two timestamped frames")
-    if not np.all(np.diff(timestamps) > 0):
-        raise ValueError("source timestamps must be strictly increasing")
-    period = 1.0 / float(target_hz)
-    targets = np.arange(timestamps[0], timestamps[-1] + period * 0.25, period)
-    right = np.searchsorted(timestamps, targets, side="left")
-    right = np.clip(right, 0, timestamps.size - 1)
-    left = np.clip(right - 1, 0, timestamps.size - 1)
-    choose_left = np.abs(timestamps[left] - targets) <= np.abs(timestamps[right] - targets)
-    candidate_indices = np.where(choose_left, left, right)
-    keep = np.concatenate(([True], candidate_indices[1:] != candidate_indices[:-1]))
-    indices = np.asarray(candidate_indices[keep], dtype=np.int64)
-    selected_targets = np.asarray(targets[keep], dtype=np.float64)
-    return indices, selected_targets
 
 
 def _load_raw_frame(path: Path) -> dict[str, Any]:
@@ -110,6 +92,7 @@ def convert_episode(
     *,
     instruction: str,
     target_hz: float,
+    max_transition_period_error_ms: float,
     jpeg_quality: int,
     scales: RealActionScales,
 ) -> dict[str, Any]:
@@ -117,11 +100,20 @@ def convert_episode(
     if len(source_files) < ACTION_HORIZON + 1:
         raise ValueError(f"episode {episode_dir.name} is too short")
     timestamps = np.asarray([timestamp_from_path(path) for path in source_files], dtype=np.float64)
-    selected_indices, target_times = select_nearest_frames(timestamps, target_hz)
-    if selected_indices.size < ACTION_HORIZON + 1:
-        raise ValueError(f"resampled episode {episode_dir.name} is too short")
+    if not np.all(np.diff(timestamps) > 0):
+        raise ValueError(f"source timestamps must be strictly increasing: {episode_dir.name}")
+    # The capture stream is already nominally 15 Hz. Keep its synchronized RGB,
+    # pose, and control records intact instead of snapping them to another grid.
+    selected_indices = np.arange(timestamps.size, dtype=np.int64)
     frames = [_load_raw_frame(source_files[int(index)]) for index in selected_indices]
     selected_times = timestamps[selected_indices]
+    source_interval_ms = np.diff(selected_times) * 1000.0
+    nominal_period_ms = 1000.0 / float(target_hz)
+    transition_period_error_ms = np.abs(source_interval_ms - nominal_period_ms)
+    valid_transition = transition_period_error_ms <= float(max_transition_period_error_ms)
+    valid_starts = valid_action_window_starts(valid_transition, ACTION_HORIZON)
+    if valid_starts.size == 0:
+        raise ValueError(f"episode {episode_dir.name} has no timing-valid H={ACTION_HORIZON} window")
     states = np.stack(
         [
             encode_opposed_finger_state(frame["pose"], frame["gripper_position"], scales)
@@ -149,7 +141,6 @@ def convert_episode(
     raw_action_array = np.stack(raw_actions, axis=0)
     pose_exceeded = np.any(np.abs(raw_action_array[:, :6]) > scales.clip_abs, axis=1)
     component_exceeded = np.abs(raw_action_array[:, :6]) > scales.clip_abs
-    timing_error = np.abs(selected_times - target_times[: selected_times.size])
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
@@ -162,8 +153,10 @@ def convert_episode(
             handle.attrs["instruction"] = instruction
             handle.attrs["source_frame_count"] = len(source_files)
             handle.attrs["target_hz"] = float(target_hz)
+            handle.attrs["sampling_mode"] = "native_capture_order"
             handle.create_dataset("timestamp_s", data=selected_times)
             handle.create_dataset("source_index", data=selected_indices)
+            handle.create_dataset("valid_transition", data=valid_transition.astype(np.uint8))
             handle.create_dataset("state", data=states, compression="gzip", shuffle=True)
             handle.create_dataset("step_action", data=actions, compression="gzip", shuffle=True)
             handle.create_dataset(
@@ -187,13 +180,23 @@ def convert_episode(
         "path": str(Path("episodes") / destination.name),
         "source_frames": len(source_files),
         "frames": int(states.shape[0]),
-        "training_samples": int(states.shape[0] - ACTION_HORIZON),
+        "candidate_training_samples": int(states.shape[0] - ACTION_HORIZON),
+        "training_samples": int(valid_starts.size),
+        "excluded_training_samples": int(states.shape[0] - ACTION_HORIZON - valid_starts.size),
         "duration_s": float(selected_times[-1] - selected_times[0]),
-        "resample_abs_error_ms": {
-            "mean": float(timing_error.mean() * 1000.0),
-            "p95": float(np.percentile(timing_error, 95) * 1000.0),
-            "max": float(timing_error.max() * 1000.0),
+        "source_interval_ms": {
+            "min": float(source_interval_ms.min()),
+            "mean": float(source_interval_ms.mean()),
+            "p95": float(np.percentile(source_interval_ms, 95)),
+            "max": float(source_interval_ms.max()),
         },
+        "transition_period_error_ms": {
+            "mean": float(transition_period_error_ms.mean()),
+            "p95": float(np.percentile(transition_period_error_ms, 95)),
+            "max": float(transition_period_error_ms.max()),
+            "max_included": float(transition_period_error_ms[valid_transition].max()),
+        },
+        "excluded_transition_count": int((~valid_transition).sum()),
         "pose_clip_transition_count": int(pose_exceeded.sum()),
         "pose_clip_transition_fraction": float(pose_exceeded.mean()),
         "pose_clip_component_count": int(component_exceeded.sum()),
@@ -223,7 +226,9 @@ def _write_norm_stats(output: Path, episodes: list[dict[str, Any]], train_ids: s
             continue
         with h5py.File(output / episode["path"], "r") as handle:
             state_values.append(np.asarray(handle["state"], dtype=np.float32))
-            action_values.append(np.asarray(handle["step_action"], dtype=np.float32))
+            action = np.asarray(handle["step_action"], dtype=np.float32)
+            valid = np.asarray(handle["valid_transition"], dtype=bool)
+            action_values.append(action[valid])
     payload = {
         "norm_stats": {
             "state": _stats(state_values),
@@ -262,6 +267,11 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
         clip_abs=args.clip_abs,
         gripper_max_opening_m=args.gripper_max_opening_m,
     )
+    max_transition_period_error_ms = args.max_transition_period_error_ms
+    if max_transition_period_error_ms is None:
+        # A sample farther than half a nominal period belongs closer to a
+        # different control tick and must not be treated as one 15 Hz action.
+        max_transition_period_error_ms = 500.0 / float(args.target_hz)
     summaries = []
     for number, episode_dir in enumerate(episode_dirs, start=1):
         destination = output / "episodes" / f"{episode_dir.name}.h5"
@@ -272,6 +282,7 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 destination,
                 instruction=args.instruction,
                 target_hz=args.target_hz,
+                max_transition_period_error_ms=max_transition_period_error_ms,
                 jpeg_quality=args.jpeg_quality,
                 scales=scales,
             )
@@ -288,7 +299,13 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
     transition_total = sum(item["frames"] - 1 for item in summaries)
     clip_total = sum(item["pose_clip_transition_count"] for item in summaries)
     clip_fraction = float(clip_total / max(transition_total, 1))
-    resample_max = max(item["resample_abs_error_ms"]["max"] for item in summaries)
+    timing_max = max(item["transition_period_error_ms"]["max"] for item in summaries)
+    included_timing_max = max(
+        item["transition_period_error_ms"]["max_included"] for item in summaries
+    )
+    excluded_transition_count = sum(item["excluded_transition_count"] for item in summaries)
+    candidate_training_samples = sum(item["candidate_training_samples"] for item in summaries)
+    training_samples = sum(item["training_samples"] for item in summaries)
     roundtrip_max = max(item["roundtrip_matrix_max_abs"] for item in summaries)
     data_identity_payload = {
         "schema": DATASET_SCHEMA,
@@ -311,6 +328,7 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
         },
         "instruction": args.instruction,
         "target_hz": float(args.target_hz),
+        "sampling_mode": "native_capture_order_with_timing_valid_windows",
         "action_horizon": ACTION_HORIZON,
         "execution_horizon": 5,
         "image_contract": {
@@ -338,22 +356,32 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "pose_clip_transition_fraction": clip_fraction,
             "pose_clip_transition_count": clip_total,
             "transition_count": transition_total,
-            "max_resample_abs_error_ms": resample_max,
+            "excluded_transition_count": excluded_transition_count,
+            "excluded_transition_fraction": float(excluded_transition_count / max(transition_total, 1)),
+            "candidate_training_samples": candidate_training_samples,
+            "training_samples": training_samples,
+            "excluded_training_samples": candidate_training_samples - training_samples,
+            "excluded_training_sample_fraction": float(
+                (candidate_training_samples - training_samples) / max(candidate_training_samples, 1)
+            ),
+            "max_transition_period_error_ms": timing_max,
+            "max_included_transition_period_error_ms": included_timing_max,
             "max_pose_roundtrip_matrix_abs": roundtrip_max,
             "max_allowed_pose_clip_fraction": float(args.max_pose_clip_fraction),
-            "max_allowed_resample_error_ms": float(args.max_resample_error_ms),
+            "max_allowed_transition_period_error_ms": float(max_transition_period_error_ms),
         },
     }
     passed = (
         clip_fraction <= args.max_pose_clip_fraction
-        and resample_max <= args.max_resample_error_ms
+        and included_timing_max <= max_transition_period_error_ms
         and roundtrip_max <= 1e-6
+        and all(item["training_samples"] > 0 for item in summaries)
     )
     manifest["verdict"] = "REAL_DATASET_CONTRACT_PASS" if passed else "REAL_DATASET_CONTRACT_FAIL"
     atomic_write_json(output / "manifest.json", manifest)
     if not passed:
         raise RuntimeError(
-            "converted data failed the action/resampling contract; inspect manifest.json"
+            "converted data failed the action/timing contract; inspect manifest.json"
         )
     return manifest
 
@@ -377,7 +405,12 @@ def build_parser() -> argparse.ArgumentParser:
     # Pose-label clipping changes the demonstrated trajectory.  Fail closed by
     # default instead of accepting an arbitrary percentage of distorted labels.
     parser.add_argument("--max-pose-clip-fraction", type=float, default=0.0)
-    parser.add_argument("--max-resample-error-ms", type=float, default=34.0)
+    parser.add_argument(
+        "--max-transition-period-error-ms",
+        type=float,
+        default=None,
+        help="exclude transitions farther than this from one nominal period; default is half a period",
+    )
     parser.add_argument("--resume", action="store_true")
     return parser
 

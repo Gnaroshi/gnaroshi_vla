@@ -4,6 +4,7 @@ import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import h5py
 import numpy as np
 import torch
 
@@ -51,11 +52,11 @@ def test_local_delta_pose_round_trip_matches_deployment_composition():
     assert raw[-1] == 1.0
 
 
-def _write_episode(root: Path, episode: str, offset: float) -> None:
+def _write_episode(root: Path, episode: str, offset: float, frames: int = 14) -> None:
     directory = root / episode
     directory.mkdir(parents=True)
     started = datetime(2026, 9, 4, 12, 0, 0)
-    for index in range(14):
+    for index in range(frames):
         timestamp = started + timedelta(seconds=index / 15.0)
         payload = {
             "base_rgb": np.full((12, 16, 3), index, dtype=np.uint8),
@@ -87,7 +88,7 @@ def test_conversion_uses_episode_split_and_h10_local_actions(tmp_path):
         clip_abs=1.0,
         gripper_max_opening_m=0.04,
         max_pose_clip_fraction=0.0,
-        max_resample_error_ms=34.0,
+        max_transition_period_error_ms=None,
         resume=False,
     )
     manifest = convert_dataset(args)
@@ -99,6 +100,38 @@ def test_conversion_uses_episode_split_and_h10_local_actions(tmp_path):
     assert sample["image_input"].shape == (3, 3, 384, 384)
     assert sample["action"].shape == (10, 7)
     np.testing.assert_allclose(sample["action"][:, 0], 0.05, atol=1e-5)
+
+
+def test_conversion_preserves_native_frames_and_excludes_gap_crossing_windows(tmp_path):
+    source = tmp_path / "raw"
+    _write_episode(source, "episode_a", 0.0, frames=24)
+    _write_episode(source, "episode_b", 0.1, frames=24)
+    episode = source / "episode_a"
+    files = sorted(episode.glob("*.pkl"))
+    for path in files[12:]:
+        payload = path.read_bytes()
+        timestamp = datetime.fromisoformat(path.stem) + timedelta(milliseconds=40)
+        path.unlink()
+        (episode / f"{timestamp.isoformat(timespec='microseconds')}.pkl").write_bytes(payload)
+
+    output = tmp_path / "converted"
+    args = argparse.Namespace(
+        source=str(source), output=str(output), instruction="stack the cup and doll",
+        expected_episodes=2, train_episodes=1, split_seed=7, target_hz=15.0,
+        jpeg_quality=95, translation_scale_m=0.02, rotation_scale_rad=0.05,
+        clip_abs=1.0, gripper_max_opening_m=0.04, max_pose_clip_fraction=0.0,
+        max_transition_period_error_ms=None, resume=False,
+    )
+    manifest = convert_dataset(args)
+    summary = next(
+        item for item in manifest["episodes"] if item["episode_id"] == "episode_a"
+    )
+    assert summary["source_frames"] == 24
+    assert summary["frames"] == 24
+    assert summary["excluded_transition_count"] == 1
+    assert summary["training_samples"] == 4
+    with h5py.File(output / summary["path"], "r") as handle:
+        np.testing.assert_array_equal(handle["source_index"][:], np.arange(24))
 
 
 class _TinyModel:

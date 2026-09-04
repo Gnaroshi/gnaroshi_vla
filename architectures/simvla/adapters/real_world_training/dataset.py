@@ -18,9 +18,28 @@ from torchvision.transforms import InterpolationMode
 from .geometry import ACTION_HORIZON
 
 
-DATASET_SCHEMA = "simvla_real_hdf5_v1"
+DATASET_SCHEMA = "simvla_real_hdf5_v2"
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
+
+
+def valid_action_window_starts(
+    valid_transition: np.ndarray,
+    action_horizon: int,
+) -> np.ndarray:
+    """Return starts whose complete action horizon has valid capture timing."""
+    valid = np.asarray(valid_transition, dtype=bool).reshape(-1)
+    horizon = int(action_horizon)
+    if horizon < 1:
+        raise ValueError("action_horizon must be positive")
+    candidate_count = valid.size - horizon + 1
+    if candidate_count <= 0:
+        return np.empty((0,), dtype=np.int64)
+    invalid = (~valid).astype(np.int64)
+    prefix = np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(invalid)))
+    starts = np.arange(candidate_count, dtype=np.int64)
+    invalid_counts = prefix[starts + horizon] - prefix[starts]
+    return starts[invalid_counts == 0]
 
 
 def resize_with_pad(image: np.ndarray, size: int = 224) -> Image.Image:
@@ -103,9 +122,16 @@ class RealSimVLADataset(Dataset[dict[str, Any]]):
             episode_id = str(episode["episode_id"])
             if episode_id not in selected:
                 continue
-            usable = int(episode["frames"]) - self.action_horizon
+            handle = self.store.handle(episode_id)
+            if "valid_transition" in handle:
+                valid_transition = np.asarray(handle["valid_transition"], dtype=bool)
+            else:
+                valid_transition = np.ones(
+                    max(0, int(episode["frames"]) - 1), dtype=bool
+                )
+            starts = valid_action_window_starts(valid_transition, self.action_horizon)
             self.samples.extend(
-                (episode_id, index) for index in range(0, max(0, usable), sample_stride)
+                (episode_id, int(index)) for index in starts[::sample_stride]
             )
         if not self.samples:
             raise ValueError(f"split {split!r} contains no full H={action_horizon} samples")
