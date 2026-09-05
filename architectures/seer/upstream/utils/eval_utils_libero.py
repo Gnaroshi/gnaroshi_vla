@@ -3,8 +3,11 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-os.environ["PYOPENGL_PLATFORM"] = "osmesa"
-os.environ['MUJOCO_GL'] = 'osmesa'
+_renderer_backend = os.environ.get(
+    "LIBERO_GL_BACKEND", os.environ.get("MUJOCO_GL", "osmesa")
+).lower()
+os.environ.setdefault("PYOPENGL_PLATFORM", _renderer_backend)
+os.environ.setdefault("MUJOCO_GL", _renderer_backend)
 
 from pathlib import Path
 import copy
@@ -394,6 +397,9 @@ class ModelWrapper:
         self.current_episode_start_time = time.perf_counter()
         self.last_action = None
         self.last_action_delta = None
+        base_model = self._base_model()
+        if hasattr(base_model, "reset_vla_cache_state"):
+            base_model.reset_vla_cache_state()
         if self.use_ensembling:
             self.all_time_actions = torch.zeros(
                 [
@@ -708,7 +714,7 @@ class ModelWrapper:
         query_reduction = self.lrnode_update_calls / total_calls if total_calls else 0.0
         full_query_reduction_ratio = 1.0 - (self.full_forward_calls / self.num_policy_steps) if self.num_policy_steps else 0.0
         effective_query_interval = self.num_policy_steps / self.full_forward_calls if self.full_forward_calls else 0.0
-        return {
+        stats = {
             "num_env_steps": self.num_policy_steps,
             "full_forward_calls": self.full_forward_calls,
             "lrnode_update_calls": self.lrnode_update_calls,
@@ -768,6 +774,20 @@ class ModelWrapper:
             if self.shadow_full_forward_calls else 0.0,
             "shadow_by_age": self.shadow_age_stats,
         }
+        base_model = self._base_model()
+        if hasattr(base_model, "get_vla_cache_stats"):
+            cache_stats = base_model.get_vla_cache_stats()
+            for key in (
+                "calls",
+                "first_queries",
+                "actual_kv_reuse_calls",
+                "reusable_candidates",
+                "removed_final",
+                "full_token_layers",
+                "computed_token_layers",
+            ):
+                stats[f"vla_cache_{key}"] = cache_stats.get(key, 0)
+        return stats
 
     def record_env_step_ms(self, env_step_ms):
         self.env_step_latency_sum += float(env_step_ms)
@@ -1192,6 +1212,22 @@ class ModelWrapper:
                         "full_refresh_reason": self._full_refresh_reason(timestep),
                     }
                 )
+                cache_report = getattr(
+                    self._base_model().transformer_backbone,
+                    "last_vla_cache_report",
+                    None,
+                )
+                if cache_report:
+                    step_record["vla_cache"] = cache_report
+                    step_record["vla_cache_reusable_candidates"] = int(
+                        cache_report.get("reusable_candidates", 0)
+                    )
+                    step_record["vla_cache_removed_final"] = int(
+                        cache_report.get("removed_final", 0)
+                    )
+                    step_record["vla_cache_token_layer_reduction"] = float(
+                        cache_report.get("token_layer_reduction", 0.0)
+                    )
 
                 if self.use_lrnode_latent_update:
                     arm_action = model_outputs["arm_pred_action"]
@@ -1469,6 +1505,13 @@ def merge_lrnode_stats(stats_list):
         "shadow_action_l2_sum": 0.0,
         "shadow_action_hold_l1_sum": 0.0,
         "shadow_by_age": {},
+        "vla_cache_calls": 0,
+        "vla_cache_first_queries": 0,
+        "vla_cache_actual_kv_reuse_calls": 0,
+        "vla_cache_reusable_candidates": 0,
+        "vla_cache_removed_final": 0,
+        "vla_cache_full_token_layers": 0,
+        "vla_cache_computed_token_layers": 0,
     }
     for item in stats_list:
         if item is None:
@@ -1509,6 +1552,16 @@ def merge_lrnode_stats(stats_list):
         merged["shadow_action_l1_sum"] += float(item.get("shadow_action_l1", 0.0)) * shadow_calls
         merged["shadow_action_l2_sum"] += float(item.get("shadow_action_l2", 0.0)) * shadow_calls
         merged["shadow_action_hold_l1_sum"] += float(item.get("shadow_action_hold_l1", 0.0)) * shadow_calls
+        for key in (
+            "vla_cache_calls",
+            "vla_cache_first_queries",
+            "vla_cache_actual_kv_reuse_calls",
+            "vla_cache_reusable_candidates",
+            "vla_cache_removed_final",
+            "vla_cache_full_token_layers",
+            "vla_cache_computed_token_layers",
+        ):
+            merged[key] += int(item.get(key, 0))
         for age_key, age_item in item.get("shadow_by_age", {}).items():
             target = merged["shadow_by_age"].setdefault(
                 age_key,
@@ -1598,6 +1651,20 @@ def merge_lrnode_stats(stats_list):
         age_item["latent_mse"] = age_item["latent_mse_sum"] / count
         age_item["action_l1"] = age_item["action_l1_sum"] / count
         age_item["action_hold_l1"] = age_item["action_hold_l1_sum"] / count
+    cache_calls = max(1, merged["vla_cache_calls"])
+    merged["vla_cache_avg_reusable_candidates"] = (
+        merged["vla_cache_reusable_candidates"] / cache_calls
+    )
+    merged["vla_cache_avg_removed_final"] = (
+        merged["vla_cache_removed_final"] / cache_calls
+    )
+    merged["vla_cache_token_layer_reduction"] = (
+        1.0
+        - merged["vla_cache_computed_token_layers"]
+        / merged["vla_cache_full_token_layers"]
+        if merged["vla_cache_full_token_layers"]
+        else 0.0
+    )
     return merged
 
 
@@ -1779,6 +1846,43 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
             "multistep_train": bool(args.lrnode_multistep_train),
             "train_max_horizon": int(args.lrnode_train_max_horizon),
             **lrnode_stats,
+        },
+        "vla_cache": {
+            "mode": getattr(args, "vla_cache_mode", "off"),
+            "pruning_layers": getattr(
+                args, "vla_cache_pruning_layers", "2,6,9,11"
+            ),
+            "reference_attention_layer": int(
+                getattr(args, "vla_cache_reference_attention_layer", 15)
+            ),
+            "similarity_threshold": float(
+                getattr(args, "vla_cache_similarity_threshold", 0.996)
+            ),
+            "positive_growth_factor": float(
+                getattr(args, "vla_cache_growth_factor", 0.55)
+            ),
+            "calls": int(lrnode_stats.get("vla_cache_calls", 0)),
+            "first_queries": int(
+                lrnode_stats.get("vla_cache_first_queries", 0)
+            ),
+            "actual_kv_reuse_calls": int(
+                lrnode_stats.get("vla_cache_actual_kv_reuse_calls", 0)
+            ),
+            "avg_reusable_candidates": float(
+                lrnode_stats.get("vla_cache_avg_reusable_candidates", 0.0)
+            ),
+            "avg_removed_final": float(
+                lrnode_stats.get("vla_cache_avg_removed_final", 0.0)
+            ),
+            "full_token_layers": int(
+                lrnode_stats.get("vla_cache_full_token_layers", 0)
+            ),
+            "computed_token_layers": int(
+                lrnode_stats.get("vla_cache_computed_token_layers", 0)
+            ),
+            "token_layer_reduction": float(
+                lrnode_stats.get("vla_cache_token_layer_reduction", 0.0)
+            ),
         },
         "query_reduction": {
             "num_env_steps": int(lrnode_stats.get("num_env_steps", 0)),

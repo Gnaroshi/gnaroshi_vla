@@ -346,6 +346,41 @@ def get_parser(is_eval=False):
         default=1,
         help="Episode-level full-Seer query budget for first_only/fixed_budget LR-NODE eval policies.",
     )
+    parser.add_argument(
+        "--vla_cache_mode",
+        type=str,
+        default="off",
+        choices=["off", "matched_full", "reuse"],
+        help=(
+            "Inference-only Seer VLA-Cache mode. matched_full uses the indexed "
+            "runtime without token reuse; reuse enables stable, non-task-relevant "
+            "visual-condition K/V reuse."
+        ),
+    )
+    parser.add_argument(
+        "--vla_cache_pruning_layers",
+        type=str,
+        default="2,6,9,11",
+        help="Comma-separated zero-based GPT-2 layers using the published reuse schedule.",
+    )
+    parser.add_argument(
+        "--vla_cache_reference_attention_layer",
+        type=int,
+        default=15,
+        help="GPT-2 layer whose previous action-query attention defines task relevance.",
+    )
+    parser.add_argument(
+        "--vla_cache_similarity_threshold",
+        type=float,
+        default=0.996,
+        help="Cosine threshold for stable projected Seer visual-condition tokens.",
+    )
+    parser.add_argument(
+        "--vla_cache_growth_factor",
+        type=float,
+        default=0.55,
+        help="Published positive-growth smoothing factor for the entropy schedule.",
+    )
     
     # calvin
     parser.add_argument("--except_lang", default=False, action="store_true")

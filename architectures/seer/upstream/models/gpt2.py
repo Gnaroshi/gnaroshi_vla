@@ -170,6 +170,68 @@ class GPT2Attention(nn.Module):
 
         return attn_output
 
+    def forward_indexed_reuse(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        attention_mask: Optional[torch.Tensor],
+        active_positions: torch.Tensor,
+        previous_key: Optional[torch.Tensor],
+        previous_value: Optional[torch.Tensor],
+        sequence_length: int,
+    ):
+        """Compute active queries while retaining prior K/V at inactive positions."""
+
+        query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+        query = self._split_heads(query, self.num_heads, self.head_dim)
+        key = self._split_heads(key, self.num_heads, self.head_dim)
+        value = self._split_heads(value, self.num_heads, self.head_dim)
+
+        if previous_key is None or previous_value is None:
+            expected = torch.arange(sequence_length, device=active_positions.device)
+            if not torch.equal(active_positions, expected):
+                raise RuntimeError("The first VLA-Cache query must compute every token")
+            full_key = key.detach()
+            full_value = value.detach()
+        else:
+            expected_shape = (
+                hidden_states.shape[0],
+                self.num_heads,
+                sequence_length,
+                self.head_dim,
+            )
+            if tuple(previous_key.shape) != expected_shape:
+                raise RuntimeError(
+                    "VLA-Cache key shape changed: "
+                    f"expected={expected_shape}, actual={tuple(previous_key.shape)}"
+                )
+            if tuple(previous_value.shape) != expected_shape:
+                raise RuntimeError(
+                    "VLA-Cache value shape changed: "
+                    f"expected={expected_shape}, actual={tuple(previous_value.shape)}"
+                )
+            full_key = previous_key
+            full_value = previous_value
+            full_key.index_copy_(2, active_positions, key.detach())
+            full_value.index_copy_(2, active_positions, value.detach())
+
+        if self.reorder_and_upcast_attn:
+            raise RuntimeError(
+                "Seer VLA-Cache requires the model's standard eager attention path"
+            )
+        attn_output, attn_weights = self._attn(
+            query,
+            full_key,
+            full_value,
+            attention_mask,
+        )
+        attn_output = self._merge_heads(
+            attn_output, self.num_heads, self.head_dim
+        )
+        attn_output = self.c_proj(attn_output)
+        attn_output = self.resid_dropout(attn_output)
+        return attn_output, attn_weights, full_key, full_value
+
 
 class GPT2MLP(nn.Module):
     def __init__(self, intermediate_size, config):
@@ -221,6 +283,33 @@ class GPT2Block(nn.Module):
         hidden_states = residual + feed_forward_hidden_states  # TODO
 
         return hidden_states 
+
+    def forward_indexed_reuse(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        attention_mask: Optional[torch.Tensor],
+        active_positions: torch.Tensor,
+        previous_key: Optional[torch.Tensor],
+        previous_value: Optional[torch.Tensor],
+        sequence_length: int,
+    ):
+        residual = hidden_states
+        normalized = self.ln_1(hidden_states)
+        attn_output, attention_weights, key, value = (
+            self.attn.forward_indexed_reuse(
+                normalized,
+                attention_mask=attention_mask,
+                active_positions=active_positions,
+                previous_key=previous_key,
+                previous_value=previous_value,
+                sequence_length=sequence_length,
+            )
+        )
+        hidden_states = residual + attn_output
+        residual = hidden_states
+        hidden_states = residual + self.mlp(self.ln_2(hidden_states))
+        return hidden_states, attention_weights, key, value
 
 
 class GPT2PreTrainedModel(PreTrainedModel):
@@ -324,6 +413,364 @@ class GPT2Model(GPT2PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.reset_vla_cache_statistics()
+        self.reset_vla_cache_state()
+
+    def reset_vla_cache_state(self):
+        """Reset rollout-local cache state without discarding aggregate metrics."""
+
+        self._vla_cache_key_cache = None
+        self._vla_cache_value_cache = None
+        self._vla_cache_previous_full_hidden = None
+        self._vla_cache_previous_source = None
+        self._vla_cache_previous_importance = None
+        self._vla_cache_previous_entropies = None
+        self._vla_cache_sequence_length = None
+        self._vla_cache_query_index = 0
+        self.last_vla_cache_report = {}
+
+    def reset_vla_cache_statistics(self):
+        self._vla_cache_statistics = {
+            "calls": 0,
+            "first_queries": 0,
+            "actual_kv_reuse_calls": 0,
+            "reusable_candidates": 0,
+            "removed_final": 0,
+            "full_token_layers": 0,
+            "computed_token_layers": 0,
+        }
+
+    def get_vla_cache_stats(self):
+        stats = dict(self._vla_cache_statistics)
+        calls = max(1, int(stats["calls"]))
+        full_token_layers = int(stats["full_token_layers"])
+        computed_token_layers = int(stats["computed_token_layers"])
+        stats.update(
+            {
+                "avg_reusable_candidates": stats["reusable_candidates"] / calls,
+                "avg_removed_final": stats["removed_final"] / calls,
+                "token_layer_reduction": (
+                    1.0 - computed_token_layers / full_token_layers
+                    if full_token_layers
+                    else 0.0
+                ),
+                "last_report": dict(self.last_vla_cache_report),
+            }
+        )
+        return stats
+
+    @staticmethod
+    def _vla_cache_attention_rows(attention_mask, active_positions):
+        if attention_mask is None:
+            return None
+        if attention_mask.dim() == 2:
+            return attention_mask.index_select(0, active_positions)
+        if attention_mask.dim() == 3:
+            return attention_mask.index_select(1, active_positions)
+        if attention_mask.dim() == 4:
+            return attention_mask.index_select(2, active_positions)
+        raise ValueError(
+            "Seer VLA-Cache supports 2D, 3D, or 4D attention masks; "
+            f"got shape={tuple(attention_mask.shape)}"
+        )
+
+    @staticmethod
+    def _vla_cache_attention_entropy(attention):
+        probabilities = attention.float().mean(dim=1)
+        probabilities = probabilities / probabilities.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-10)
+        probabilities = torch.nan_to_num(probabilities, nan=0.0)
+        token_entropy = -(
+            probabilities * torch.log(probabilities + 1e-10)
+        ).sum(dim=-1)
+        return token_entropy.mean().detach()
+
+    @staticmethod
+    def _vla_cache_layer_schedule(entropies, growth_factor):
+        if len(entropies) < 2:
+            raise ValueError("VLA-Cache requires at least two attention layers")
+        values = torch.stack(list(entropies[:-1])).float()
+        normalized = (values - values.min()) / (
+            values.max() - values.min() + 1e-10
+        )
+        reuse = (1.0 - normalized).tolist()
+        for index in range(1, len(reuse)):
+            delta = reuse[index] - reuse[index - 1]
+            if delta > 0:
+                reuse[index] = reuse[index - 1] + delta * float(growth_factor)
+        return torch.tensor(
+            reuse, dtype=torch.float32, device=entropies[0].device
+        )
+
+    @staticmethod
+    def _vla_cache_select_reusable(
+        previous_source,
+        current_source,
+        previous_importance,
+        config,
+    ):
+        if previous_source.shape != current_source.shape:
+            raise ValueError("VLA-Cache source-token shape changed within a rollout")
+        if previous_source.ndim != 3 or previous_source.shape[0] != 1:
+            raise ValueError("Seer VLA-Cache requires source tokens shaped [1,N,D]")
+        sequence_length = current_source.shape[1]
+        if previous_importance.shape != (sequence_length,):
+            raise ValueError("VLA-Cache visual-importance shape is invalid")
+
+        threshold = float(config["similarity_threshold"])
+        stable_top_k = int(config["stable_top_k"])
+        relevant_top_k = int(config["task_relevant_top_k"])
+        reusable = []
+        diagnostics = []
+        for group_index, group_values in enumerate(config["visual_groups"]):
+            positions = torch.as_tensor(
+                group_values, dtype=torch.long, device=current_source.device
+            )
+            previous = previous_source.index_select(1, positions).float()
+            current = current_source.index_select(1, positions).float()
+            similarities = nn.functional.cosine_similarity(
+                previous, current, dim=-1
+            )[0]
+            eligible = torch.nonzero(
+                similarities >= threshold, as_tuple=False
+            ).flatten()
+            if eligible.numel():
+                order = torch.argsort(
+                    similarities.index_select(0, eligible),
+                    descending=True,
+                    stable=True,
+                )
+                stable_relative = eligible.index_select(0, order[:stable_top_k])
+            else:
+                stable_relative = eligible
+            importance = previous_importance.index_select(0, positions)
+            important_relative = torch.argsort(
+                importance, descending=True, stable=True
+            )[:relevant_top_k]
+            stable_set = set(stable_relative.tolist())
+            important_set = set(important_relative.tolist())
+            reusable_relative = sorted(stable_set - important_set)
+            reusable.extend(
+                int(positions[index].item()) for index in reusable_relative
+            )
+            diagnostics.append(
+                {
+                    "group_index": group_index,
+                    "timestep": int(config["visual_group_timesteps"][group_index]),
+                    "camera": str(config["visual_group_cameras"][group_index]),
+                    "stable_candidates": int(eligible.numel()),
+                    "stable_selected": int(stable_relative.numel()),
+                    "task_relevant_selected": int(important_relative.numel()),
+                    "reusable_selected": len(reusable_relative),
+                    "similarity_mean": float(similarities.mean().item()),
+                    "similarity_min": float(similarities.min().item()),
+                    "similarity_max": float(similarities.max().item()),
+                }
+            )
+        return (
+            torch.tensor(
+                sorted(reusable), dtype=torch.long, device=current_source.device
+            ),
+            diagnostics,
+        )
+
+    @staticmethod
+    def _vla_cache_action_importance(
+        attention,
+        active_positions,
+        action_query_positions,
+        visual_positions,
+        sequence_length,
+    ):
+        action_positions = torch.as_tensor(
+            action_query_positions,
+            dtype=torch.long,
+            device=active_positions.device,
+        )
+        action_rows = torch.searchsorted(active_positions, action_positions)
+        if (
+            action_rows.numel() != action_positions.numel()
+            or int(action_rows.max()) >= active_positions.numel()
+            or not torch.equal(
+                active_positions.index_select(0, action_rows), action_positions
+            )
+        ):
+            raise RuntimeError("VLA-Cache removed an action query token")
+        visual = torch.as_tensor(
+            visual_positions,
+            dtype=torch.long,
+            device=active_positions.device,
+        )
+        scores = attention.index_select(-2, action_rows).index_select(-1, visual)
+        scores = scores.float().mean(dim=(0, 1, 2))
+        full = scores.new_zeros(sequence_length)
+        full.index_copy_(0, visual, scores)
+        return full.detach()
+
+    def _forward_vla_cache(
+        self,
+        *,
+        inputs_embeds,
+        attention_mask,
+        source_embeds,
+        config,
+    ):
+        if self.training:
+            raise ValueError("VLA-Cache is an inference-only path")
+        if inputs_embeds.ndim != 3 or inputs_embeds.shape[0] != 1:
+            raise ValueError("Seer VLA-Cache requires per-rank batch size one")
+        if source_embeds is None or source_embeds.shape != inputs_embeds.shape:
+            raise ValueError(
+                "Seer VLA-Cache requires pre-position source embeddings with the "
+                "same [1,N,D] shape as inputs_embeds"
+            )
+        sequence_length = int(inputs_embeds.shape[1])
+        if sequence_length != int(config["total_tokens"]):
+            raise ValueError(
+                "VLA-Cache token-layout mismatch: "
+                f"runtime={sequence_length}, contract={config['total_tokens']}"
+            )
+        if (
+            self._vla_cache_sequence_length is not None
+            and self._vla_cache_sequence_length != sequence_length
+        ):
+            raise ValueError("VLA-Cache sequence length changed within a rollout")
+        self._vla_cache_sequence_length = sequence_length
+
+        hidden_states = self.drop(inputs_embeds)
+        full_positions = torch.arange(sequence_length, device=inputs_embeds.device)
+        first_query = self._vla_cache_key_cache is None
+        reuse_enabled = bool(config.get("reuse_enabled", False))
+        if first_query:
+            self._vla_cache_key_cache = [None] * len(self.h)
+            self._vla_cache_value_cache = [None] * len(self.h)
+
+        selection_diagnostics = []
+        if (
+            reuse_enabled
+            and not first_query
+            and self._vla_cache_previous_source is not None
+            and self._vla_cache_previous_importance is not None
+        ):
+            reusable, selection_diagnostics = self._vla_cache_select_reusable(
+                self._vla_cache_previous_source,
+                source_embeds,
+                self._vla_cache_previous_importance,
+                config,
+            )
+            schedule = self._vla_cache_layer_schedule(
+                self._vla_cache_previous_entropies,
+                config["positive_growth_factor"],
+            )
+        else:
+            reusable = full_positions[:0]
+            schedule = None
+
+        active_positions = full_positions
+        removed_positions = full_positions[:0]
+        active_tokens_per_layer = []
+        selected_per_pruning_layer = {}
+        current_entropies = []
+        current_importance = None
+        selected_timestep = min(
+            self._vla_cache_query_index, int(config["sequence_length"]) - 1
+        )
+        pruning_layers = set(int(layer) for layer in config["pruning_layers"])
+
+        for layer_index, block in enumerate(self.h):
+            if (
+                schedule is not None
+                and reusable.numel()
+                and layer_index in pruning_layers
+            ):
+                proportion = float(schedule[layer_index].item())
+                selected_count = max(1, int(proportion * reusable.numel()))
+                selected = reusable[:selected_count]
+                if removed_positions.numel() <= selected.numel():
+                    keep = ~torch.isin(active_positions, selected)
+                    hidden_states = hidden_states[:, keep]
+                    active_positions = active_positions[keep]
+                    removed_positions = selected
+                selected_per_pruning_layer[str(layer_index)] = selected.tolist()
+
+            active_tokens_per_layer.append(int(active_positions.numel()))
+            layer_attention_mask = self._vla_cache_attention_rows(
+                attention_mask, active_positions
+            )
+            hidden_states, attention, key, value = block.forward_indexed_reuse(
+                hidden_states,
+                attention_mask=layer_attention_mask,
+                active_positions=active_positions,
+                previous_key=self._vla_cache_key_cache[layer_index],
+                previous_value=self._vla_cache_value_cache[layer_index],
+                sequence_length=sequence_length,
+            )
+            self._vla_cache_key_cache[layer_index] = key
+            self._vla_cache_value_cache[layer_index] = value
+            current_entropies.append(
+                self._vla_cache_attention_entropy(attention)
+            )
+            if layer_index == int(config["reference_attention_layer"]):
+                current_importance = self._vla_cache_action_importance(
+                    attention,
+                    active_positions,
+                    config["action_query_groups"][selected_timestep],
+                    config["visual_positions"],
+                    sequence_length,
+                )
+
+        hidden_states = self.ln_f(hidden_states)
+        if removed_positions.numel():
+            if self._vla_cache_previous_full_hidden is None:
+                raise RuntimeError("VLA-Cache cannot reconstruct output without history")
+            full_hidden = self._vla_cache_previous_full_hidden.clone()
+            full_hidden.index_copy_(1, active_positions, hidden_states)
+        else:
+            full_hidden = hidden_states
+        if current_importance is None:
+            raise RuntimeError("VLA-Cache did not capture reference-layer attention")
+
+        self._vla_cache_previous_full_hidden = full_hidden.detach()
+        self._vla_cache_previous_source = source_embeds.detach().clone()
+        self._vla_cache_previous_importance = current_importance
+        self._vla_cache_previous_entropies = current_entropies
+        self._vla_cache_query_index += 1
+
+        full_token_layers = sequence_length * len(self.h)
+        computed_token_layers = sum(active_tokens_per_layer)
+        report = {
+            "mode": str(config["mode"]),
+            "first_query": bool(first_query),
+            "query_index": int(self._vla_cache_query_index - 1),
+            "selected_action_timestep": int(selected_timestep),
+            "sequence_length": sequence_length,
+            "visual_tokens": len(config["visual_positions"]),
+            "reusable_candidates": int(reusable.numel()),
+            "removed_final": int(removed_positions.numel()),
+            "active_tokens_per_layer": active_tokens_per_layer,
+            "selected_positions_per_pruning_layer": selected_per_pruning_layer,
+            "selection_by_timestep_camera": selection_diagnostics,
+            "full_token_layers": full_token_layers,
+            "computed_token_layers": computed_token_layers,
+            "skipped_token_layers": full_token_layers - computed_token_layers,
+            "token_layer_reduction": 1.0
+            - computed_token_layers / full_token_layers,
+            "actual_kv_reuse": bool(removed_positions.numel()),
+            "output_reconstructed_from_previous_hidden": bool(
+                removed_positions.numel()
+            ),
+        }
+        self.last_vla_cache_report = report
+        stats = self._vla_cache_statistics
+        stats["calls"] += 1
+        stats["first_queries"] += int(first_query)
+        stats["actual_kv_reuse_calls"] += int(report["actual_kv_reuse"])
+        stats["reusable_candidates"] += report["reusable_candidates"]
+        stats["removed_final"] += report["removed_final"]
+        stats["full_token_layers"] += full_token_layers
+        stats["computed_token_layers"] += computed_token_layers
+        return full_hidden
 
     def get_input_embeddings(self):
         return self.wte
@@ -335,7 +782,16 @@ class GPT2Model(GPT2PreTrainedModel):
         self,
         attention_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        vla_cache_config=None,
+        vla_cache_source_embeds: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
+        if vla_cache_config and bool(vla_cache_config.get("enabled", False)):
+            return self._forward_vla_cache(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                source_embeds=vla_cache_source_embeds,
+                config=vla_cache_config,
+            )
         
         input_shape = inputs_embeds.size()[:-1]
 

@@ -13,6 +13,7 @@ import numpy as np
 from models.vit_mae import MaskedAutoencoderViT
 from models.perceiver_resampler import PerceiverResampler
 from models.gpt2 import GPT2Model
+from models.vla_cache import build_seer_vla_cache_config
 from models.lrnode_modules import FastVisualDeltaEncoder, ControlledLatentNODE
 from transformers import GPT2Config
 from pdb import set_trace
@@ -165,6 +166,11 @@ class SeerAgent(nn.Module):
         lrnode_log_sanity=1,
         lrnode_gate_init_bias=-4.0,
         lrnode_trace=0,
+        vla_cache_mode="off",
+        vla_cache_pruning_layers="2,6,9,11",
+        vla_cache_reference_attention_layer=15,
+        vla_cache_similarity_threshold=0.996,
+        vla_cache_growth_factor=0.55,
     ):
         super().__init__()
         self.finetune_type = finetune_type
@@ -267,6 +273,19 @@ class SeerAgent(nn.Module):
         config.vocab_size = 1
         config.n_head = transformer_heads
         self.transformer_backbone = GPT2Model(config)
+        self.vla_cache_config = build_seer_vla_cache_config(
+            mode=vla_cache_mode,
+            pruning_layers=vla_cache_pruning_layers,
+            reference_attention_layer=vla_cache_reference_attention_layer,
+            similarity_threshold=vla_cache_similarity_threshold,
+            positive_growth_factor=vla_cache_growth_factor,
+            transformer_layers=transformer_layers,
+            sequence_length=self.sequence_length,
+            num_resampler_query=self.NUM_RESAMPLER_QUERY,
+            num_obs_token_per_image=self.NUM_OBS_TOKEN_PER_IMAGE,
+            obs_pred=self.obs_pred,
+            action_pred_steps=self.action_pred_steps,
+        )
 
         # action decoder
         MLP_hidden_dim = self.hidden_dim // 2
@@ -388,6 +407,12 @@ class SeerAgent(nn.Module):
         self.action_decoder_type = next(self.action_decoder.parameters()).type()
         if self.use_lrnode_latent_update:
             self.lrnode_delta_encoder_type = next(self.lrnode_delta_encoder.parameters()).type()
+
+    def reset_vla_cache_state(self):
+        self.transformer_backbone.reset_vla_cache_state()
+
+    def get_vla_cache_stats(self):
+        return self.transformer_backbone.get_vla_cache_stats()
 
     def decode_action_from_latent(self, action_latent):
         if self.action_pred_steps <= 0:
@@ -594,7 +619,8 @@ class SeerAgent(nn.Module):
             transformer_input_list.append(self.obs_tokens.repeat(B, S, 1, 1))
         if self.action_pred_steps > 0:
             transformer_input_list.append(self.action_pred_token.repeat(B, S, 1, 1))
-        transformer_input = torch.cat(transformer_input_list, dim=2)  
+        transformer_input = torch.cat(transformer_input_list, dim=2)
+        vla_cache_source_embeds = transformer_input.flatten(1, 2)
         transformer_input = transformer_input + self.transformer_backbone_position_embedding.repeat(B, 1, transformer_input.shape[-2], 1)
         transformer_input = transformer_input.flatten(1, 2)
 
@@ -602,7 +628,12 @@ class SeerAgent(nn.Module):
         if transformer_input.type() != self.transformer_backbone_type:
             transformer_input = transformer_input.type(self.transformer_backbone_type)
         transformer_input = self.embedding_layer_norm(transformer_input)
-        transformer_output = self.transformer_backbone(inputs_embeds=transformer_input, attention_mask=self.attention_mask)
+        transformer_output = self.transformer_backbone(
+            inputs_embeds=transformer_input,
+            attention_mask=self.attention_mask,
+            vla_cache_config=self.vla_cache_config,
+            vla_cache_source_embeds=vla_cache_source_embeds,
+        )
         transformer_output = transformer_output.view(B, S, -1, self.hidden_dim)
 
         if self.obs_pred:

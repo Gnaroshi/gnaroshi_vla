@@ -178,6 +178,24 @@ def main():
         print(f"[EVAL ARGS] lrnode_multistep_train={bool(args.lrnode_multistep_train)}")
         print(f"[EVAL ARGS] lrnode_train_max_horizon={args.lrnode_train_max_horizon}")
         print(f"[EVAL ARGS] lrnode_gate_init_bias={args.lrnode_gate_init_bias}")
+        print(f"[EVAL ARGS] vla_cache_mode={args.vla_cache_mode}")
+        print(
+            "[EVAL ARGS] "
+            f"vla_cache_pruning_layers={args.vla_cache_pruning_layers}"
+        )
+        print(
+            "[EVAL ARGS] "
+            "vla_cache_reference_attention_layer="
+            f"{args.vla_cache_reference_attention_layer}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"vla_cache_similarity_threshold={args.vla_cache_similarity_threshold}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"vla_cache_growth_factor={args.vla_cache_growth_factor}"
+        )
     _save_eval_args_snapshot(args)
     random_seed(args.seed)
 
@@ -215,6 +233,13 @@ def main():
         lrnode_log_sanity=args.lrnode_log_sanity,
         lrnode_gate_init_bias=args.lrnode_gate_init_bias,
         lrnode_trace=args.lrnode_trace,
+        vla_cache_mode=args.vla_cache_mode,
+        vla_cache_pruning_layers=args.vla_cache_pruning_layers,
+        vla_cache_reference_attention_layer=(
+            args.vla_cache_reference_attention_layer
+        ),
+        vla_cache_similarity_threshold=args.vla_cache_similarity_threshold,
+        vla_cache_growth_factor=args.vla_cache_growth_factor,
     )
 
     random_seed(args.seed, args.rank)
@@ -293,6 +318,12 @@ def main():
             print(f"[EVAL MODEL] lrnode_train_max_horizon={getattr(m, 'lrnode_train_max_horizon', None)}")
             print(f"[EVAL MODEL] lrnode_gate_init_bias={getattr(m, 'lrnode_gate_init_bias', None)}")
             print(f"[EVAL MODEL] action_pred_steps={getattr(m, 'action_pred_steps', None)}")
+
+    if args.rank == 0 and args.vla_cache_mode != "off":
+        print(
+            "[VLA-CACHE CONTRACT] "
+            + json.dumps(ddp_model.module.vla_cache_config, sort_keys=True)
+        )
 
     if args.rank == 0:
         log_dir = os.environ.get("LOG_DIR")
