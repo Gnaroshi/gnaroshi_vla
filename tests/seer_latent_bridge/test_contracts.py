@@ -280,7 +280,10 @@ def test_exact_distributed_eval_sampler_has_no_padding_or_duplicates():
     assert [len(partition) for partition in partitions] == [3, 3, 3, 2]
 
 
-def test_runtime_provenance_is_fail_closed():
+def test_runtime_provenance_is_fail_closed(monkeypatch):
+    monkeypatch.setenv(
+        "SEER_LATENT_BRIDGE_BASE_CHECKPOINT_SHA256", PUBLIC_SEER_33_SHA256
+    )
     valid = {
         "stage": "R1",
         "metadata": {

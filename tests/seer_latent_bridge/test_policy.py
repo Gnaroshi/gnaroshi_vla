@@ -70,6 +70,9 @@ class _FakeBaseWrapper:
 def test_zero_initialized_policy_skip_reuses_condition_and_shared_head(
     tmp_path: Path, monkeypatch
 ):
+    monkeypatch.setenv(
+        "SEER_LATENT_BRIDGE_BASE_CHECKPOINT_SHA256", PUBLIC_SEER_33_SHA256
+    )
     config = SeerFeatureBridgeConfig(
         stable_seq_len=3,
         hidden_dim=24,
