@@ -55,7 +55,13 @@ def _configure_deterministic_noise(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.set_deterministic_debug_mode("error")
     torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
 
 
 def _load_controller(args: argparse.Namespace):
@@ -81,12 +87,16 @@ def _artifact_preflight(args: argparse.Namespace) -> dict[str, Any]:
     width = int(cameras["width"])
     exterior = np.full((height, width, 3), 96, dtype=np.uint8)
     wrist = np.full((height, width, 3), 160, dtype=np.uint8)
-    state = np.asarray(contract.state["preflight_vector"], dtype=np.float32)
+    state = contract.state["preflight_robot_state"]
     robot_state = {
-        "pose6d": state[:6],
-        "tcp_rotvec": state[3:6],
-        "gripper_open_state": state[6:7],
-        "gripper_position": state[7:8],
+        "pose6d": np.asarray(state["pose6d_euler_xyz"], dtype=np.float32),
+        "tcp_rotvec": np.asarray(state["tcp_rotvec"], dtype=np.float32),
+        "gripper_open_state": np.asarray(
+            [state["gripper_open_state"]], dtype=np.float32
+        ),
+        "gripper_position": np.asarray(
+            [state["gripper_position_normalized"]], dtype=np.float32
+        ),
     }
     steps = max(int(args.steps or 11), 11)
     actions = []
@@ -122,6 +132,8 @@ def _artifact_preflight(args: argparse.Namespace) -> dict[str, Any]:
                 "num_condition_updater_calls": queries // 2,
             }
         )
+        if args.method == "latentloop":
+            expected["num_condition_change_code_queries"] = queries // 2
     else:
         expected.update(
             {
@@ -169,11 +181,13 @@ def _artifact_preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 def _read_only_profile(args: argparse.Namespace) -> dict[str, Any]:
     contract, controller = _load_controller(args)
+    from .contracts import require_hardware_configuration
     from .hardware import build_deploy_config
     from .runtime import ReadOnlyDeployEnvironment, run_read_only_profile
 
     if not args.output:
         raise ValueError("--output is required for read-only-profile")
+    require_hardware_configuration(contract)
     steps = int(args.steps or contract.runtime["max_steps"])
     if steps < 11:
         raise ValueError("read-only-profile requires at least 11 steps")
@@ -208,7 +222,7 @@ def main() -> None:
         from .contracts import load_deployment_contract, require_live_authorization
 
         contract = load_deployment_contract(args.manifest, verify_artifacts=True)
-        require_live_authorization(contract)
+        require_live_authorization(contract, deployment_method=args.method)
         _, controller = _load_controller(args)
         from .deploy_gui import run_live_gui
 

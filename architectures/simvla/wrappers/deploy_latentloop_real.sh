@@ -12,6 +12,10 @@ Usage:
 The default path cannot command the robot. Live mode additionally requires the
 manifest safety approval, SIMVLA_REAL_LIVE_RUN=1, and a matching
 SIMVLA_REAL_DEPLOYMENT_ID.
+
+SIMVLA_REAL_LOG_ROOT selects a writable log root. SIMVLA_REAL_RUN_NAME is a
+semantic run name (default: mode_method). Repeats receive _r2, _r3, ... suffixes.
+SIMVLA_REAL_CUDA_DEVICE selects one physical GPU; sd1 permits only 4,5,6,7.
 EOF
 }
 
@@ -79,11 +83,54 @@ fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../.." && pwd)
 python_bin="${SIMVLA_REAL_PYTHON:-python}"
-cuda_device="${SIMVLA_REAL_CUDA_DEVICE:-0}"
+machine_name=$(hostname -s)
+default_gpu=0
+if [[ "${machine_name}" == "jbrserver1" || "${machine_name}" == "sd1" ]]; then
+    default_gpu=4
+fi
+cuda_device="${SIMVLA_REAL_CUDA_DEVICE:-${default_gpu}}"
+if [[ "${mode}" == "source-preflight" ]]; then
+    cuda_device=""
+else
+    [[ "${cuda_device}" =~ ^[0-9]+$ ]] || {
+        echo "[ERROR] SIMVLA_REAL_CUDA_DEVICE must be one physical GPU ID" >&2
+        exit 2
+    }
+    if [[ "${machine_name}" == "jbrserver1" || "${machine_name}" == "sd1" ]]; then
+        [[ "${cuda_device}" =~ ^[4-7]$ ]] || {
+            echo "[ERROR] sd1 permits only physical GPU IDs 4,5,6,7" >&2
+            exit 2
+        }
+    fi
+fi
 run_stamp=$(date +%Y%m%d_%H%M%S)
-launch_dir="${repo_root}/results/simvla/real_deploy/launch_logs/${mode}/${run_stamp}"
+default_log_root="${repo_root}/results/simvla/real_deploy/launch_logs"
+for storage_root in \
+    /home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla \
+    /home/mingyujung/private/gnaroshi_vla_storage; do
+    if [[ -d "${storage_root}/results" ]]; then
+        default_log_root="${storage_root}/results/simvla/real_deploy/launch_logs"
+        break
+    fi
+done
+log_root="${SIMVLA_REAL_LOG_ROOT:-${default_log_root}}"
+run_name="${SIMVLA_REAL_RUN_NAME:-${mode}_${method}}"
+[[ "${run_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || {
+    echo "[ERROR] SIMVLA_REAL_RUN_NAME must be a simple semantic name" >&2
+    exit 2
+}
+mkdir -p "${log_root}"
+launch_dir="${log_root}/${run_name}"
+repeat=1
+until mkdir "${launch_dir}" 2>/dev/null; do
+    [[ -e "${launch_dir}" ]] || {
+        echo "[ERROR] Cannot create log directory: ${launch_dir}" >&2
+        exit 1
+    }
+    repeat=$((repeat + 1))
+    launch_dir="${log_root}/${run_name}_r${repeat}"
+done
 output_dir="${launch_dir}/output"
-mkdir -p "${launch_dir}"
 
 export CUDA_VISIBLE_DEVICES="${cuda_device}"
 export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"

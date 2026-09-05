@@ -18,9 +18,49 @@ from torchvision.transforms import InterpolationMode
 from .geometry import ACTION_HORIZON
 
 
-DATASET_SCHEMA = "simvla_real_hdf5_v2"
+DATASET_SCHEMA = "simvla_real_hdf5_v3"
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
+REAL_JPEG_QUALITY = 95
+REAL_JPEG_SUBSAMPLING = 0
+
+
+def align_current_rotvec_proprio(
+    previous: torch.Tensor, current: torch.Tensor
+) -> torch.Tensor:
+    """Choose the current axis-angle representative nearest the previous one.
+
+    UR TCP rotation vectors are equivalent modulo full rotations.  Around the
+    axis-angle branch cut, directly subtracting two equivalent representatives
+    creates a large false proprioceptive delta.  Only the Condition Updater
+    consumes this aligned copy; the base action transformer keeps its original
+    proprioception contract.
+    """
+
+    if previous.ndim != 2 or current.shape != previous.shape:
+        raise ValueError("real proprioception pair must have matching [B,Q] shapes")
+    if previous.shape[-1] != 8:
+        raise ValueError("real SimVLA proprioception must have dimension 8")
+    if previous.device != current.device:
+        raise ValueError("real proprioception pair must be on the same device")
+    previous_rotation = previous[:, 3:6]
+    current_rotation = current[:, 3:6]
+    angle = torch.linalg.vector_norm(current_rotation, dim=-1, keepdim=True)
+    axis = current_rotation / angle.clamp_min(torch.finfo(current.dtype).eps)
+    turns = torch.arange(-2, 3, device=current.device, dtype=current.dtype)
+    candidates = current_rotation[:, None, :] + (
+        2.0 * torch.pi * turns[None, :, None] * axis[:, None, :]
+    )
+    distance = torch.linalg.vector_norm(
+        candidates - previous_rotation[:, None, :], dim=-1
+    )
+    selected = candidates[
+        torch.arange(current.shape[0], device=current.device), distance.argmin(dim=1)
+    ]
+    selected = torch.where(angle > 1e-7, selected, current_rotation)
+    result = current.clone()
+    result[:, 3:6] = selected
+    return result
 
 
 def valid_action_window_starts(
@@ -55,10 +95,45 @@ def resize_with_pad(image: np.ndarray, size: int = 224) -> Image.Image:
     return canvas
 
 
+def encode_jpeg(
+    image: np.ndarray,
+    *,
+    quality: int = REAL_JPEG_QUALITY,
+    subsampling: int = REAL_JPEG_SUBSAMPLING,
+) -> np.ndarray:
+    """Encode one RGB frame with the deterministic real-dataset codec."""
+
+    value = np.asarray(image)
+    if value.ndim != 3 or value.shape[-1] != 3 or value.dtype != np.uint8:
+        raise ValueError("real SimVLA images must be uint8 HWC RGB arrays")
+    buffer = io.BytesIO()
+    Image.fromarray(value, mode="RGB").save(
+        buffer,
+        format="JPEG",
+        quality=int(quality),
+        subsampling=int(subsampling),
+        optimize=False,
+    )
+    return np.frombuffer(buffer.getvalue(), dtype=np.uint8)
+
+
 def decode_jpeg(value: np.ndarray) -> np.ndarray:
     payload = np.asarray(value, dtype=np.uint8).tobytes()
     with Image.open(io.BytesIO(payload)) as image:
         return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+
+def jpeg_roundtrip(
+    image: np.ndarray,
+    *,
+    quality: int = REAL_JPEG_QUALITY,
+    subsampling: int = REAL_JPEG_SUBSAMPLING,
+) -> np.ndarray:
+    """Match deployment frames to the decoded JPEG frames used for training."""
+
+    return decode_jpeg(
+        encode_jpeg(image, quality=quality, subsampling=subsampling)
+    )
 
 
 def build_real_image_transform(*, training: bool) -> transforms.Compose:

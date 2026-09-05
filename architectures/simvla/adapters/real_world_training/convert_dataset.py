@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import pickle
@@ -13,9 +12,7 @@ from typing import Any
 
 import h5py
 import numpy as np
-from PIL import Image
-
-from .dataset import DATASET_SCHEMA, valid_action_window_starts
+from .dataset import DATASET_SCHEMA, encode_jpeg, valid_action_window_starts
 from .geometry import (
     ACTION_DIM,
     ACTION_HORIZON,
@@ -62,6 +59,10 @@ def _load_raw_frame(path: Path) -> dict[str, Any]:
         raise ValueError(f"unexpected pose/gripper/control shape in {path}")
     if not all(np.isfinite(value).all() for value in (pose, gripper, control)):
         raise ValueError(f"non-finite robot value in {path}")
+    if not 0.0 <= float(gripper[0]) <= 1.0:
+        raise ValueError(f"gripper observation is outside [0,1] in {path}")
+    if not 0.0 <= float(control[6]) <= 1.0:
+        raise ValueError(f"gripper command is outside [0,1] in {path}")
     return {
         "base_rgb": np.ascontiguousarray(base),
         "wrist_rgb": np.ascontiguousarray(wrist),
@@ -69,14 +70,6 @@ def _load_raw_frame(path: Path) -> dict[str, Any]:
         "gripper_position": float(gripper[0]),
         "gripper_control": float(control[6]),
     }
-
-
-def _jpeg(image: np.ndarray, quality: int) -> np.ndarray:
-    buffer = io.BytesIO()
-    Image.fromarray(image, mode="RGB").save(
-        buffer, format="JPEG", quality=int(quality), subsampling=0, optimize=False
-    )
-    return np.frombuffer(buffer.getvalue(), dtype=np.uint8)
 
 
 def _roundtrip_error(current: np.ndarray, following: np.ndarray, raw_action: np.ndarray, scales: RealActionScales) -> float:
@@ -128,7 +121,7 @@ def convert_episode(
         clipped, raw = transition_to_normalized_action(
             current["pose"],
             following["pose"],
-            following["gripper_control"],
+            current["gripper_control"],
             scales,
             clip=True,
         )
@@ -139,6 +132,18 @@ def convert_episode(
         )
     actions = np.stack(clipped_actions, axis=0)
     raw_action_array = np.stack(raw_actions, axis=0)
+    gripper_commands = np.asarray(
+        [frame["gripper_control"] for frame in frames], dtype=np.float32
+    )
+    expected_gripper = (1.0 - 2.0 * gripper_commands[:-1]).astype(np.float32)
+    gripper_alignment_errors = int(
+        np.count_nonzero(~np.isclose(actions[:, 6], expected_gripper, atol=1e-7))
+    )
+    binary_gripper_state = gripper_commands >= 0.5
+    gripper_switch_indices = (
+        np.flatnonzero(binary_gripper_state[1:] != binary_gripper_state[:-1]) + 1
+    )
+    first_close_indices = np.flatnonzero(binary_gripper_state)
     pose_exceeded = np.any(np.abs(raw_action_array[:, :6]) > scales.clip_abs, axis=1)
     component_exceeded = np.abs(raw_action_array[:, :6]) > scales.clip_abs
 
@@ -154,10 +159,21 @@ def convert_episode(
             handle.attrs["source_frame_count"] = len(source_files)
             handle.attrs["target_hz"] = float(target_hz)
             handle.attrs["sampling_mode"] = "native_capture_order"
+            handle.attrs["observation_action_alignment"] = (
+                "frame_t stores observation_t and command_t before env.step(command_t)"
+            )
             handle.create_dataset("timestamp_s", data=selected_times)
             handle.create_dataset("source_index", data=selected_indices)
             handle.create_dataset("valid_transition", data=valid_transition.astype(np.uint8))
             handle.create_dataset("state", data=states, compression="gzip", shuffle=True)
+            handle.create_dataset(
+                "gripper_command",
+                data=np.asarray(
+                    [frame["gripper_control"] for frame in frames], dtype=np.float32
+                ),
+                compression="gzip",
+                shuffle=True,
+            )
             handle.create_dataset("step_action", data=actions, compression="gzip", shuffle=True)
             handle.create_dataset(
                 "raw_normalized_step_action", data=raw_action_array, compression="gzip", shuffle=True
@@ -169,8 +185,12 @@ def convert_episode(
                 "wrist_rgb_jpeg", shape=(len(frames),), dtype=jpeg_dtype
             )
             for index, frame in enumerate(frames):
-                base_dataset[index] = _jpeg(frame["base_rgb"], jpeg_quality)
-                wrist_dataset[index] = _jpeg(frame["wrist_rgb"], jpeg_quality)
+                base_dataset[index] = encode_jpeg(
+                    frame["base_rgb"], quality=jpeg_quality
+                )
+                wrist_dataset[index] = encode_jpeg(
+                    frame["wrist_rgb"], quality=jpeg_quality
+                )
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -203,6 +223,16 @@ def convert_episode(
         "pose_clip_component_fraction": float(component_exceeded.mean()),
         "raw_pose_action_abs_max": np.abs(raw_action_array[:, :6]).max(axis=0).tolist(),
         "roundtrip_matrix_max_abs": float(max(roundtrip_errors)),
+        "gripper_label_alignment_error_count": gripper_alignment_errors,
+        "first_gripper_close_frame": (
+            int(first_close_indices[0]) if first_close_indices.size else None
+        ),
+        "gripper_switch_indices": gripper_switch_indices.tolist(),
+        "minimum_gripper_switch_interval": (
+            int(np.diff(gripper_switch_indices).min())
+            if gripper_switch_indices.size > 1
+            else None
+        ),
         "sha256": sha256_file(destination),
         "size_bytes": destination.stat().st_size,
     }
@@ -307,6 +337,19 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
     candidate_training_samples = sum(item["candidate_training_samples"] for item in summaries)
     training_samples = sum(item["training_samples"] for item in summaries)
     roundtrip_max = max(item["roundtrip_matrix_max_abs"] for item in summaries)
+    gripper_alignment_errors = sum(
+        item["gripper_label_alignment_error_count"] for item in summaries
+    )
+    first_close_frames = [
+        int(item["first_gripper_close_frame"])
+        for item in summaries
+        if item["first_gripper_close_frame"] is not None
+    ]
+    gripper_switch_intervals = [
+        int(item["minimum_gripper_switch_interval"])
+        for item in summaries
+        if item["minimum_gripper_switch_interval"] is not None
+    ]
     data_identity_payload = {
         "schema": DATASET_SCHEMA,
         "episode_sha256": {item["episode_id"]: item["sha256"] for item in summaries},
@@ -324,7 +367,13 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "format": "3dflow_teleoperation_pickle",
             "control_pose_channels_used": False,
             "tcp_pose_source": "ee_pos_quat interpreted as xyz+rotation_vector",
-            "gripper_command_source": "control[6], <0.5=open and >=0.5=close",
+            "observation_action_alignment": (
+                "frame_t stores observation_t and command_t before env.step(command_t)"
+            ),
+            "gripper_command_source": (
+                "current_frame.control[6] recorded with observation_t before "
+                "env.step(command_t); 0=open and 1=close continuous target"
+            ),
         },
         "instruction": args.instruction,
         "target_hz": float(args.target_hz),
@@ -339,10 +388,18 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
         },
         "state_contract": {
             "representation": "tcp_xyz_rotvec_plus_opposed_finger_positions",
+            "condition_updater_rotation_delta": (
+                "current rotvec mapped to equivalent 2pi branch nearest previous rotvec"
+            ),
             "gripper_max_opening_m": scales.gripper_max_opening_m,
         },
         "action_contract": {
-            "representation": "inv(T_current)@T_next local xyz plus xyz_euler plus gripper",
+            "representation": (
+                "inv(T_current)@T_next local xyz plus xyz_euler plus "
+                "continuous gripper target"
+            ),
+            "pose_label_source": "measured transition observation_t to observation_t+1",
+            "gripper_label_source": "1 - 2 * command_t stored in current frame",
             "translation_scale_m": scales.translation_m,
             "rotation_scale_rad": scales.rotation_rad,
             "clip_abs": scales.clip_abs,
@@ -367,6 +424,13 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "max_transition_period_error_ms": timing_max,
             "max_included_transition_period_error_ms": included_timing_max,
             "max_pose_roundtrip_matrix_abs": roundtrip_max,
+            "gripper_label_alignment_error_count": gripper_alignment_errors,
+            "earliest_gripper_close_frame": (
+                min(first_close_frames) if first_close_frames else None
+            ),
+            "minimum_gripper_switch_interval": (
+                min(gripper_switch_intervals) if gripper_switch_intervals else None
+            ),
             "max_allowed_pose_clip_fraction": float(args.max_pose_clip_fraction),
             "max_allowed_transition_period_error_ms": float(max_transition_period_error_ms),
         },
@@ -375,6 +439,7 @@ def convert_dataset(args: argparse.Namespace) -> dict[str, Any]:
         clip_fraction <= args.max_pose_clip_fraction
         and included_timing_max <= max_transition_period_error_ms
         and roundtrip_max <= 1e-6
+        and gripper_alignment_errors == 0
         and all(item["training_samples"] > 0 for item in summaries)
     )
     manifest["verdict"] = "REAL_DATASET_CONTRACT_PASS" if passed else "REAL_DATASET_CONTRACT_FAIL"

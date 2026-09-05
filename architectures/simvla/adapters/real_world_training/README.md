@@ -1,7 +1,10 @@
 # SimVLA real-world baseline and LatentLoop training
 
 This package prepares a controlled comparison on the 40 `stackcupanddoll`
-teleoperation trajectories. It does not contain a robot-control entry point.
+teleoperation trajectories. Live robot control is implemented separately in
+`architectures/simvla/adapters/latentloop_real_deploy` and remains disabled
+until its artifact, hardware, timing, baseline-canary, and operator approvals
+all pass.
 
 ## Initialization contract
 
@@ -23,12 +26,15 @@ and records the SHA-256 of its complete official parent.
   than half a period is excluded. Every H=10 window crossing such a gap is
   omitted from training and counted in the dataset manifest.
 - Exterior and wrist RGB are kept in that order. Cache creation, training, and
-  deployment call the same resize-with-pad-224 then bicubic-384 transform.
+  deployment call the same JPEG95/subsampling0, resize-with-pad-224 then
+  bicubic-384 transform and ImageNet normalization. The processor is used for
+  text tokenization, not as an alternative image-normalization path.
 - State is `[TCP xyz, TCP rotation-vector, +finger opening, -finger opening]`.
 - `control[:6]` is an absolute joint command and is deliberately ignored.
 - Each action is reconstructed from consecutive TCP poses as
   `inv(T_current) @ T_next`, then represented as local xyz / 0.02 m, XYZ Euler
-  / 0.05 rad, and `+1=open,-1=close`.
+  / 0.05 rad. The gripper target is the synchronized current-frame command
+  `1 - 2 * command_t`, so it remains continuous with `+1=open,-1=close`.
 - Pose-label clipping is rejected by default. The converter writes the measured
   extrema before stopping so that a scale change can be reviewed explicitly.
 
@@ -47,8 +53,28 @@ Updater (`N_G=3`, full evaluations at solver indices 0, 4, and 8) train in
 parallel when at least two GPUs are available and sequentially on one GPU. Both
 checkpoints must name the exact real baseline SHA-256 as their teacher. Loss
 magnitudes are measured deterministically before training and normalized to
-equal contribution; no unexplained hand-selected loss weights are embedded in
-the wrapper.
+equal initial contribution. This balances numerical scales; it does not prove
+that the chosen loss balance is optimal for physical task success.
+
+A subsequent 10,000-step coupling stage freezes both trained updaters and
+trains only the Generation Updater's existing 128-by-128 condition-code
+projection (16,384 parameters). Its code is the same delta-encoder output used
+by the Condition Updater. The objective is local-oracle hidden-state MSE under
+the predicted condition. It is not end-to-end joint training and cannot by
+itself establish that the approximate condition is correct. Deployment uses
+this coupled checkpoint, not the uncoupled generation checkpoint.
+
+Legacy data and checkpoints with next-frame gripper labels are not deployment
+inputs. The wrapper requires dataset v3, cache v2, and v2 real checkpoint
+formats. Optional cache migration reuses only frozen conditions after checking
+image, proprioception, instruction, and record identities. A separate exact
+condition check covers one query from each of all 40 episodes before reuse.
+
+Training resume is deliberately not part of the scientific wrapper contract.
+An interrupted optimizer run does not preserve the exact distributed sampler
+and per-rank random-number state. The wrapper therefore moves an incomplete
+run into `quarantine/` and restarts that stage from step zero. Completed stages
+with a validated `run_summary.json` are reused.
 
 ## Comparison contract
 

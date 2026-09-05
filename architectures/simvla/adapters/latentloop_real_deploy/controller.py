@@ -41,9 +41,11 @@ def encode_robot_state(
     ).reshape(-1)
     if position.shape != (1,) or open_state.shape != (1,):
         raise ValueError("gripper state and position must each be scalar arrays")
+    if not np.isfinite(position[0]) or not 0.0 <= float(position[0]) <= 1.0:
+        raise ValueError("gripper position must be normalized to [0,1]")
     if encoding != "opposed_finger_positions":
         raise ValueError(f"Unsupported state encoding: {encoding}")
-    opening = (1.0 - float(np.clip(position[0], 0.0, 1.0))) * float(
+    opening = (1.0 - float(position[0])) * float(
         gripper_max_opening_m
     )
     state = np.concatenate((pose, [opening, -opening]))
@@ -66,9 +68,9 @@ def convert_model_action(
             "SimVLA pose action exceeded the reviewed normalized action bound: "
             f"max={float(np.max(np.abs(value[:6]))):.6f} bound={float(clip_abs):.6f}"
         )
-    # The real gripper consumes only the sign (open/close). Flow decoding can
-    # overshoot the supervised {-1, +1} targets slightly, so saturate this
-    # categorical channel while retaining the hard bound for Cartesian motion.
+    # The real gripper target is continuous in [-1,+1]. Flow decoding can
+    # overshoot that supervised interval, so saturate this channel while
+    # retaining a hard rejection (rather than clipping) for Cartesian motion.
     gripper = float(np.clip(value[6], -float(clip_abs), float(clip_abs)))
     if positive_gripper_means == "close":
         gripper = -gripper
@@ -108,6 +110,7 @@ class SimVLARealController:
         self.session_dir: Path | None = None
         self.step_records: list[dict[str, Any]] = []
         self.control_command_monotonic_s: list[float] = []
+        self.tracking_errors: list[dict[str, float]] = []
         self.args = SimpleNamespace(
             resume_from_checkpoint=str(
                 contract.artifacts["real_action_transformer"].path
@@ -136,6 +139,7 @@ class SimVLARealController:
             load_exact_official_model,
         )
         from architectures.simvla.adapters.real_world_training.updater_io import (
+            load_real_coupled_generation,
             load_real_updater,
         )
         from .policy import (
@@ -155,6 +159,16 @@ class SimVLARealController:
             device=target_device,
             freeze_vlm=True,
             freeze_action_transformer=True,
+            expected_dataset_identity_sha256=str(
+                contract.pairing["dataset_identity"]
+            ),
+            expected_cache_identity_sha256=str(
+                contract.pairing["condition_cache_identity"]
+            ),
+            expected_cache_attestation_identity_sha256=str(
+                contract.pairing["condition_cache_attestation_identity"]
+            ),
+            expected_real_action_optimizer_step=3000,
         )
         freeze_module(model)
 
@@ -178,11 +192,25 @@ class SimVLARealController:
             policy = FullSimVLARealPolicy(**common)
         elif deployment_method in {"condition_loop", "latentloop"}:
             baseline_sha256 = contract.artifacts["real_action_transformer"].sha256
+            source_expectations = {
+                "expected_baseline_sha256": baseline_sha256,
+                "expected_norm_sha256": contract.artifacts["norm_stats"].sha256,
+                "expected_dataset_identity_sha256": str(
+                    contract.pairing["dataset_identity"]
+                ),
+                "expected_cache_identity_sha256": str(
+                    contract.pairing["condition_cache_identity"]
+                ),
+                "expected_cache_attestation_identity_sha256": str(
+                    contract.pairing["condition_cache_attestation_identity"]
+                ),
+                "expected_optimizer_step": 10_000,
+            }
             condition, _ = load_real_updater(
                 contract.artifacts["condition_updater"].path,
                 kind="condition",
                 device=target_device,
-                expected_baseline_sha256=baseline_sha256,
+                **source_expectations,
             )
             condition_common = {
                 "adapter": condition,
@@ -194,11 +222,19 @@ class SimVLARealController:
             if deployment_method == "condition_loop":
                 policy = ConditionLoopSimVLARealPolicy(**condition_common)
             else:
-                generation, _ = load_real_updater(
-                    contract.artifacts["generation_updater"].path,
-                    kind="generation",
+                generation, _ = load_real_coupled_generation(
+                    contract.artifacts["coupled_generation_updater"].path,
                     device=target_device,
-                    expected_baseline_sha256=baseline_sha256,
+                    expected_parent_generation_sha256=contract.artifacts[
+                        "generation_updater"
+                    ].sha256,
+                    expected_condition_updater_sha256=contract.artifacts[
+                        "condition_updater"
+                    ].sha256,
+                    expected_cache_manifest_sha256=contract.artifacts[
+                        "condition_cache_manifest"
+                    ].sha256,
+                    **source_expectations,
                 )
                 policy = LatentLoopSimVLARealPolicy(
                     generation_updater=generation,
@@ -243,11 +279,20 @@ class SimVLARealController:
         self.policy.reset()
         self.step_records = []
         self.control_command_monotonic_s = []
+        self.tracking_errors = []
 
-    def record_control_command(self, timestamp: float | None = None) -> None:
+    def record_control_command(
+        self,
+        timestamp: float | None = None,
+        tracking_error: Mapping[str, float] | None = None,
+    ) -> None:
         self.control_command_monotonic_s.append(
             time.perf_counter() if timestamp is None else float(timestamp)
         )
+        if tracking_error is not None:
+            self.tracking_errors.append(
+                {key: float(value) for key, value in tracking_error.items()}
+            )
 
     @property
     def needs_policy_query(self) -> bool:
@@ -266,6 +311,18 @@ class SimVLARealController:
         images = observation.get("color_image")
         if not isinstance(images, (list, tuple)) or len(images) < 2:
             raise ValueError("color_image must contain exterior and wrist RGB images")
+        exterior = np.asarray(images[0])
+        wrist = np.asarray(images[1])
+        if self.needs_policy_query:
+            from architectures.simvla.adapters.real_world_training.dataset import (
+                jpeg_roundtrip,
+            )
+
+            # Training and every cached teacher condition use decoded JPEG95
+            # frames. Apply the same deterministic codec only on policy-query
+            # steps; queued actions do not consume the image arguments.
+            exterior = jpeg_roundtrip(exterior)
+            wrist = jpeg_roundtrip(wrist)
         state = encode_robot_state(
             observation["robot_state"],
             str(self.contract.state["encoding"]),
@@ -273,8 +330,8 @@ class SimVLARealController:
             float(self.contract.state["gripper_max_opening_m"]),
         )
         output = self.policy.act(
-            np.asarray(images[0]),
-            np.asarray(images[1]),
+            exterior,
+            wrist,
             state,
             str(observation["language_instruction"]),
         )
@@ -307,6 +364,9 @@ class SimVLARealController:
             "deployment_id": self.contract.deployment_id,
             "deployment_method": self.deployment_method,
             "manifest": str(self.contract.path),
+            "runtime_source_identity_sha256": self.contract.payload[
+                "runtime_source_identity_sha256"
+            ],
             "exact_initialization": getattr(self, "exact_initialization", None),
             "policy_contract": dict(self.contract.policy),
             "state_contract": dict(self.contract.state),
@@ -336,6 +396,14 @@ class SimVLARealController:
         control_period_ms = 1000.0 / float(
             self.contract.runtime["control_frequency_hz"]
         )
+        translation_errors = np.asarray(
+            [item["translation_m"] for item in self.tracking_errors],
+            dtype=np.float64,
+        )
+        rotation_errors = np.asarray(
+            [item["rotation_rad"] for item in self.tracking_errors],
+            dtype=np.float64,
+        )
         return {
             **self.deployment_metadata(),
             "rollout_index": self.rollout_index,
@@ -350,6 +418,21 @@ class SimVLARealController:
             "query_trace": list(getattr(self.policy, "query_trace", [])),
             "control_period_ms": control_period_ms,
             "control_commands": int(command_times.size),
+            "tracking_error": {
+                "samples": len(self.tracking_errors),
+                "translation_m_max": float(translation_errors.max())
+                if translation_errors.size
+                else 0.0,
+                "translation_m_p95": float(np.percentile(translation_errors, 95))
+                if translation_errors.size
+                else 0.0,
+                "rotation_rad_max": float(rotation_errors.max())
+                if rotation_errors.size
+                else 0.0,
+                "rotation_rad_p95": float(np.percentile(rotation_errors, 95))
+                if rotation_errors.size
+                else 0.0,
+            },
             "control_command_interval_ms": {
                 "mean": float(command_intervals_ms.mean())
                 if command_intervals_ms.size

@@ -31,6 +31,22 @@ def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def sha256_directory(path: str | Path) -> str:
+    """Hash directory contents and relative names in a stable order."""
+
+    root = Path(path).expanduser().resolve()
+    files = sorted(item for item in root.rglob("*") if item.is_file())
+    if not files:
+        raise ValueError(f"artifact directory contains no files: {root}")
+    digest = hashlib.sha256()
+    for item in files:
+        relative = item.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(sha256_file(item)))
+    return digest.hexdigest()
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 

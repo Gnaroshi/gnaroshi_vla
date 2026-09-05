@@ -23,7 +23,12 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.generation_obj
 from methods.latentloop.modules.native_simvla_v0 import NativeV0ObservationPair
 from methods.latentloop.modules.simvla_generation_loop import SimVLAGenerationLoop
 
+from .artifact_validation import (
+    validate_real_baseline_checkpoint,
+    validate_real_training_sources,
+)
 from .condition_cache import RealConditionCacheDataset
+from .dataset import align_current_rotvec_proprio
 from .distributed import initialize_distributed, seed_process
 from .io_utils import atomic_write_json, sha256_file, stable_int_seed
 from .model_io import load_exact_official_model
@@ -31,7 +36,6 @@ from .updater_data import RealConditionPairDataset
 from .updater_io import (
     RealConditionConfig,
     RealGenerationConfig,
-    load_real_updater,
     save_real_updater,
 )
 
@@ -66,6 +70,7 @@ def _condition_raw_losses(
     target = batch["current_condition"].to(device, non_blocking=True)
     previous_q = batch["previous_proprio"].to(device, non_blocking=True)
     current_q = batch["current_proprio"].to(device, non_blocking=True)
+    updater_current_q = align_current_rotvec_proprio(previous_q, current_q)
     previous_images = batch["previous_images"].to(device, non_blocking=True)
     current_images = batch["current_images"].to(device, non_blocking=True)
     valid, groups = _layout(cache_manifest, previous.shape[0], device)
@@ -75,7 +80,7 @@ def _condition_raw_losses(
             previous_images=previous_images,
             current_images=current_images,
             previous_proprio=previous_q,
-            current_proprio=current_q,
+            current_proprio=updater_current_q,
         ),
         valid_mask=valid,
         group_ids=groups,
@@ -278,8 +283,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         output = Path(args.output).expanduser().resolve()
         output.mkdir(parents=True, exist_ok=True)
         (output / "checkpoints").mkdir(exist_ok=True)
-        cache_manifest = json.loads(
-            (Path(args.condition_cache) / "manifest.json").read_text(encoding="utf-8")
+        source_contract = validate_real_training_sources(
+            condition_cache=args.condition_cache,
+            checkpoint=args.checkpoint,
+            processor=args.processor,
+            norm_stats=args.norm_stats,
+            verify_cache_array_checksums=False,
+            condition_cache_attestation=args.condition_cache_attestation,
+        )
+        cache_manifest = source_contract["condition_cache"]
+        validate_real_baseline_checkpoint(
+            args.baseline_action_checkpoint,
+            source=source_contract,
+            expected_optimizer_step=3000,
         )
         model, _, loading = load_exact_official_model(
             model_directory=args.checkpoint,
@@ -289,6 +305,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             real_action_checkpoint=args.baseline_action_checkpoint,
             freeze_vlm=True,
             freeze_action_transformer=True,
+            expected_dataset_identity_sha256=cache_manifest[
+                "dataset_identity_sha256"
+            ],
+            expected_cache_identity_sha256=cache_manifest[
+                "condition_cache_identity_sha256"
+            ],
+            expected_cache_attestation_identity_sha256=source_contract[
+                "condition_cache_attestation"
+            ]["attestation_identity_sha256"],
+            expected_real_action_optimizer_step=3000,
         )
         transformer = model.transformer.to(context.device).eval()
         action_space = model.action_space.to(context.device)
@@ -336,72 +362,51 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
         atomic_write_json(output / "exact_teacher_initialization.json", loading)
 
-        start_step = 0
-        resume = output / "resume.pt"
-        if args.resume:
-            updater, payload = load_real_updater(
-                resume,
-                kind=args.kind,
-                device=context.device,
-                expected_baseline_sha256=sha256_file(args.baseline_action_checkpoint),
+        if args.kind == "condition":
+            calibration = _calibrate_condition(
+                updater,
+                transformer.vlm_proj,
+                train_loader,
+                cache_manifest,
+                context.device,
+                args.calibration_batches,
             )
-            optimizer = torch.optim.AdamW(
-                updater.parameters(),
-                lr=args.learning_rate,
-                betas=(0.9, 0.95),
-                weight_decay=args.weight_decay,
-                fused=context.device.type == "cuda",
-            )
-            optimizer.load_state_dict(payload["optimizer_state_dict"])
-            start_step = int(payload["optimizer_step"])
-            objective = dict(payload["objective"])
-            weights = dict(objective["loss_weights"])
-        else:
-            if args.kind == "condition":
-                calibration = _calibrate_condition(
-                    updater,
-                    transformer.vlm_proj,
-                    train_loader,
-                    cache_manifest,
-                    context.device,
-                    args.calibration_batches,
-                )
-                # The two training terms receive equal contribution after
-                # deterministic calibration. Cosine distance is diagnostic only.
-                weights = {
-                    "condition_normalized_mse": 0.5
-                    / calibration["condition_normalized_mse"],
-                    "action_projection_normalized_mse": 0.5
-                    / calibration["action_projection_normalized_mse"],
-                }
-            else:
-                calibration = _calibrate_generation(
-                    updater,
-                    transformer,
-                    action_space,
-                    train_loader,
-                    cache_manifest,
-                    context.device,
-                    args.calibration_batches,
-                )
-                weights = {
-                    name: (1.0 / 3.0) / value
-                    for name, value in calibration.items()
-                }
-            objective = {
-                "calibration_raw_mean": calibration,
-                "loss_weights": weights,
-                "weight_rule": "equal contribution after deterministic raw-loss calibration",
-                "manual_weight_approval_required": False,
+            # The two training terms receive equal contribution after
+            # deterministic calibration. Cosine distance is diagnostic only.
+            weights = {
+                "condition_normalized_mse": 0.5
+                / calibration["condition_normalized_mse"],
+                "action_projection_normalized_mse": 0.5
+                / calibration["action_projection_normalized_mse"],
             }
+        else:
+            calibration = _calibrate_generation(
+                updater,
+                transformer,
+                action_space,
+                train_loader,
+                cache_manifest,
+                context.device,
+                args.calibration_batches,
+            )
+            weights = {
+                name: (1.0 / 3.0) / value
+                for name, value in calibration.items()
+            }
+        objective = {
+            "calibration_raw_mean": calibration,
+            "loss_weights": weights,
+            "weight_rule": "equal contribution after deterministic raw-loss calibration",
+            "manual_weight_approval_required": False,
+        }
         atomic_write_json(output / "objective.json", objective)
 
         iterator = iter(train_loader)
-        progress = tqdm(total=args.max_steps, initial=start_step, desc=f"real {args.kind} updater")
+        progress = tqdm(total=args.max_steps, initial=0, desc=f"real {args.kind} updater")
         metrics_path = output / "train_metrics.jsonl"
         last_validation: dict[str, float] = {}
         started = time.perf_counter()
-        step = start_step
+        step = 0
         while step < args.max_steps:
             try:
                 batch = next(iterator)
@@ -475,12 +480,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     "condition_cache_identity_sha256": cache_manifest[
                         "condition_cache_identity_sha256"
                     ],
+                    "condition_cache_attestation_identity_sha256": source_contract[
+                        "condition_cache_attestation"
+                    ]["attestation_identity_sha256"],
                     "optimizer_step": step,
                     "objective": objective,
                     "validation": last_validation,
                 }
                 save_real_updater(checkpoint, **shared)
-                save_real_updater(resume, optimizer_state=optimizer.state_dict(), **shared)
                 (output / "latest_checkpoint.txt").write_text(str(checkpoint) + "\n", encoding="utf-8")
                 old = sorted((output / "checkpoints").glob(f"{args.kind}_step_*.pt"))
                 for stale in old[: max(0, len(old) - args.keep_checkpoints)]:
@@ -519,6 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("kind", choices=("condition", "generation"))
     parser.add_argument("--condition-cache", required=True)
+    parser.add_argument("--condition-cache-attestation", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--processor", required=True)
     parser.add_argument("--norm-stats", required=True)
@@ -538,7 +546,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-checkpoints", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260904)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--resume", action="store_true")
     return parser
 
 

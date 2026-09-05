@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .contracts import sha256_file
+from .contracts import runtime_source_identity, sha256_file
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -43,10 +43,14 @@ def verify_source_snapshots() -> dict[str, Any]:
                 f"{copied_relative} != {reference_relative}"
             )
 
+    runtime_identity = runtime_source_identity()
     return {
         "verdict": "SOURCE_PREFLIGHT_PASS",
         "manifest": str(MANIFEST),
         "verified_files": len(observed),
         "byte_identical_pairs": len(payload["byte_identical_reference_pairs"]),
         "sha256": observed,
+        "runtime_source_identity_sha256": runtime_identity["combined_sha256"],
+        "runtime_source_file_count": runtime_identity["file_count"],
+        "runtime_source_sha256": runtime_identity["files"],
     }

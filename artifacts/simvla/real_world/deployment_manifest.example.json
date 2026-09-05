@@ -1,7 +1,8 @@
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "deployment_id": "replace-with-reviewed-deployment-id",
   "simvla_upstream_commit": "32700d0ad8991996e123e4b685abe370ce6e9aab",
+  "runtime_source_identity_sha256": "e716707ee8b4c7cc1e7059364a235607c8f890110992694a3b4c5eaef82c4497",
   "artifacts": {
     "official_base_model_directory": {
       "path": "./official_base_model",
@@ -19,6 +20,18 @@
       "path": "./norm_stats/real_norm.json",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     },
+    "dataset_manifest": {
+      "path": "./provenance/dataset_manifest.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "condition_cache_manifest": {
+      "path": "./provenance/condition_cache_manifest.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "condition_cache_attestation": {
+      "path": "./provenance/condition_cache_attestation.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
     "real_action_transformer": {
       "path": "./real_action_transformer.pt",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
@@ -30,13 +43,25 @@
     "generation_updater": {
       "path": "./updaters/generation_updater.pt",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "coupled_generation_updater": {
+      "path": "./updaters/coupled_generation_updater.pt",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     }
   },
   "pairing": {
     "official_base_model_identity": "replace-with-official-model-sha256",
     "real_baseline_identity": "replace-with-real-action-checkpoint-sha256",
+    "norm_stats_identity": "replace-with-norm-stats-sha256",
+    "dataset_identity": "replace-with-dataset-identity-sha256",
+    "condition_cache_identity": "replace-with-condition-cache-identity-sha256",
+    "condition_cache_attestation_identity": "replace-with-condition-cache-attestation-identity-sha256",
     "condition_source_real_baseline_identity": "replace-with-real-action-checkpoint-sha256",
-    "generation_source_real_baseline_identity": "replace-with-real-action-checkpoint-sha256"
+    "generation_source_real_baseline_identity": "replace-with-real-action-checkpoint-sha256",
+    "coupled_source_real_baseline_identity": "replace-with-real-action-checkpoint-sha256",
+    "coupled_parent_generation_identity": "replace-with-generation-updater-sha256",
+    "coupled_condition_updater_identity": "replace-with-condition-updater-sha256",
+    "coupled_generation_identity": "replace-with-coupled-generation-updater-sha256"
   },
   "policy": {
     "action_mode": "libero_joint",
@@ -53,20 +78,26 @@
     "condition_refresh_interval": 2,
     "generation_full_evaluations": 3,
     "control_protocol": "fresh_h10_execute_r5",
-    "generation_condition_coupling": "uncoupled_zero_code",
+    "generation_condition_coupling": "condition_delta_code",
     "deterministic_action_noise": true
   },
   "state": {
     "encoding": "opposed_finger_positions",
     "tcp_orientation": "axis_angle_radians",
     "gripper_max_opening_m": 0.04,
-    "preflight_vector": [0.4, 0.0, 0.3, 3.14, 0.0, 0.0, 0.04, -0.04]
+    "preflight_robot_state": {
+      "pose6d_euler_xyz": [0.4, 0.0, 0.3, 3.14, 0.0, 0.0],
+      "tcp_rotvec": [3.14, 0.0, 0.0],
+      "gripper_open_state": 1.0,
+      "gripper_position_normalized": 0.0
+    }
   },
   "action": {
     "representation": "normalized_delta_pose",
     "translation_scale_m": 0.02,
     "rotation_scale_rad": 0.05,
     "clip_abs": 1.0,
+    "gripper_representation": "continuous_normalized_position",
     "model_positive_gripper_means": "open"
   },
   "hardware": {
@@ -74,10 +105,12 @@
       "type": "ur5e_robotiq_2f85",
       "ip": "replace-with-robot-ip",
       "home_pose": [3.14, -1.57, 1.57, -1.57, -1.57, -1.57, 0.0],
+      "home_pose_source": "replace-with-reviewed-task-home-pose-source",
       "workspace_m": {
         "min": [0.2, -0.6, 0.05],
         "max": [0.8, 0.6, 0.8]
       },
+      "workspace_source": "replace-with-reviewed-task-workspace-source",
       "control": {
         "home_move_duration_s": 3.0,
         "home_move_hz": 60,
@@ -85,14 +118,22 @@
         "velocity": 0.5,
         "servoj_time_s": 0.002,
         "servoj_lookahead_s": 0.2,
-        "servoj_gain": 100
+        "servoj_gain": 100,
+        "tracking_error_guard": {
+          "enabled": false,
+          "max_translation_error_m": null,
+          "max_rotation_error_rad": null
+        }
       },
       "gripper": {
+        "command_mode": "continuous_position_with_crossing_lock",
         "open_position_threshold": 0.1,
         "speed": 255,
         "force": 10,
         "min_command_delta": 3,
-        "min_command_period_s": 0.05
+        "min_command_period_s": 0.05,
+        "startup_force_open_steps": 50,
+        "status_lock_steps": 10
       }
     },
     "cameras": {
@@ -101,12 +142,12 @@
       "wrist": {"serial": "replace-with-wrist-camera-serial"},
       "width": 640,
       "height": 480,
-      "fps": 60
+      "fps": 30
     }
   },
   "runtime": {
     "control_frequency_hz": 15,
-    "max_steps": 5000,
+    "max_steps": 700,
     "warmup_steps": 3,
     "num_rollouts_per_instruction": 15,
     "seed": 42,
@@ -119,6 +160,16 @@
     "live_authorized": false,
     "model_preflight_passed": false,
     "read_only_profile_passed": false,
+    "hardware_configuration_reviewed": false,
+    "camera_role_mapping_verified": false,
+    "task_home_pose_verified": false,
+    "workspace_bounds_verified": false,
+    "control_limits_reviewed": false,
+    "gripper_startup_behavior_reviewed": false,
+    "gripper_no_software_stop_acknowledged": false,
+    "physical_emergency_stop_verified": false,
+    "runtime_timing_reviewed": false,
+    "baseline_bounded_canary_passed": false,
     "approved_by": "",
     "approved_at": ""
   }

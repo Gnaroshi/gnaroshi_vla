@@ -133,6 +133,117 @@ def _distribution(values: list[float]) -> dict[str, float | int]:
     }
 
 
+def _validate_robot_state(
+    state: dict[str, np.ndarray], *, workspace_min: np.ndarray, workspace_max: np.ndarray
+) -> None:
+    expected = {
+        "pose6d": (6,),
+        "tcp_rotvec": (3,),
+        "gripper_open_state": (1,),
+        "gripper_position": (1,),
+        "joint_positions": (6,),
+    }
+    for key, shape in expected.items():
+        value = np.asarray(state.get(key))
+        if value.shape != shape or not np.isfinite(value).all():
+            raise RuntimeError(f"read-only robot state {key} must be finite {shape}")
+    position = np.asarray(state["pose6d"], dtype=np.float64)[:3]
+    if np.any(position < workspace_min) or np.any(position > workspace_max):
+        raise RuntimeError(
+            "read-only actual TCP is outside the reviewed workspace: "
+            f"xyz={position.tolist()}"
+        )
+    gripper_position = float(np.asarray(state["gripper_position"])[0])
+    if not 0.0 <= gripper_position <= 1.0:
+        raise RuntimeError("read-only gripper position must be normalized to [0,1]")
+
+
+def _validate_camera_sample(
+    *,
+    role: str,
+    image: np.ndarray,
+    metadata: dict[str, Any] | None,
+    expected_serial: str,
+    expected_width: int,
+    expected_height: int,
+    expected_fps: int,
+    previous: dict[str, Any] | None,
+) -> dict[str, Any]:
+    value = np.asarray(image)
+    if value.shape != (expected_height, expected_width, 3) or value.dtype != np.uint8:
+        raise RuntimeError(
+            f"{role} camera must produce uint8 RGB "
+            f"{(expected_height, expected_width, 3)}, got {value.shape}/{value.dtype}"
+        )
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"{role} camera did not expose frame metadata")
+    expected = {
+        "serial": expected_serial,
+        "width": expected_width,
+        "height": expected_height,
+        "fps": expected_fps,
+    }
+    mismatches = {
+        key: {"observed": metadata.get(key), "expected": expected_value}
+        for key, expected_value in expected.items()
+        if metadata.get(key) != expected_value
+    }
+    if "rgb8" not in str(metadata.get("format", "")).lower():
+        mismatches["format"] = {
+            "observed": metadata.get("format"),
+            "expected": "rgb8",
+        }
+    if mismatches:
+        raise RuntimeError(f"{role} camera profile mismatch: {mismatches}")
+    frame_number = int(metadata["frame_number"])
+    sensor_timestamp = float(metadata["sensor_timestamp_ms"])
+    host_timestamp = float(metadata["host_capture_monotonic_s"])
+    if not all(np.isfinite(value) for value in (sensor_timestamp, host_timestamp)):
+        raise RuntimeError(f"{role} camera timestamps must be finite")
+    if previous is not None:
+        if frame_number <= int(previous["frame_number"]):
+            raise RuntimeError(f"{role} camera frame number did not increase")
+        if sensor_timestamp <= float(previous["sensor_timestamp_ms"]):
+            raise RuntimeError(f"{role} camera sensor timestamp did not increase")
+        if host_timestamp <= float(previous["host_capture_monotonic_s"]):
+            raise RuntimeError(f"{role} camera host timestamp did not increase")
+    return dict(metadata)
+
+
+def _expected_policy_counters(method: str, steps: int) -> dict[str, int]:
+    queries = (int(steps) + 4) // 5
+    expected = {
+        "num_policy_queries": queries,
+        "num_action_queue_steps": int(steps),
+    }
+    if method == "baseline":
+        expected.update(
+            {
+                "num_full_vlm_calls": queries,
+                "num_condition_updater_calls": 0,
+                "num_action_transformer_calls": queries * 10,
+            }
+        )
+    elif method == "condition_loop":
+        expected.update(
+            {
+                "num_full_vlm_calls": (queries + 1) // 2,
+                "num_condition_updater_calls": queries // 2,
+                "num_action_transformer_calls": queries * 10,
+            }
+        )
+    elif method == "latentloop":
+        expected.update(
+            {
+                "num_full_vlm_calls": (queries + 1) // 2,
+                "num_condition_updater_calls": queries // 2,
+                "num_condition_change_code_queries": queries // 2,
+                "num_action_transformer_calls": queries * 3,
+            }
+        )
+    return expected
+
+
 def run_read_only_profile(
     *, controller, env: ReadOnlyDeployEnvironment, output: str | Path, steps: int
 ) -> dict[str, Any]:
@@ -140,15 +251,84 @@ def run_read_only_profile(
     output_dir.mkdir(parents=True, exist_ok=False)
     controller.attach_session_dir(output_dir)
     instruction = str(controller.contract.runtime["instructions"][0])
+    cameras = controller.contract.hardware["cameras"]
+    workspace = controller.contract.hardware["robot"]["workspace_m"]
+    workspace_min = np.asarray(workspace["min"], dtype=np.float64)
+    workspace_max = np.asarray(workspace["max"], dtype=np.float64)
+    expected_width = int(cameras["width"])
+    expected_height = int(cameras["height"])
+    expected_fps = int(cameras["fps"])
+    previous_camera: dict[str, dict[str, Any] | None] = {
+        "exterior": None,
+        "wrist": None,
+    }
+    warmup_steps = int(controller.contract.runtime["warmup_steps"])
+
+    for warmup in range(warmup_steps):
+        robot_state = env.get_robot_state()
+        _validate_robot_state(
+            robot_state, workspace_min=workspace_min, workspace_max=workspace_max
+        )
+        images = env.get_color_images()
+        for role, image, camera in (
+            ("exterior", images[0], env.exterior_camera),
+            ("wrist", images[1], env.wrist_camera),
+        ):
+            previous_camera[role] = _validate_camera_sample(
+                role=role,
+                image=image,
+                metadata=camera.last_read_metadata,
+                expected_serial=str(cameras[role]["serial"]),
+                expected_width=expected_width,
+                expected_height=expected_height,
+                expected_fps=expected_fps,
+                previous=previous_camera[role],
+            )
+        controller.forward(
+            {
+                "robot_state": robot_state,
+                "color_image": images,
+                "language_instruction": instruction,
+            },
+            include_info=True,
+            timestep=warmup,
+            record_step=False,
+        )
+    controller.reset()
+
     rows = []
+    tick_starts: list[float] = []
+    control_period_s = 1.0 / float(
+        controller.contract.runtime["control_frequency_hz"]
+    )
     for step in range(int(steps)):
         started = time.perf_counter()
+        tick_starts.append(started)
         state_started = time.perf_counter()
         robot_state = env.get_robot_state()
+        _validate_robot_state(
+            robot_state, workspace_min=workspace_min, workspace_max=workspace_max
+        )
         state_ms = (time.perf_counter() - state_started) * 1000.0
         camera_started = time.perf_counter()
         images = env.get_color_images()
         camera_ms = (time.perf_counter() - camera_started) * 1000.0
+        camera_metadata: dict[str, dict[str, Any]] = {}
+        for role, image, camera in (
+            ("exterior", images[0], env.exterior_camera),
+            ("wrist", images[1], env.wrist_camera),
+        ):
+            camera_metadata[role] = _validate_camera_sample(
+                role=role,
+                image=image,
+                metadata=camera.last_read_metadata,
+                expected_serial=str(cameras[role]["serial"]),
+                expected_width=expected_width,
+                expected_height=expected_height,
+                expected_fps=expected_fps,
+                previous=previous_camera[role],
+            )
+            previous_camera[role] = camera_metadata[role]
         policy_started = time.perf_counter()
         _, _, _, info = controller.forward(
             {
@@ -159,27 +339,73 @@ def run_read_only_profile(
             include_info=True,
             timestep=step,
         )
+        policy_ms = (time.perf_counter() - policy_started) * 1000.0
+        compute_ms = (time.perf_counter() - started) * 1000.0
         rows.append(
             {
                 **info["record"],
                 "state_read_ms": state_ms,
                 "camera_pair_read_ms": camera_ms,
-                "policy_call_ms": (time.perf_counter() - policy_started) * 1000.0,
-                "tick_compute_ms": (time.perf_counter() - started) * 1000.0,
+                "policy_call_ms": policy_ms,
+                "tick_compute_ms": compute_ms,
+                "nominal_deadline_missed": compute_ms > control_period_s * 1000.0,
                 "robot_command_issued": False,
-                "exterior_camera": env.exterior_camera.last_read_metadata,
-                "wrist_camera": env.wrist_camera.last_read_metadata,
+                "actual_tcp_rotvec": np.concatenate(
+                    (
+                        np.asarray(robot_state["pose6d"], dtype=np.float64)[:3],
+                        np.asarray(robot_state["tcp_rotvec"], dtype=np.float64),
+                    )
+                ).tolist(),
+                "camera_host_capture_skew_ms": abs(
+                    camera_metadata["exterior"]["host_capture_monotonic_s"]
+                    - camera_metadata["wrist"]["host_capture_monotonic_s"]
+                )
+                * 1000.0,
+                "exterior_camera": camera_metadata["exterior"],
+                "wrist_camera": camera_metadata["wrist"],
             }
         )
+        sleep_left = control_period_s - (time.perf_counter() - started)
+        if sleep_left > 0:
+            time.sleep(sleep_left)
     controller.write_runtime_summary()
     with (output_dir / "read_only_steps.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
-    fields = ("state_read_ms", "camera_pair_read_ms", "policy_call_ms", "tick_compute_ms")
+    fields = (
+        "state_read_ms",
+        "camera_pair_read_ms",
+        "policy_call_ms",
+        "tick_compute_ms",
+        "camera_host_capture_skew_ms",
+    )
+    counters = dict(controller.policy.metrics.counters)
+    expected_counters = _expected_policy_counters(
+        controller.deployment_method, len(rows)
+    )
+    counter_mismatches = {
+        key: {"observed": int(counters.get(key, 0)), "expected": expected}
+        for key, expected in expected_counters.items()
+        if int(counters.get(key, 0)) != expected
+    }
+    if counter_mismatches:
+        raise RuntimeError(f"read-only policy schedule drift: {counter_mismatches}")
+    tick_intervals_ms = np.diff(np.asarray(tick_starts, dtype=np.float64)) * 1000.0
+    deadline_misses = sum(bool(row["nominal_deadline_missed"]) for row in rows)
     summary = {
-        "verdict": "READ_ONLY_PROFILE_COMPLETE",
+        "verdict": "READ_ONLY_PROFILE_PASS",
         "robot_command_issued": False,
+        "hardware_contract_validated": True,
+        "policy_schedule_validated": True,
+        "nominal_timing_is_measurement_not_authorization": True,
+        "warmup_steps": warmup_steps,
         "steps": len(rows),
+        "expected_policy_counters": expected_counters,
+        "observed_policy_counters": counters,
+        "nominal_control_period_ms": control_period_s * 1000.0,
+        "nominal_deadline_misses": deadline_misses,
+        "nominal_deadline_miss_fraction": deadline_misses / max(len(rows), 1),
+        "tick_interval_ms": _distribution(tick_intervals_ms.tolist()),
         "latency_ms": {
             field: _distribution([float(row[field]) for row in rows]) for field in fields
         },

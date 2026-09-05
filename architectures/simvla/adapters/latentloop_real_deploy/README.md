@@ -17,8 +17,17 @@ transform as the real condition cache and action-head training path.
 The real baseline starts from every tensor in the released SimVLA-LIBERO
 checkpoint, freezes its VLM, and fine-tunes the existing action transformer;
 there is no scratch or reinitialized-head ablation. LatentLoop updaters must be
-trained from that exact real baseline. The deployment loader verifies all three
-SHA-256 identities before constructing either policy.
+trained from that exact real baseline. The deployment loader verifies the real
+baseline, condition updater, parent generation updater, and projection-only
+coupled generation checkpoint, together with data/cache/normalization lineage,
+before constructing either policy. The `latentloop` method requires coupling;
+an uncoupled checkpoint cannot be silently substituted.
+
+This package proves source/artifact consistency and enforces reviewed command
+limits. It does not prove real-task success. The frozen-VLM, 3,000-step real
+action-head adaptation is a controlled low-data transfer protocol for the 40
+available demonstrations, not a published SimVLA real-world recipe. A bounded
+baseline canary must pass before LatentLoop can be authorized.
 
 ## Staged commands
 
@@ -45,35 +54,9 @@ Live mode intentionally requires three independent approvals:
 
 The wrapper defaults to `source-preflight`; it never defaults to live mode.
 
-## VLA-Cache comparison
-
-The same manifest also supports the training-free `vla_cache` baseline. It
-performs actual SmolVLM decoder token pruning and fixed-position K/V reuse; it
-does not blend old and new condition outputs. The `condition_loop` mode runs
-our Condition Loop at `K_C=2` while restoring all ten action-network
-evaluations (`N_G=10`), so it is the direct backbone-side comparator. Use
-`vla_cache_full` as VLA-Cache's same-backend no-reuse control:
-
-```bash
-bash architectures/simvla/wrappers/deploy_latentloop_real.sh \
-  artifact-preflight --manifest /path/to/deployment_manifest.local.json \
-  --method condition_loop
-
-bash architectures/simvla/wrappers/deploy_latentloop_real.sh \
-  artifact-preflight --manifest /path/to/deployment_manifest.local.json \
-  --method vla_cache_full
-
-bash architectures/simvla/wrappers/deploy_latentloop_real.sh \
-  artifact-preflight --manifest /path/to/deployment_manifest.local.json \
-  --method vla_cache
-```
-
-Both retain full ten-step flow generation and the same fresh-H10/execute-R5
-control protocol as the standard baseline. See
-`architectures/simvla/adapters/vla_cache/README.md` for the pinned official
-source and the required 256-token to 36-token architecture mapping.
-
-Report `baseline` versus `latentloop` for the complete system and
-`condition_loop` versus `vla_cache` for the backbone-side comparison.
-`vla_cache_full` isolates the effect of VLA-Cache reuse from the eager
-attention backend it requires.
+The operator-facing Stop/Retry actions raise the abort latch immediately and
+stop the UR arm at the current RTDE command boundary. A command already inside
+the RTDE call may finish before the software stop takes effect. The rollout is
+discarded without an automatic home move. The copied Robotiq API has no stop
+primitive, so the software can only stop issuing new gripper commands; the
+physical emergency-stop path remains mandatory.

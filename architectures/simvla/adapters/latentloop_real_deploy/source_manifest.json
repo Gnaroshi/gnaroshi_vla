@@ -14,11 +14,5 @@
     "architectures/simvla/third_party/simvla_upstream_32700d0/models/processing_smolvlm_vla.py": "6957b4e618fe2334ebb56e73f37b551d992a69af31c4ce99ecb602fa15c8adc9",
     "architectures/simvla/third_party/simvla_upstream_32700d0/models/transformer_smolvlm.py": "f5606db5ac74d2f77eeac663043a40a03fa2a77e756b5b688b45866b914c099f"
   },
-  "byte_identical_reference_pairs": {
-    "architectures/simvla/third_party/3dflow_real_deploy/deploy.py": "architectures/seer/third_party/3dflow_real_deploy/deploy.py",
-    "architectures/simvla/third_party/3dflow_real_deploy/deploy_gui.py": "architectures/seer/third_party/3dflow_real_deploy/deploy_gui.py",
-    "architectures/simvla/third_party/3dflow_real_deploy/real_controller/controller.py": "architectures/seer/third_party/3dflow_real_deploy/real_controller/controller.py",
-    "architectures/simvla/third_party/3dflow_real_deploy/real_controller/robotiq_gripper.py": "architectures/seer/third_party/3dflow_real_deploy/real_controller/robotiq_gripper.py",
-    "architectures/simvla/third_party/3dflow_real_deploy/scripts/REAL/deploy_gui.sh": "architectures/seer/third_party/3dflow_real_deploy/scripts/REAL/deploy_gui.sh"
-  }
+  "byte_identical_reference_pairs": {}
 }

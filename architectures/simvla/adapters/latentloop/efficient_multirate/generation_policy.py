@@ -76,12 +76,38 @@ class RealSimVLAGenerationPolicy(RealSimVLADCLDPolicy):
         *,
         policy_query_index: int,
     ) -> tuple[torch.Tensor, int | None]:
+        return self._decode_with_condition_code(
+            condition,
+            proprio,
+            policy_query_index=policy_query_index,
+            condition_change_code=condition.new_zeros(
+                (condition.shape[0], self.generation_loop.updater.condition_code_dim)
+            ),
+        )
+
+    def _decode_with_condition_code(
+        self,
+        condition: torch.Tensor,
+        proprio: torch.Tensor,
+        *,
+        policy_query_index: int,
+        condition_change_code: torch.Tensor,
+    ) -> tuple[torch.Tensor, int | None]:
         initial_noise, seed = self._paired_initial_noise(
             condition, proprio, policy_query_index
         )
         if initial_noise is None:
             raise RuntimeError("Generation evaluation requires explicit paired noise")
         normalized_proprio = self.action_adapter.normalize_proprio(proprio)
+        expected_code_shape = (
+            condition.shape[0],
+            self.generation_loop.updater.condition_code_dim,
+        )
+        if condition_change_code.shape != expected_code_shape:
+            raise ValueError(
+                f"condition_change_code must be {expected_code_shape}, "
+                f"got {tuple(condition_change_code.shape)}"
+            )
 
         def full_step(
             noisy_action: torch.Tensor, tau: torch.Tensor
@@ -106,9 +132,7 @@ class RealSimVLAGenerationPolicy(RealSimVLADCLDPolicy):
                 proprio=normalized_proprio,
                 condition=condition,
                 condition_valid_mask=None,
-                condition_change_code=condition.new_zeros(
-                    (condition.shape[0], self.generation_loop.updater.condition_code_dim)
-                ),
+                condition_change_code=condition_change_code,
             )
             action = self.action_adapter.action_space.postprocess(
                 trace.final_noisy_action

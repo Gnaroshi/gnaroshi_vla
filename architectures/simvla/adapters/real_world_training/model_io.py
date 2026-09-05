@@ -16,7 +16,10 @@ from architectures.simvla.adapters.latentloop_real_deploy.bootstrap import (
 from .io_utils import sha256_file
 
 
-REAL_ACTION_CHECKPOINT_FORMAT = "simvla_real_action_transformer_v1"
+REAL_ACTION_CHECKPOINT_FORMAT = "simvla_real_action_transformer_v2"
+OFFICIAL_SIMVLA_LIBERO_WEIGHTS_SHA256 = (
+    "9d3b1767773da86906d771b1eca2c2911087371bf8b3890a7336b6773270f6be"
+)
 
 
 @dataclass(frozen=True)
@@ -57,20 +60,54 @@ def official_base_identity(
     model_root = Path(model_directory).expanduser().resolve()
     processor_root = Path(processor_directory).expanduser().resolve()
     config = SmolVLMVLAConfig.from_pretrained(str(model_root), local_files_only=True)
-    return OfficialBaseIdentity(
+    weights_sha256 = sha256_file(_weights_path(model_root))
+    if weights_sha256 != OFFICIAL_SIMVLA_LIBERO_WEIGHTS_SHA256:
+        raise ValueError(
+            "real adaptation requires the pinned YuankaiLuo/SimVLA-LIBERO weights: "
+            f"observed={weights_sha256} "
+            f"expected={OFFICIAL_SIMVLA_LIBERO_WEIGHTS_SHA256}"
+        )
+    identity = OfficialBaseIdentity(
         model_directory=str(model_root),
-        model_weights_sha256=sha256_file(_weights_path(model_root)),
+        model_weights_sha256=weights_sha256,
         processor_directory=str(processor_root),
         action_mode=str(config.action_mode),
         action_horizon=int(config.num_actions),
         transformer_hidden_size=int(config.hidden_size),
         transformer_depth=int(config.depth),
     )
+    expected = {
+        "action_mode": "libero_joint",
+        "action_horizon": 10,
+        "transformer_hidden_size": 1024,
+        "transformer_depth": 24,
+    }
+    observed = {
+        key: getattr(identity, key)
+        for key in expected
+    }
+    if observed != expected:
+        raise ValueError(
+            f"pinned SimVLA-LIBERO architecture contract changed: {observed} != {expected}"
+        )
+    return identity
 
 
 def _nonempty_loading_info(info: Mapping[str, Any]) -> dict[str, Any]:
     keys = ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
     return {key: list(info.get(key) or ()) for key in keys if info.get(key)}
+
+
+def _load_local_processor(processor_directory: str | Path) -> Any:
+    configure_model_imports()
+    from models.processing_smolvlm_vla import SmolVLMVLAProcessor
+
+    root = Path(processor_directory).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"local processor snapshot was not found: {root}")
+    # The upstream factory catches errors and substitutes a Hub model. The
+    # constructor preserves preprocessing but propagates local-load failures.
+    return SmolVLMVLAProcessor(smolvlm_model_path=str(root))
 
 
 def load_exact_official_model(
@@ -82,6 +119,10 @@ def load_exact_official_model(
     real_action_checkpoint: str | Path | None = None,
     freeze_vlm: bool = True,
     freeze_action_transformer: bool = False,
+    expected_dataset_identity_sha256: str | None = None,
+    expected_cache_identity_sha256: str | None = None,
+    expected_cache_attestation_identity_sha256: str | None = None,
+    expected_real_action_optimizer_step: int | None = None,
 ) -> tuple[Any, Any, dict[str, Any]]:
     """Load every released SimVLA tensor, then optionally overlay only its head.
 
@@ -93,7 +134,6 @@ def load_exact_official_model(
     configure_model_imports()
     from models.configuration_smolvlm_vla import SmolVLMVLAConfig
     from models.modeling_smolvlm_vla import SmolVLMVLA
-    from models.processing_smolvlm_vla import SmolVLMVLAProcessor
 
     model_root = Path(model_directory).expanduser().resolve()
     processor_root = Path(processor_directory).expanduser().resolve()
@@ -122,6 +162,12 @@ def load_exact_official_model(
             real_action_checkpoint,
             expected_base_sha256=base.model_weights_sha256,
             expected_norm_sha256=sha256_file(norm_stats),
+            expected_dataset_identity_sha256=expected_dataset_identity_sha256,
+            expected_cache_identity_sha256=expected_cache_identity_sha256,
+            expected_cache_attestation_identity_sha256=(
+                expected_cache_attestation_identity_sha256
+            ),
+            expected_optimizer_step=expected_real_action_optimizer_step,
         )
     for parameter in model.vlm.parameters():
         parameter.requires_grad_(not freeze_vlm)
@@ -130,7 +176,7 @@ def load_exact_official_model(
     model.vlm.eval() if freeze_vlm else model.vlm.train()
     model.transformer.eval() if freeze_action_transformer else model.transformer.train()
     model.to(device)
-    processor = SmolVLMVLAProcessor.from_pretrained(str(processor_root))
+    processor = _load_local_processor(processor_root)
     report = {
         "verdict": "EXACT_OFFICIAL_INITIALIZATION_PASS",
         "base": base.to_dict(),
@@ -196,7 +242,7 @@ def save_real_action_checkpoint(
 
 
 def load_real_action_payload(path: str | Path) -> dict[str, Any]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("checkpoint_format") != REAL_ACTION_CHECKPOINT_FORMAT:
         raise ValueError(
             f"unsupported real action checkpoint: {payload.get('checkpoint_format')!r}"
@@ -212,6 +258,10 @@ def apply_real_action_checkpoint(
     *,
     expected_base_sha256: str,
     expected_norm_sha256: str,
+    expected_dataset_identity_sha256: str | None = None,
+    expected_cache_identity_sha256: str | None = None,
+    expected_cache_attestation_identity_sha256: str | None = None,
+    expected_optimizer_step: int | None = None,
 ) -> dict[str, Any]:
     payload = load_real_action_payload(path)
     observed_base = payload.get("official_base", {}).get("model_weights_sha256")
@@ -224,14 +274,52 @@ def apply_real_action_checkpoint(
         raise ValueError(
             f"real action checkpoint norm mismatch: {observed_norm} != {expected_norm_sha256}"
         )
+    observed_dataset = payload.get("dataset_identity_sha256")
+    if (
+        expected_dataset_identity_sha256 is not None
+        and observed_dataset != expected_dataset_identity_sha256
+    ):
+        raise ValueError(
+            "real action checkpoint dataset mismatch: "
+            f"{observed_dataset} != {expected_dataset_identity_sha256}"
+        )
+    observed_cache = payload.get("training_config", {}).get(
+        "condition_cache_identity_sha256"
+    )
+    if (
+        expected_cache_identity_sha256 is not None
+        and observed_cache != expected_cache_identity_sha256
+    ):
+        raise ValueError(
+            "real action checkpoint Condition cache mismatch: "
+            f"{observed_cache} != {expected_cache_identity_sha256}"
+        )
+    observed_attestation = payload.get("training_config", {}).get(
+        "condition_cache_attestation_identity_sha256"
+    )
+    if (
+        expected_cache_attestation_identity_sha256 is not None
+        and observed_attestation != expected_cache_attestation_identity_sha256
+    ):
+        raise ValueError(
+            "real action checkpoint Condition cache attestation mismatch: "
+            f"{observed_attestation} != {expected_cache_attestation_identity_sha256}"
+        )
+    observed_step = int(payload.get("optimizer_step", -1))
+    if expected_optimizer_step is not None and observed_step != int(
+        expected_optimizer_step
+    ):
+        raise ValueError(
+            "real action checkpoint optimizer step mismatch: "
+            f"{observed_step} != {expected_optimizer_step}"
+        )
     model.transformer.load_state_dict(
         payload["action_transformer_state_dict"], strict=True
     )
     return {
         "path": str(Path(path).expanduser().resolve()),
         "sha256": sha256_file(path),
-        "optimizer_step": int(payload["optimizer_step"]),
+        "optimizer_step": observed_step,
         "dataset_identity_sha256": str(payload["dataset_identity_sha256"]),
         "strict_state_dict_load": True,
     }
-

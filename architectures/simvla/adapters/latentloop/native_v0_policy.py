@@ -154,12 +154,7 @@ class RealSimVLANativeV0Policy(RealSimVLADCLDPolicy):
             raise RuntimeError("V0 token layout was not established at the full refresh")
         if age not in {1, 2, 3}:
             raise ValueError("native K4 V0 update age must be 1, 2, or 3")
-        pair = NativeV0ObservationPair(
-            previous_images=self.cached_raw_rgb,
-            current_images=batch["raw_rgb"],
-            previous_proprio=self.cached_proprio,
-            current_proprio=batch["proprio"],
-        )
+        pair = self._condition_observation_pair(batch)
         self._sync()
         started = time.perf_counter()
         with torch.no_grad():
@@ -186,6 +181,18 @@ class RealSimVLANativeV0Policy(RealSimVLADCLDPolicy):
         self.cached_proprio = batch["proprio"].detach()
         self.cached_action_chunk = action.detach()
         return update.condition, action, seed
+
+    def _condition_observation_pair(
+        self, batch: dict[str, torch.Tensor]
+    ) -> NativeV0ObservationPair:
+        if self.cached_raw_rgb is None or self.cached_proprio is None:
+            raise RuntimeError("V0 update requires the preceding query observation")
+        return NativeV0ObservationPair(
+            previous_images=self.cached_raw_rgb,
+            current_images=batch["raw_rgb"],
+            previous_proprio=self.cached_proprio,
+            current_proprio=batch["proprio"],
+        )
 
     def _refill_action_queue(self, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
         self.metrics.counters["num_policy_queries"] += 1

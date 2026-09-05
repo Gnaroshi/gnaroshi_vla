@@ -12,17 +12,18 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
+from .artifact_validation import (
+    validate_real_training_sources,
+)
 from .condition_cache import RealConditionCacheDataset
 from .distributed import initialize_distributed, seed_process
 from .io_utils import atomic_write_json
 from .model_io import (
     load_exact_official_model,
-    load_real_action_payload,
     official_base_identity,
     save_real_action_checkpoint,
 )
@@ -114,9 +115,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             (output / "checkpoints").mkdir(exist_ok=True)
         context.barrier()
 
-        cache_manifest = json.loads(
-            (Path(args.condition_cache) / "manifest.json").read_text(encoding="utf-8")
+        source_contract = validate_real_training_sources(
+            condition_cache=args.condition_cache,
+            checkpoint=args.checkpoint,
+            processor=args.processor,
+            norm_stats=args.norm_stats,
+            verify_cache_array_checksums=False,
+            condition_cache_attestation=args.condition_cache_attestation,
         )
+        cache_manifest = source_contract["condition_cache"]
         model, processor, loading = load_exact_official_model(
             model_directory=args.checkpoint,
             processor_directory=args.processor,
@@ -175,16 +182,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             weight_decay=args.weight_decay,
             fused=context.device.type == "cuda",
         )
-        start_step = 0
-        resume_path = output / "resume.pt"
-        if args.resume and resume_path.is_file():
-            payload = load_real_action_payload(resume_path)
-            transformer.load_state_dict(payload["action_transformer_state_dict"], strict=True)
-            optimizer.load_state_dict(payload["optimizer_state_dict"])
-            start_step = int(payload["optimizer_step"])
-        elif args.resume:
-            raise FileNotFoundError(f"--resume requested but {resume_path} is absent")
-
         effective_batch = (
             args.local_batch_size * context.world_size * args.gradient_accumulation_steps
         )
@@ -204,6 +201,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "condition_cache_identity_sha256": cache_manifest[
                 "condition_cache_identity_sha256"
             ],
+            "condition_cache_attestation_identity_sha256": source_contract[
+                "condition_cache_attestation"
+            ]["attestation_identity_sha256"],
             "action_transformer_trainable_parameters": trainable,
             "vlm_trainable_parameters": 0,
             "action_transformer_reinitialized": False,
@@ -217,14 +217,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         iterator = iter(train_loader)
         progress = tqdm(
             total=args.max_steps,
-            initial=start_step,
+            initial=0,
             disable=not context.primary,
             desc="real SimVLA action-head fine-tune",
         )
         history_path = output / "train_metrics.jsonl"
         last_validation: dict[str, Any] = {}
         started = time.perf_counter()
-        step = start_step
+        step = 0
         while step < args.max_steps:
             accumulated = 0.0
             for micro_step in range(args.gradient_accumulation_steps):
@@ -292,18 +292,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                         training_config=training_config,
                         validation=last_validation,
                     )
-                    save_real_action_checkpoint(
-                        resume_path,
-                        transformer=transformer,
-                        official_base=base,
-                        norm_stats_path=args.norm_stats,
-                        dataset_identity_sha256=cache_manifest["dataset_identity_sha256"],
-                        optimizer_step=step,
-                        training_config=training_config,
-                        validation=last_validation,
-                        optimizer_state=optimizer.state_dict(),
-                        scheduler_state={"step": step, "learning_rate": lr},
-                    )
                     (output / "latest_checkpoint.txt").write_text(str(checkpoint) + "\n", encoding="utf-8")
                     old = sorted((output / "checkpoints").glob("action_transformer_step_*.pt"))
                     for stale in old[: max(0, len(old) - args.keep_checkpoints)]:
@@ -342,6 +330,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--condition-cache", required=True)
+    parser.add_argument("--condition-cache-attestation", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--processor", required=True)
     parser.add_argument("--norm-stats", required=True)
@@ -360,7 +349,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-batches", type=int, default=32)
     parser.add_argument("--seed", type=int, default=20260904)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--resume", action="store_true")
     return parser
 
 
@@ -373,4 +361,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

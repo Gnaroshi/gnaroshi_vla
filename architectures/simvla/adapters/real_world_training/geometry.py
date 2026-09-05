@@ -53,7 +53,7 @@ def pose6d_to_matrix(value: np.ndarray) -> np.ndarray:
 def transition_to_normalized_action(
     current_pose6d: np.ndarray,
     next_pose6d: np.ndarray,
-    next_gripper_control: float,
+    command_t_gripper_control: float,
     scales: RealActionScales = RealActionScales(),
     *,
     clip: bool = True,
@@ -72,11 +72,14 @@ def transition_to_normalized_action(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         relative_euler = Rotation.from_matrix(relative[:3, :3]).as_euler("xyz")
+    gripper_control = float(command_t_gripper_control)
+    if not np.isfinite(gripper_control) or not 0.0 <= gripper_control <= 1.0:
+        raise ValueError("command_t gripper target must be normalized to [0,1]")
     raw = np.concatenate(
         (
             relative[:3, 3] / scales.translation_m,
             relative_euler / scales.rotation_rad,
-            np.asarray([1.0 if float(next_gripper_control) < 0.5 else -1.0]),
+            np.asarray([1.0 - 2.0 * gripper_control]),
         )
     ).astype(np.float32)
     if not np.isfinite(raw).all():
