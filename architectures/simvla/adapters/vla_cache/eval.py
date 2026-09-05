@@ -35,6 +35,8 @@ from architectures.simvla.wrappers.dcld_eval.rollout_runner import (
 from .policy import VLACacheSimVLAPolicy
 from .recipe import OFFICIAL_NORM_SHA256, evaluation_row, scientific_contract
 
+SUITE_MAX_ACTIONS = {"libero_10": 900, "libero_spatial": 800, "libero_object": 800, "libero_goal": 800}
+
 
 def _configure_paths() -> tuple[Path, Path, Path]:
     root = Path(__file__).resolve().parents[4]
@@ -132,13 +134,15 @@ def _load_manifest(path: Path, *, row: str, max_episodes: int | None) -> dict[st
     missing = sorted(required - set(data))
     if missing:
         raise ValueError(f"episode manifest is missing fields: {missing}")
+    suite = data["suite"]
+    if suite not in SUITE_MAX_ACTIONS:
+        raise ValueError(f"unsupported paper suite: {suite}")
     expected = {
-        "suite": "libero_10",
         "action_horizon": 10,
         "execution_horizon": 5,
         "flow_steps": 10,
         "num_wait_steps": 10,
-        "max_policy_actions": 900,
+        "max_policy_actions": SUITE_MAX_ACTIONS[suite],
         "environment_resolution": 256,
         "client_resize_size": 224,
         "model_image_size": 384,
@@ -302,7 +306,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     progress = tqdm(
         total=len(selected_keys),
         initial=len(completed),
-        desc=f"{args.row} LIBERO-Long",
+        desc=f"{args.row} {manifest['suite']}",
         dynamic_ncols=True,
         mininterval=args.tqdm_mininterval,
     )
@@ -444,6 +448,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     skipped = sum(int(item["skipped_text_token_layers"]) for item in completed_rows)
     summary = {
         "verdict": "SIMVLA_VLA_CACHE_LIBERO_EVAL_COMPLETE",
+        "suite": manifest["suite"],
         "row": args.row,
         "episodes": len(completed_rows),
         "successes": sum(bool(item["success"]) for item in completed_rows),

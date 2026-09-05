@@ -55,3 +55,21 @@ observations. Profiler traces and uninstrumented wall timings are separate.
 Policy timings include preprocessing, ten flow steps and five returned
 actions, but exclude environment stepping. These bounded measurements are
 not replacements for full-suite success rates or paper latency measurements.
+
+For the complete paper row, run
+`architectures/simvla/wrappers/run_vla_cache_four_suite_tmux.sh --all` on rb2.
+This evaluates Long, Spatial, Object, then Goal, each with three 500-episode
+seeds. It uses the manifests of the completed native baselines, not the older
+four-suite draft manifests for non-Long suites. All existing baseline results
+are reused. The numerical policy, precision, H=10/R=5 and flow=10 are unchanged.
+The launcher changes to its own repository root so another worktree cannot
+shadow its Python imports. `--verify` is bounded to four real observations.
+
+Results go to `four_suite_oft_runtime_v3`. The final `summary/` directory
+contains `paper_summary.json`, `per_seed.csv`, and `main_table_rows.tex`.
+The exported spread is sample standard deviation across evaluation seeds.
+The generation count is 10 and the additional trainable parameter count is
+zero; the table uses `--` for K_C because token caching is not periodic full
+backbone refresh. Policy latency uses the same per-episode then per-seed mean
+as the existing table. Historical latency comparisons are not simultaneous
+paired timing measurements. The manuscript itself is not edited.

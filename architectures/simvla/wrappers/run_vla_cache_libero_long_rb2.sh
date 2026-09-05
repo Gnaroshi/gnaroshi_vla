@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+cd "${ROOT}"
 MODE=${1:---all}
 case "${MODE}" in --all|--preflight|--verify) ;; *) echo "Usage: $0 [--preflight|--verify|--all]" >&2; exit 2 ;; esac
 PYTHON=${PYTHON:-/home/mingyujung/private/gnaroshi_vla_storage/envs/simvla/libero_mujoco237/bin/python}

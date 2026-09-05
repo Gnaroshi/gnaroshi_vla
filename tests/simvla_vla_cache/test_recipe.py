@@ -39,3 +39,23 @@ def test_implementation_identity_is_stable_and_covers_runtime():
     identity = implementation_identity()
     assert identity == implementation_identity()
     assert {"smolvlm_runtime.py", "official_contract.py", "policy.py", "eval.py"} <= identity.keys()
+
+
+@pytest.mark.parametrize("suite,steps", [("libero_10", 900), ("libero_spatial", 800), ("libero_object", 800), ("libero_goal", 800)])
+def test_paper_manifest_suite_limits(tmp_path, suite, steps):
+    import json
+    from architectures.simvla.adapters.vla_cache.eval import _load_manifest
+    data = dict(checkpoint="YuankaiLuo/SimVLA-LIBERO",
+                checkpoint_revision="93dc4d90b0596c652ad2840ad743c62b9c4473fb",
+                norm_stats="unused", suite=suite, action_horizon=10, execution_horizon=5,
+                flow_steps=10, num_wait_steps=10, max_policy_actions=steps,
+                environment_resolution=256, client_resize_size=224, model_image_size=384,
+                determinism_seed=1, action_noise_seed_base=2,
+                episodes=[dict(task_id=0, trial_id=0)], task_iteration_order={"rank0": [0]})
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(data))
+    assert _load_manifest(path, row="vla_cache", max_episodes=None)["suite"] == suite
+    data["max_policy_actions"] += 1
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="paper evaluation contract"):
+        _load_manifest(path, row="vla_cache", max_episodes=None)
