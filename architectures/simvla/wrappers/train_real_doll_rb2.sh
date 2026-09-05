@@ -3,7 +3,7 @@
 set -euo pipefail
 mode="${1:---preflight}"
 [[ $# -le 1 ]] || exit 2
-case "${mode}" in --preflight|--all) ;; *) echo "Usage: $0 [--preflight|--all]" >&2; exit 2 ;; esac
+case "${mode}" in --preflight|--all|--wait) ;; *) echo "Usage: $0 [--preflight|--all|--wait]" >&2; exit 2 ;; esac
 [[ "$(hostname -s)" == "jbr-TRX50" ]] || { echo "Run this training on rb2" >&2; exit 2; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 storage=/home/mingyujung/private/gnaroshi_vla_storage
@@ -24,12 +24,21 @@ export TRANSFORMERS_OFFLINE=1
 export PYTHONPATH="${repo}${PYTHONPATH:+:${PYTHONPATH}}"
 export PATH="$(dirname "${SIMVLA_REAL_PYTHON}"):${PATH}"
 unset SIMVLA_REAL_RAW_DATA
-if [[ "${mode}" == "--all" ]]; then
+if [[ "${mode}" != "--preflight" ]]; then
     [[ "${SIMVLA_REAL_TRAIN_RUN:-0}" == 1 ]] || { echo "Set SIMVLA_REAL_TRAIN_RUN=1" >&2; exit 2; }
     command -v flock >/dev/null
     mkdir -p "${SIMVLA_REAL_STORAGE}/logs"
     exec 9>"${SIMVLA_REAL_STORAGE}/.pipeline.lock"
     flock -n 9 || { echo "Corrected Doll pipeline is already active" >&2; exit 2; }
+fi
+if [[ "${mode}" == "--wait" ]]; then
+    [[ -n "${SIMVLA_REAL_WAIT_PIDS:-}" ]] || { echo "Set SIMVLA_REAL_WAIT_PIDS to the current pipeline launcher PIDs" >&2; exit 2; }
+    "${SIMVLA_REAL_PYTHON}" "${repo}/tools/simvla/wait_real_training.py" \
+        --parent-pids "${SIMVLA_REAL_WAIT_PIDS}" \
+        --dataset-manifest "${SIMVLA_REAL_DATASET}/manifest.json" \
+        --gpu-id 0 \
+        2>&1 | tee -a "${SIMVLA_REAL_STORAGE}/logs/wait_for_gpu.log"
+    mode=--all
 fi
 bash "${repo}/architectures/simvla/wrappers/train_real_stackcupanddoll.sh" --preflight
 if [[ "${mode}" == "--all" ]]; then
