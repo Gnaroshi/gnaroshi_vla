@@ -247,7 +247,31 @@ class SafeUR5eDeployEnv(legacy_deploy.UR5eDeployEnv):
         self._cancel_next_disarmed_policy_step = False
         self.last_tracking_error: dict[str, float] | None = None
         self.last_emergency_stop_report: dict[str, Any] | None = None
-        super().__init__(cfg)
+        self._closed = False
+        self.cfg = cfg
+        for name in ("rtde_ctrl", "rtde_rec", "gripper", "exterior_camera",
+                     "wrist_camera", "observer_camera"):
+            setattr(self, name, None)
+        try:
+            super().__init__(cfg)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self.emergency_stop()
+        try:
+            super().close()
+        finally:
+            gripper = getattr(self, "gripper", None)
+            if gripper is not None:
+                try:
+                    gripper.disconnect()
+                except Exception:
+                    pass
+            self._closed = True
 
     def arm_policy_commands(self) -> None:
         """Allow policy-driven Cartesian steps for one active GUI rollout."""

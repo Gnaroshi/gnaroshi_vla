@@ -14,7 +14,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "mode",
-        choices=("source-preflight", "artifact-preflight", "read-only-profile", "live"),
+        choices=("source-preflight", "environment-preflight", "prepare",
+                 "artifact-preflight", "read-only-profile", "live"),
     )
     parser.add_argument("--manifest")
     parser.add_argument(
@@ -31,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output")
     parser.add_argument("--steps", type=int, default=0)
+    parser.add_argument("--require-gui", action="store_true")
     return parser.parse_args()
 
 
@@ -165,6 +167,8 @@ def _artifact_preflight(args: argparse.Namespace) -> dict[str, Any]:
         }
     if mismatch:
         raise RuntimeError(f"Deployment schedule preflight failed: {mismatch}")
+    if not bool(np.isfinite(np.asarray(actions)).all()):
+        raise RuntimeError("Deployment preflight produced non-finite actions")
     payload = {
         "verdict": "ARTIFACT_PREFLIGHT_PASS",
         "deployment": controller.deployment_metadata(),
@@ -212,7 +216,25 @@ def main() -> None:
         _write_json(args.output, "source_preflight.json", source)
         print(json.dumps(source, indent=2, sort_keys=True))
         return
-    if args.mode == "artifact-preflight":
+    if args.mode == "environment-preflight":
+        from .environment import inspect_environment
+
+        result = inspect_environment(
+            require_cuda=args.device.startswith("cuda"), require_gui=args.require_gui
+        )
+        _write_json(args.output, "environment.json", result)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if result["verdict"] != "REAL_ENVIRONMENT_PASS":
+            raise RuntimeError("Environment preflight failed; see environment.json")
+        return
+    if args.mode == "prepare":
+        if not args.manifest or not args.output:
+            raise ValueError("prepare requires --manifest and --output")
+        from .preparation import prepare
+
+        result = prepare(manifest=args.manifest, output=args.output,
+                         device=args.device, require_gui=args.require_gui)
+    elif args.mode == "artifact-preflight":
         result = _artifact_preflight(args)
     elif args.mode == "read-only-profile":
         result = _read_only_profile(args)
@@ -223,6 +245,14 @@ def main() -> None:
 
         contract = load_deployment_contract(args.manifest, verify_artifacts=True)
         require_live_authorization(contract, deployment_method=args.method)
+        from .environment import inspect_environment
+
+        environment = inspect_environment(
+            require_cuda=args.device.startswith("cuda"), require_gui=True
+        )
+        _write_json(args.output, "environment.json", environment)
+        if environment["verdict"] != "REAL_ENVIRONMENT_PASS":
+            raise RuntimeError("Live environment check failed: " + "; ".join(environment["failures"]))
         _, controller = _load_controller(args)
         from .deploy_gui import run_live_gui
 

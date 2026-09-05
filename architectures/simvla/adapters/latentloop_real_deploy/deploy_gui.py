@@ -302,24 +302,35 @@ def run_live_gui(*, controller) -> None:
     cfg = build_deploy_config(contract)
     workspace = contract.hardware["robot"]["workspace_m"]
     tracking = contract.hardware["robot"]["control"]["tracking_error_guard"]
-    env = TimedSafeUR5eDeployEnv(
-        cfg,
-        workspace_min=workspace["min"],
-        workspace_max=workspace["max"],
-        tracking_error_guard=dict(tracking),
-        command_callback=controller.record_control_command,
-    )
     gui_args = SimpleNamespace(camera_c="no", gui_refresh_ms=150)
+    # Establish the operator UI before any robot control connection exists.
     root = tk.Tk()
+    env = None
     try:
+        root.withdraw()
+        env = TimedSafeUR5eDeployEnv(
+            cfg,
+            workspace_min=workspace["min"],
+            workspace_max=workspace["max"],
+            tracking_error_guard=dict(tracking),
+            command_callback=controller.record_control_command,
+        )
         SimVLADeployGuiApp(root, cfg, controller, env, gui_args)
+        root.deiconify()
         root.mainloop()
     except BaseException:
-        report = env.emergency_stop()
-        print(
-            "[simvla-deploy] emergency stop after GUI failure: "
-            + json.dumps(report, sort_keys=True),
-            flush=True,
-        )
-        env.close()
+        if env is not None:
+            try:
+                report = env.emergency_stop()
+                print("[simvla-deploy] emergency stop after GUI failure: "
+                      + json.dumps(report, sort_keys=True), flush=True)
+            finally:
+                env.close()
         raise
+    finally:
+        if env is not None:
+            env.close()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass

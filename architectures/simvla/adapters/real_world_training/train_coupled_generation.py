@@ -121,8 +121,8 @@ def _coupled_query(
         age=1,
     )
     code_norm = exposed.condition_change_code.float().norm(dim=-1)
-    if not bool((code_norm > 0).all()):
-        raise RuntimeError("real Condition Updater produced a zero change code")
+    if not bool(torch.isfinite(code_norm).all()):
+        raise RuntimeError("real Condition Updater produced a non-finite change code")
     return {
         "predicted_condition": exposed.update.condition,
         "exact_condition": exact_current,

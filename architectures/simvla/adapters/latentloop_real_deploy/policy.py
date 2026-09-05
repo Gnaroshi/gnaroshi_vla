@@ -221,8 +221,8 @@ class LatentLoopSimVLARealPolicy(RealSimVLANativeV0Policy):
         self.metrics.counters["num_condition_change_code_queries"] += 1
         code = exposed.condition_change_code.detach()
         code_norm = code.float().norm(dim=-1)
-        if not bool((code_norm > 0).all()):
-            raise RuntimeError("online real Condition Updater produced a zero change code")
+        if not bool(torch.isfinite(code_norm).all()):
+            raise RuntimeError("online real Condition Updater produced a non-finite change code")
         self._active_condition_change_code = code
         self.condition_change_code_norms.extend(code_norm.cpu().tolist())
         action, seed = self._decode(

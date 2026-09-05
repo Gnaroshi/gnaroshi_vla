@@ -5,6 +5,8 @@ usage() {
     cat <<'EOF'
 Usage:
   deploy_latentloop_real.sh source-preflight
+  deploy_latentloop_real.sh environment-preflight [--require-gui]
+  deploy_latentloop_real.sh prepare --manifest FILE [--require-gui]
   deploy_latentloop_real.sh artifact-preflight --manifest FILE [--method baseline|condition_loop|latentloop|vla_cache_full|vla_cache]
   deploy_latentloop_real.sh read-only-profile --manifest FILE [--method baseline|condition_loop|latentloop|vla_cache_full|vla_cache] [--steps N]
   deploy_latentloop_real.sh live --manifest FILE [--method baseline|condition_loop|latentloop|vla_cache_full|vla_cache]
@@ -24,7 +26,7 @@ if [[ $# -gt 0 ]]; then
     shift
 fi
 case "${mode}" in
-    source-preflight|artifact-preflight|read-only-profile|live) ;;
+    source-preflight|environment-preflight|prepare|artifact-preflight|read-only-profile|live) ;;
     -h|--help)
         usage
         exit 0
@@ -38,8 +40,13 @@ esac
 method="latentloop"
 manifest=""
 steps=0
+require_gui=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --require-gui)
+            require_gui=1
+            shift
+            ;;
         --manifest)
             [[ $# -ge 2 ]] || { echo "[ERROR] --manifest requires a value" >&2; exit 2; }
             manifest="$2"
@@ -75,7 +82,7 @@ if ! [[ "${steps}" =~ ^[0-9]+$ ]]; then
     echo "[ERROR] --steps must be a non-negative integer" >&2
     exit 2
 fi
-if [[ "${mode}" != "source-preflight" && ! -f "${manifest}" ]]; then
+if [[ "${mode}" != "source-preflight" && "${mode}" != "environment-preflight" && ! -f "${manifest}" ]]; then
     echo "[ERROR] A populated --manifest FILE is required for ${mode}" >&2
     exit 2
 fi
@@ -83,6 +90,8 @@ fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../.." && pwd)
 python_bin="${SIMVLA_REAL_PYTHON:-python}"
+python_bin=$(command -v "${python_bin}")
+export PATH="$(dirname -- "${python_bin}"):${PATH}"
 machine_name=$(hostname -s)
 default_gpu=0
 if [[ "${machine_name}" == "jbrserver1" || "${machine_name}" == "sd1" ]]; then
@@ -150,8 +159,9 @@ fi
 if (( steps > 0 )); then
     command+=(--steps "${steps}")
 fi
-if [[ "${mode}" != "live" ]]; then
-    command+=(--output "${output_dir}")
+command+=(--output "${output_dir}")
+if (( require_gui )); then
+    command+=(--require-gui)
 fi
 
 {
