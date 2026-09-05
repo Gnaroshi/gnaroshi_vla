@@ -25,7 +25,23 @@ TENSOR_FIELDS = (
 )
 
 
-def _available_memory_bytes() -> int:
+def _available_memory_bytes(meminfo_path: Path = Path("/proc/meminfo")) -> int:
+    try:
+        for line in meminfo_path.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("MemAvailable:"):
+                continue
+            fields = line.split()
+            if len(fields) != 3 or fields[2] != "kB":
+                break
+            available = int(fields[1]) * 1024
+            if available > 0:
+                return available
+            break
+    except (OSError, ValueError):
+        pass
+
+    # MemAvailable includes reclaimable caches. Keep sysconf as a fallback for
+    # platforms without Linux's /proc/meminfo interface.
     page_size = os.sysconf("SC_PAGE_SIZE")
     available_pages = os.sysconf("SC_AVPHYS_PAGES")
     return int(page_size * available_pages)
