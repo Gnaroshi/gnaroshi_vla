@@ -38,6 +38,8 @@ fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../.." && pwd)
+# Isolate imports from the caller's worktree for preflight and every train stage.
+cd -- "${repo_root}"
 python_bin="${SIMVLA_REAL_PYTHON:-/home/mingyujung/miniconda3/envs/simvla_libero/bin/python}"
 gpu_ids="${SIMVLA_REAL_GPU_IDS:-4,5,6,7}"
 IFS=',' read -r -a gpu_array <<< "${gpu_ids}"
@@ -128,7 +130,7 @@ fail() {
     echo "[ERROR] $*" >&2
     exit 1
 }
-export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${repo_root}"
 
 dataset_manifest_valid() {
     "${python_bin}" -c \

@@ -6,6 +6,8 @@ mode="${1:---preflight}"
 case "${mode}" in --preflight|--all) ;; *) echo "Usage: $0 [--preflight|--all]" >&2; exit 2 ;; esac
 [[ "$(hostname -s)" == "jbrserver1" ]] || { echo "Run this preparation on sd1" >&2; exit 2; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
+# Python -c/-m search cwd before PYTHONPATH, including other worktrees.
+cd -- "${repo}"
 py=/home/mingyujung/miniconda3/envs/simvla_libero/bin/python
 raw=/home/mingyujung/shared/ssd1/mingyujung/FlowFLA_RWDatasets/teleop_datasets/stackcupanddoll
 data=/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/datasets/simvla_real/stackcupanddoll_hdf5_v3
@@ -13,10 +15,11 @@ remote=/home/mingyujung/private/gnaroshi_vla_storage/datasets/simvla_real/stackc
 remote_stage="${remote}.incoming"
 export CUDA_VISIBLE_DEVICES=''
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="${repo}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${repo}"
 [[ -x "${py}" && -d "${raw}" ]] || { echo "Missing source data or Python" >&2; exit 2; }
 command -v rsync >/dev/null
 command -v flock >/dev/null
+"${py}" -c 'from architectures.simvla.adapters.real_world_training.artifact_validation import validate_real_dataset_manifest; print("DATA_VALIDATOR_IMPORT_PASS")'
 "${py}" -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); episodes=[x for x in p.iterdir() if x.is_dir()]; assert len(episodes)==40, len(episodes); print("RAW_DOLL_EPISODES=40")' "${raw}"
 if [[ "${mode}" == "--preflight" ]]; then
     echo "DATA_PATH_PREFLIGHT_PASS; conversion and data validation have not run"
