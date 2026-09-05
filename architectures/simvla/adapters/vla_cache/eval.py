@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -32,7 +33,7 @@ from architectures.simvla.wrappers.dcld_eval.rollout_runner import (
 )
 
 from .policy import VLACacheSimVLAPolicy
-from .recipe import evaluation_row, scientific_contract
+from .recipe import OFFICIAL_NORM_SHA256, evaluation_row, scientific_contract
 
 
 def _configure_paths() -> tuple[Path, Path, Path]:
@@ -100,6 +101,17 @@ def _git_snapshot(root: Path) -> dict[str, Any]:
     }
 
 
+def implementation_identity() -> dict[str, str]:
+    return {path.name: _sha256(path) for path in sorted(Path(__file__).parent.glob("*.py"))}
+
+
+def validate_norm_stats(path: Path) -> str:
+    observed = _sha256(path)
+    if observed != OFFICIAL_NORM_SHA256:
+        raise RuntimeError(f"norm stats checksum mismatch: {observed}")
+    return observed
+
+
 def _load_manifest(path: Path, *, row: str, max_episodes: int | None) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     required = {
@@ -127,6 +139,11 @@ def _load_manifest(path: Path, *, row: str, max_episodes: int | None) -> dict[st
         "flow_steps": 10,
         "num_wait_steps": 10,
         "max_policy_actions": 900,
+        "environment_resolution": 256,
+        "client_resize_size": 224,
+        "model_image_size": 384,
+        "checkpoint": "YuankaiLuo/SimVLA-LIBERO",
+        "checkpoint_revision": "93dc4d90b0596c652ad2840ad743c62b9c4473fb",
     }
     mismatches = {
         key: {"expected": value, "observed": data.get(key)}
@@ -189,6 +206,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     norm_stats = Path(args.norm_stats).expanduser().resolve()
     if not norm_stats.is_file():
         raise FileNotFoundError(f"norm stats not found: {norm_stats}")
+    norm_sha256 = validate_norm_stats(norm_stats)
     manifest_norm = Path(manifest["norm_stats"]).expanduser()
     if manifest_norm.is_file() and _sha256(manifest_norm) != _sha256(norm_stats):
         raise RuntimeError("provided norm stats differ from the paired manifest")
@@ -204,7 +222,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "manifest_file_sha256": manifest["manifest_file_sha256"],
         "selected_episode_count": manifest["selected_episode_count"],
         "norm_stats": str(norm_stats),
-        "norm_stats_sha256": _sha256(norm_stats),
+        "norm_stats_sha256": norm_sha256,
+        "implementation_identity": implementation_identity(),
         "smolvlm_model": args.smolvlm_model,
         "scientific_contract": scientific_contract(),
     }
@@ -241,6 +260,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    from libero.libero import benchmark, get_libero_path
+
     metadata = {
         **contract,
         "hostname": platform.node(),
@@ -248,6 +269,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "python": sys.version,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
+        "mujoco": importlib.metadata.version("mujoco"),
+        "transformers": importlib.metadata.version("transformers"),
+        "model_dtype": str(next(model.parameters()).dtype),
+        "native_attention_backend": model.vlm.model.text_model.config._attn_implementation,
+        "cache_attention_backend": "eager" if row_contract.enable_reuse else None,
+        "simvla_model_source_sha256": _sha256(upstream / "models/modeling_smolvlm_vla.py"),
+        "libero_data_paths": {key: get_libero_path(key) for key in ("assets", "bddl_files", "init_states")},
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         "simvla_upstream_root": str(upstream),
         "libero_root": str(libero),
@@ -266,8 +294,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "resume_completed_at_start": len(completed),
     }
     _write_json(output / "environment_metadata.json", metadata)
-
-    from libero.libero import benchmark
 
     suite = benchmark.get_benchmark_dict()[manifest["suite"]]()
     by_task: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -327,7 +353,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 counters = dict(policy.metrics.counters)
                 decoder_reports = [item["vla_cache"]["decoder"] for item in policy.query_trace]
                 selected_counts = [
-                    len(item["vla_cache"]["selection"]["reusable_positions"])
+                    item["vla_cache"]["selection"]["reusable_count"]
                     for item in policy.query_trace
                 ]
                 computed = int(counters.get("computed_text_token_layers", 0))
@@ -425,6 +451,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "taskwise": taskwise,
         "latency_per_executed_action_ms": _mean([float(item["policy_latency_mean_ms"]) for item in completed_rows]),
         "query_latency_mean_ms": _mean([float(item["query_latency_mean_ms"]) for item in completed_rows]),
+        "latency_aggregation": "unweighted mean of per-episode means, matching the existing paper table",
+        "action_weighted_latency_ms": sum(item["policy_latency_mean_ms"] * item["episode_length"] for item in completed_rows) / sum(item["episode_length"] for item in completed_rows),
+        "implementation_identity": contract["implementation_identity"],
         "computed_text_token_layers": computed,
         "skipped_text_token_layers": skipped,
         "text_token_layer_reduction": skipped / max(computed + skipped, 1),

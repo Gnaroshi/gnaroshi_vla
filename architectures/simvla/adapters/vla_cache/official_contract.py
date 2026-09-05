@@ -105,6 +105,7 @@ def reusable_visual_positions(
     current_images: torch.Tensor,
     previous_visual_importance: torch.Tensor,
     config: VLACacheConfig,
+    diagnostics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, object]]:
     """Apply official stable-minus-task-relevant selection per camera view."""
 
@@ -118,8 +119,18 @@ def reusable_visual_positions(
         raise ValueError(
             "visual importance must match [views, connector_tokens_per_view]"
         )
-    reusable: list[int] = []
-    diagnostics: list[dict[str, object]] = []
+    # Fixed-size ranks avoid per-view device-to-host conversions and set work.
+    order = torch.argsort(similarities, dim=1, descending=True, stable=True)
+    stable = order[:, :config.stable_top_k]
+    stable_mask = torch.zeros_like(similarities, dtype=torch.bool)
+    stable_mask.scatter_(1, stable, similarities.gather(1, stable) >= config.similarity_threshold)
+    important = torch.argsort(previous_visual_importance, dim=1, descending=True, stable=True)
+    stable_mask.scatter_(1, important[:, :config.task_relevant_top_k], False)
+    reusable = torch.nonzero(stable_mask.flatten(), as_tuple=False).flatten()
+    report: dict[str, object] = {"per_view": [], "reusable_count": reusable.numel()}
+    if not diagnostics:
+        return reusable, report
+    per_view: list[dict[str, object]] = []
     for view in range(views):
         scores = similarities[view]
         eligible = torch.nonzero(
@@ -133,9 +144,8 @@ def reusable_visual_positions(
         important = torch.argsort(
             previous_visual_importance[view], descending=True, stable=True
         )[: config.task_relevant_top_k]
-        keep = sorted(set(stable.tolist()) - set(important.tolist()))
-        reusable.extend(view * tokens + token for token in keep)
-        diagnostics.append(
+        keep = torch.nonzero(stable_mask[view], as_tuple=False).flatten()
+        per_view.append(
             {
                 "view": view,
                 "stable_candidates": int(eligible.numel()),
@@ -146,29 +156,40 @@ def reusable_visual_positions(
                 "similarity_min": float(scores.min().item()),
             }
         )
-    return (
-        torch.tensor(reusable, dtype=torch.long, device=current_images.device),
-        {"per_view": diagnostics, "reusable_positions": reusable},
-    )
+    report.update(per_view=per_view, reusable_positions=reusable.tolist())
+    return reusable, report
 
 
 def layer_reuse_schedule(
     attentions: Sequence[torch.Tensor],
     *,
     growth_factor: float,
+    grouped: bool = True,
 ) -> torch.Tensor:
-    """Reproduce the official attention-entropy reuse schedule."""
+    """Official OFT schedule, with actual maps only (no cache-position sentinel)."""
 
     if len(attentions) < 2:
         raise ValueError("at least two decoder attention maps are required")
-    entropy = []
-    for attention in attentions[:-1]:
-        probabilities = attention.float().mean(dim=1)
-        probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True).clamp_min(1e-10)
+    def entropy_of(probabilities: torch.Tensor) -> torch.Tensor:
+        probabilities = probabilities / (probabilities.sum(dim=-1, keepdim=True) + 1e-10)
         probabilities = torch.nan_to_num(probabilities, nan=0.0)
         token_entropy = -(probabilities * torch.log(probabilities + 1e-10)).sum(dim=-1)
-        entropy.append(token_entropy.mean())
-    values = torch.stack(entropy)
+        return token_entropy.mean(dim=(-1, -2))
+
+    if any(attention.ndim != 4 or attention.shape[0] != 1 for attention in attentions):
+        raise ValueError("expected only [1,heads,queries,keys] attention maps")
+    if grouped:
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for index, attention in enumerate(attentions):
+            groups.setdefault(tuple(attention.shape), []).append(index)
+        entropies: list[torch.Tensor | None] = [None] * len(attentions)
+        for indices in groups.values():
+            values = entropy_of(torch.stack([attentions[i].float() for i in indices]).mean(dim=2))
+            for index, value in zip(indices, values.unbind()):
+                entropies[index] = value
+        values = torch.stack(entropies)
+    else:
+        values = torch.stack([entropy_of(a.float().mean(dim=1)) for a in attentions])
     normalized = (values - values.min()) / (values.max() - values.min() + 1e-10)
     reuse = (1.0 - normalized).tolist()
     for index in range(1, len(reuse)):

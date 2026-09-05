@@ -3,15 +3,16 @@ set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 MODE=${1:---all}
+case "${MODE}" in --all|--preflight|--verify) ;; *) echo "Usage: $0 [--preflight|--verify|--all]" >&2; exit 2 ;; esac
 PYTHON=${PYTHON:-/home/mingyujung/private/gnaroshi_vla_storage/envs/simvla/libero_mujoco237/bin/python}
 GPU_ID=${SIMVLA_VLA_CACHE_GPU:-0}
 UPSTREAM=${SIMVLA_UPSTREAM_ROOT:-/home/mingyujung/private/gnaroshi_vla/architectures/simvla/upstream}
-LIBERO=${LIBERO_ROOT:-${UPSTREAM}/evaluation/libero/LIBERO}
-RESULT_ROOT=${SIMVLA_VLA_CACHE_RESULT_ROOT:-/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/vla_cache/libero_10_paper_compare_v1}
+LIBERO=${LIBERO_ROOT:-/home/mingyujung/private/gnaroshi_vla_storage/datasets/LIBERO}
+RESULT_ROOT=${SIMVLA_VLA_CACHE_RESULT_ROOT:-/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/vla_cache/libero_10_oft_fidelity_v2}
 REFERENCE_ROOT=${SIMVLA_REFERENCE_RESULT_ROOT:-/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/paper_four_suite_three_seed_v1}
 MANIFEST_ROOT=${SIMVLA_EPISODE_MANIFEST_ROOT:-${REFERENCE_ROOT}/manifests/libero_10}
 NORM_STATS=${SIMVLA_NORM_STATS:-${ROOT}/architectures/simvla/adapters/latentloop/assets/libero_norm_official_32700d0.json}
-CHECKPOINT_REVISION=93dc4d90b0596c652ad2840ad743c62b9c4473fb
+REFERENCE_SUMMARY=${SIMVLA_REFERENCE_SUMMARY:-/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/paper_followup/three_seed_long500_primary_v1/aggregate/paper_followup_three_seed_summary.json}
 
 export SIMVLA_UPSTREAM_ROOT="${UPSTREAM}"
 export LIBERO_ROOT="${LIBERO}"
@@ -26,6 +27,8 @@ export HF_HOME=${HF_HOME:-/home/mingyujung/private/gnaroshi_vla/.cache/huggingfa
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
+export USE_TF=0
+export PYTHONDONTWRITEBYTECODE=1
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NUMBA_CACHE_DIR=${NUMBA_CACHE_DIR:-/tmp/numba_cache}
@@ -47,6 +50,7 @@ fail() {
   exit "${rc}"
 }
 trap fail ERR
+trap 'echo "SIMVLA_VLA_CACHE_INTERRUPTED" | tee "${STATUS}"; exit 130' INT TERM
 
 stage_complete() {
   local stage=$1
@@ -54,9 +58,11 @@ stage_complete() {
 import json
 import sys
 from pathlib import Path
+from architectures.simvla.adapters.vla_cache.eval import implementation_identity
 
 stage, root_text = sys.argv[1:]
 root = Path(root_text)
+data = None
 
 def load(path):
     if not path.is_file():
@@ -66,12 +72,6 @@ def load(path):
 if stage == "checkpoint_smoke":
     data = load(root / "preflight/real_checkpoint_smoke.json")
     ok = bool(data and data.get("verdict") == "SIMVLA_VLA_CACHE_REAL_CHECKPOINT_SMOKE_PASS")
-elif stage == "libero_smoke":
-    data = load(root / "preflight/libero_smoke/summary.json")
-    ok = bool(data and data.get("verdict") == "SIMVLA_VLA_CACHE_LIBERO_EVAL_COMPLETE" and data.get("episodes") == 1)
-elif stage == "matched_full_control":
-    data = load(root / "matched_full_control/seed01/summary.json")
-    ok = bool(data and data.get("verdict") == "SIMVLA_VLA_CACHE_LIBERO_EVAL_COMPLETE" and data.get("episodes") == 500 and data.get("actual_kv_reuse_queries") == 0)
 elif stage.startswith("vla_cache_seed"):
     seed = stage.rsplit("seed", 1)[1]
     data = load(root / f"vla_cache/seed{seed}/summary.json")
@@ -81,6 +81,7 @@ elif stage == "summary":
     ok = bool(data and data.get("verdict") == "SIMVLA_VLA_CACHE_LIBERO_THREE_SEED_COMPLETE")
 else:
     ok = False
+ok = bool(ok and data and data.get("implementation_identity") == implementation_identity())
 raise SystemExit(0 if ok else 1)
 PY
 }
@@ -110,6 +111,7 @@ preflight() {
     "${MANIFEST_ROOT}/seed01/episode_manifest.json"
     "${MANIFEST_ROOT}/seed02/episode_manifest.json"
     "${MANIFEST_ROOT}/seed03/episode_manifest.json"
+    "${REFERENCE_SUMMARY}"
   )
   for path in "${required[@]}"; do
     if [[ ! -e "${path}" ]]; then
@@ -121,10 +123,25 @@ preflight() {
     echo "PREFLIGHT_FAIL this launcher is pinned to rb2/jbr-TRX50" >&2
     return 1
   fi
-  "${PYTHON}" - <<'PY'
+  local occupied
+  occupied=$(nvidia-smi -i "${GPU_ID}" --query-compute-apps=pid --format=csv,noheader)
+  if [[ -n "${occupied}" ]]; then
+    echo "PREFLIGHT_FAIL GPU ${GPU_ID} has compute processes: ${occupied}. No process was stopped." >&2
+    return 1
+  fi
+  "${PYTHON}" - "${NORM_STATS}" "${MANIFEST_ROOT}" "${REFERENCE_SUMMARY}" <<'PY'
 import json
+import sys
+from pathlib import Path
 import torch
 from architectures.simvla.adapters.vla_cache.recipe import scientific_contract
+from architectures.simvla.adapters.vla_cache.eval import validate_norm_stats, _load_manifest
+validate_norm_stats(Path(sys.argv[1]))
+reference = json.loads(Path(sys.argv[3]).read_text())
+for seed in ("seed01", "seed02", "seed03"):
+    manifest = _load_manifest(Path(sys.argv[2]) / seed / "episode_manifest.json", row="vla_cache", max_episodes=None)
+    assert manifest["selected_episode_count"] == 500
+    assert manifest["manifest_sha256"] == reference["manifest_sha256"][seed]
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is unavailable")
 free, total = torch.cuda.mem_get_info(0)
@@ -137,7 +154,7 @@ print(json.dumps({
     "contract": scientific_contract(),
 }, indent=2, sort_keys=True))
 PY
-  CUDA_VISIBLE_DEVICES='' "${PYTHON}" -m pytest -q "${ROOT}/tests/simvla_vla_cache"
+  CUDA_VISIBLE_DEVICES='' "${PYTHON}" -m pytest -q -p no:cacheprovider "${ROOT}/tests/simvla_vla_cache"
 }
 
 preflight
@@ -145,34 +162,22 @@ if [[ "${MODE}" == "--preflight" ]]; then
   echo "SIMVLA_VLA_CACHE_PREFLIGHT_COMPLETE"
   exit 0
 fi
-if [[ "${MODE}" != "--all" ]]; then
-  echo "Usage: $0 [--preflight|--all]" >&2
-  exit 2
-fi
-if [[ ${SIMVLA_VLA_CACHE_LIBERO_RUN:-0} != 1 ]]; then
+if [[ "${MODE}" == "--all" && ${SIMVLA_VLA_CACHE_LIBERO_RUN:-0} != 1 ]]; then
   echo "Set SIMVLA_VLA_CACHE_LIBERO_RUN=1 after reviewing this launcher." >&2
   exit 2
 fi
 
-run_stage checkpoint_smoke \
+run_stage checkpoint_smoke env PYTHONHASHSEED=20260815 \
   "${PYTHON}" -m architectures.simvla.adapters.vla_cache.smoke \
     --output "${RESULT_ROOT}/preflight/real_checkpoint_smoke.json" \
-    --checkpoint YuankaiLuo/SimVLA-LIBERO \
-    --checkpoint-revision "${CHECKPOINT_REVISION}" \
+    --episode-manifest "${MANIFEST_ROOT}/seed01/episode_manifest.json" \
     --norm-stats "${NORM_STATS}" \
     --device cuda
 
-run_stage libero_smoke env PYTHONHASHSEED=20260815 \
-  "${PYTHON}" -m architectures.simvla.adapters.vla_cache.eval \
-    --output "${RESULT_ROOT}/preflight/libero_smoke" \
-    --episode-manifest "${MANIFEST_ROOT}/seed01/episode_manifest.json" \
-    --row vla_cache --norm-stats "${NORM_STATS}" --max-episodes 1 --device cuda
-
-run_stage matched_full_control env PYTHONHASHSEED=20260815 \
-  "${PYTHON}" -m architectures.simvla.adapters.vla_cache.eval \
-    --output "${RESULT_ROOT}/matched_full_control/seed01" \
-    --episode-manifest "${MANIFEST_ROOT}/seed01/episode_manifest.json" \
-    --row vla_cache_full --norm-stats "${NORM_STATS}" --device cuda
+if [[ "${MODE}" == "--verify" ]]; then
+  echo "SIMVLA_VLA_CACHE_BOUNDED_VERIFICATION_COMPLETE" | tee "${STATUS}"
+  exit 0
+fi
 
 for seed in 01 02 03; do
   case "${seed}" in
@@ -194,7 +199,7 @@ done
 run_stage summary \
   "${PYTHON}" -m architectures.simvla.adapters.vla_cache.summarize \
     --eval-root "${RESULT_ROOT}" \
-    --reference-root "${REFERENCE_ROOT}" \
+    --reference-summary "${REFERENCE_SUMMARY}" \
     --output "${RESULT_ROOT}/summary"
 
 echo "SIMVLA_VLA_CACHE_LIBERO_PIPELINE_COMPLETE" | tee "${STATUS}"

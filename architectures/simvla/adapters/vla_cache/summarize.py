@@ -1,4 +1,4 @@
-"""Aggregate matched-control and three-seed VLA-Cache LIBERO results."""
+"""Aggregate repaired VLA-Cache results against existing native paper results."""
 
 from __future__ import annotations
 
@@ -9,102 +9,70 @@ from pathlib import Path
 
 import numpy as np
 
-
-def _load(path: Path) -> dict:
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    return json.loads(path.read_text(encoding="utf-8"))
+from .eval import _sha256, implementation_identity
 
 
-def summarize(args: argparse.Namespace) -> dict:
+def summarize(args):
     root = Path(args.eval_root).expanduser().resolve()
-    control = _load(root / "matched_full_control" / "seed01" / "summary.json")
-    cache = [
-        _load(root / "vla_cache" / f"seed{index:02d}" / "summary.json")
-        for index in (1, 2, 3)
-    ]
-    expected_verdict = "SIMVLA_VLA_CACHE_LIBERO_EVAL_COMPLETE"
-    if control.get("verdict") != expected_verdict or any(
-        item.get("verdict") != expected_verdict for item in cache
-    ):
-        raise RuntimeError("one or more evaluation rows are incomplete")
-    if control.get("episodes") != 500 or any(item.get("episodes") != 500 for item in cache):
-        raise RuntimeError("paper comparison requires 500 episodes per evaluation seed")
-    control_latency = float(control["latency_per_executed_action_ms"])
+    reference_path = Path(args.reference_summary).expanduser().resolve()
+    reference = json.loads(reference_path.read_text())
+    sources = {item["row"]: item for item in reference["row_summaries"]}
+    baseline = sources["full_nfe10"]
+    if baseline["episodes"] != 1500 or baseline["seeds"] != 3:
+        raise RuntimeError("reference baseline must contain three complete 500-episode seeds")
+    baseline_latency = float(baseline["seed_mean_latency_per_action_ms"])
     rows = []
-    for seed, item in enumerate(cache, start=1):
-        rows.append(
-            {
-                "method": "VLA-Cache",
-                "seed": f"seed{seed:02d}",
-                "episodes": item["episodes"],
-                "success_rate_percent": 100.0 * float(item["success_rate"]),
-                "latency_ms_per_action": item["latency_per_executed_action_ms"],
-                "speedup_vs_matched_full": control_latency / float(item["latency_per_executed_action_ms"]),
-                "text_token_layer_reduction_percent": 100.0 * float(item["text_token_layer_reduction"]),
-                "actual_kv_reuse_queries": item["actual_kv_reuse_queries"],
-                "peak_cuda_memory_gib": item["peak_cuda_memory_gib"],
-            }
-        )
+    for seed in ("seed01", "seed02", "seed03"):
+        path = root / "vla_cache" / seed / "summary.json"
+        item = json.loads(path.read_text())
+        if item.get("verdict") != "SIMVLA_VLA_CACHE_LIBERO_EVAL_COMPLETE" or item.get("episodes") != 500:
+            raise RuntimeError(f"incomplete 500-episode row: {seed}")
+        if item.get("implementation_identity") != implementation_identity():
+            raise RuntimeError(f"different source version: {seed}")
+        if item.get("manifest_declared_sha256") != reference["manifest_sha256"][seed]:
+            raise RuntimeError(f"different paired manifest: {seed}")
+        rows.append({"seed": seed, "episodes": item["episodes"], "successes": item["successes"],
+                     "success_rate_percent": 100 * item["success_rate"],
+                     "latency_ms_per_action": item["latency_per_executed_action_ms"],
+                     "text_token_layer_reduction_percent": 100 * item["text_token_layer_reduction"],
+                     "actual_kv_reuse_queries": item["actual_kv_reuse_queries"],
+                     "peak_cuda_memory_gib": item["peak_cuda_memory_gib"]})
+    mean_latency = float(np.mean([row["latency_ms_per_action"] for row in rows]))
     result = {
         "verdict": "SIMVLA_VLA_CACHE_LIBERO_THREE_SEED_COMPLETE",
-        "matched_full_control": control,
-        "vla_cache_three_seed": {
-            "episodes_total": sum(int(item["episodes"]) for item in cache),
-            "success_rate_percent_mean": float(np.mean([100 * item["success_rate"] for item in cache])),
-            "success_rate_percent_min": float(np.min([100 * item["success_rate"] for item in cache])),
-            "success_rate_percent_max": float(np.max([100 * item["success_rate"] for item in cache])),
-            "latency_ms_per_action_mean": float(np.mean([item["latency_per_executed_action_ms"] for item in cache])),
-            "speedup_vs_matched_full_mean": float(np.mean([item["speedup_vs_matched_full"] for item in rows])),
-            "text_token_layer_reduction_percent_mean": float(np.mean([100 * item["text_token_layer_reduction"] for item in cache])),
-            "per_seed": rows,
-        },
-        "comparison_axis": {
-            "suite": "libero_10",
-            "episodes_per_seed": 500,
-            "gpu": "RTX 5090 (rb2)",
-            "action_horizon": 10,
-            "execution_horizon": 5,
-            "flow_steps": 10,
-            "paired_with_existing_simvla_manifests": True,
-            "existing_baseline_and_ours_result_root": str(Path(args.reference_root).expanduser().resolve()),
-            "baseline_rerun": False,
-            "matched_full_control_purpose": (
-                "isolate the eager-attention backend required by VLA-Cache; "
-                "it is not a replacement for the existing SimVLA baseline"
-            ),
-        },
+        "implementation_identity": implementation_identity(),
+        "vla_cache_three_seed": {"episodes_total": 1500, "per_seed": rows,
+            "success_rate_percent_mean": float(np.mean([row["success_rate_percent"] for row in rows])),
+            "latency_ms_per_action_mean": mean_latency,
+            "historical_speed_ratio_native_over_cache": baseline_latency / mean_latency},
+        "existing_native_baseline": baseline,
+        "existing_ours": {key: sources[key] for key in ("generation_ng3", "condition_kc2_ng3", "condition_kc2_ng3_coupled") if key in sources},
+        "reference_summary": str(reference_path), "reference_summary_sha256": _sha256(reference_path),
+        "comparison_axis": {"suite": "libero_10", "episodes_per_seed": 500, "seeds": 3,
+            "gpu": "RTX 5090 (rb2)", "H": 10, "R": 5, "flow_steps": 10,
+            "baseline_rerun": False, "same_declared_episode_manifests": True,
+            "latency_note": "Historical end-to-end timings, not a simultaneous paired timing trial; do not use the old eager cache-off denominator. A ratio below one means slower than native."},
     }
-    output = Path(args.output).expanduser().resolve()
+    output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    (output / "comparison_summary.json").write_text(
-        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    with (output / "vla_cache_per_seed.csv").open("w", newline="", encoding="utf-8") as handle:
+    (output / "comparison_summary.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    with (output / "vla_cache_per_seed.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    lines = [
-        "# SimVLA VLA-Cache LIBERO-Long comparison",
-        "",
-        "- VLA-Cache is evaluated on the same three 500-episode manifests used by the SimVLA paper rows.",
-        "- Existing SimVLA baseline and Ours rows are referenced, not rerun.",
-        "- The cache-off row is a matched eager-attention backend control, not another official baseline.",
-        f"- VLA-Cache SR: {result['vla_cache_three_seed']['success_rate_percent_mean']:.2f}% (three-seed mean)",
-        f"- VLA-Cache latency: {result['vla_cache_three_seed']['latency_ms_per_action_mean']:.3f} ms/action",
-        f"- Speedup vs matched cache-off control: {result['vla_cache_three_seed']['speedup_vs_matched_full_mean']:.3f}x",
-        f"- Decoder token-layer reduction: {result['vla_cache_three_seed']['text_token_layer_reduction_percent_mean']:.2f}%",
-        "",
-        f"Existing baseline/Ours root: `{result['comparison_axis']['existing_baseline_and_ours_result_root']}`",
-    ]
-    (output / "comparison_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (output / "comparison_summary.md").write_text(
+        "# SimVLA VLA-Cache LIBERO-Long\n\n"
+        "500 episodes per seed, 3 seeds, RTX 5090, H=10, R=5, flow=10.\n\n"
+        f"VLA-Cache: {result['vla_cache_three_seed']['success_rate_percent_mean']:.2f}%, {mean_latency:.3f} ms/action.\n\n"
+        f"Existing native baseline: {100 * baseline['seed_mean_success_rate']:.2f}%, {baseline_latency:.3f} ms/action.\n\n"
+        "Baseline/Ours were not rerun. Timing comparison uses historical measurements; no inflated cache-off baseline is used.\n")
     return result
 
 
-def parser() -> argparse.ArgumentParser:
+def parser():
     value = argparse.ArgumentParser()
     value.add_argument("--eval-root", required=True)
-    value.add_argument("--reference-root", required=True)
+    value.add_argument("--reference-summary", required=True)
     value.add_argument("--output", required=True)
     return value
 

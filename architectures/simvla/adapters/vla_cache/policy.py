@@ -14,7 +14,8 @@ from .smolvlm_runtime import SimVLAVLACacheBackbone
 class VLACacheSimVLAPolicy(RealSimVLADCLDPolicy):
     """Training-free VLA-Cache baseline with unchanged H=10/R=5 control."""
 
-    def __init__(self, *, enable_reuse: bool = True, **kwargs: Any) -> None:
+    def __init__(self, *, enable_reuse: bool = True, optimized: bool = True,
+                 diagnostics: bool = False, **kwargs: Any) -> None:
         self.enable_reuse = bool(enable_reuse)
         mode = "vla_cache" if self.enable_reuse else "vla_cache_full"
         fixed = {
@@ -42,14 +43,36 @@ class VLACacheSimVLAPolicy(RealSimVLADCLDPolicy):
             self.model,
             VLACacheConfig(),
             enable_reuse=self.enable_reuse,
+            optimized=optimized,
+            diagnostics=diagnostics,
         )
         self.reset()
 
     def reset(self) -> None:
         super().reset()
         self.query_trace: list[dict[str, Any]] = []
+        self._relevance_prompt = None
+        self._relevance_text_mask = None
         if hasattr(self, "vla_cache"):
             self.vla_cache.reset()
+
+    def preprocess(self, image0, image1, proprio, prompt):
+        batch = super().preprocess(image0, image1, proprio, prompt)
+        if self.enable_reuse:
+            if self._relevance_prompt != prompt:
+                import torch
+
+                tokens = self.processor.tokenizer(
+                    [prompt], return_tensors="pt", padding="max_length",
+                    max_length=self.processor.language_max_length, truncation=True,
+                )
+                if not torch.equal(tokens["input_ids"].to(self.device), batch["input_ids"]):
+                    raise RuntimeError("relevance tokenizer differs from native preprocessing")
+                self._relevance_text_mask = tokens["attention_mask"].to(self.device)
+                self._relevance_prompt = prompt
+                self.vla_cache.reset()
+            batch["text_attention_mask"] = self._relevance_text_mask
+        return batch
 
     def _sync(self) -> None:
         if self.device.type == "cuda":
@@ -80,6 +103,7 @@ class VLACacheSimVLAPolicy(RealSimVLADCLDPolicy):
             input_ids=batch["input_ids"],
             image_input=batch["image_input"],
             image_mask=batch["image_mask"],
+            text_attention_mask=batch.get("text_attention_mask"),
         )
         self._sync()
         self.metrics.latencies["VLM_encoder_ms"].append(

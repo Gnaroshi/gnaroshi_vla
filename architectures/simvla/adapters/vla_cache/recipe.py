@@ -6,6 +6,9 @@ from dataclasses import asdict, dataclass
 
 from .official_contract import VLACacheConfig
 
+IMPLEMENTATION_VERSION = "oft_fidelity_v2"
+OFFICIAL_NORM_SHA256 = "5e4dcf9026271137e102f6f784d345f0f03c1fd9963b679631b110a16788149e"
+
 
 @dataclass(frozen=True)
 class EvaluationRow:
@@ -22,8 +25,7 @@ ROWS = {
         name="vla_cache_full",
         enable_reuse=False,
         description=(
-            "Matched eager-attention control. It uses the VLA-Cache decoder "
-            "backend but recomputes every token and performs no KV reuse."
+            "Native SimVLA forward without adapter token processing or KV reuse."
         ),
     ),
     "vla_cache": EvaluationRow(
@@ -47,6 +49,10 @@ def evaluation_row(name: str) -> EvaluationRow:
 def scientific_contract() -> dict[str, object]:
     return {
         "method": "VLA-Cache",
+        "implementation_version": IMPLEMENTATION_VERSION,
+        "task_relevance_queries": "valid tokenizer text positions; native model mask unchanged",
+        "entropy_maps": "all actual decoder layers; no metadata sentinel",
+        "dense_condition_reconstruction": "previous final hidden at removed positions",
         "training_required": False,
         "condition_refresh_interval": 1,
         "action_horizon": 10,
@@ -61,7 +67,8 @@ def scientific_contract() -> dict[str, object]:
         ),
         "adaptation": VLACacheConfig().to_dict(),
         "comparison_note": (
-            "This is a method-faithful SimVLA adaptation because official "
-            "VLA-Cache does not publish a SimVLA integration."
+            "SimVLA adaptation of the pinned official OFT code. Connector budgets "
+            "and dense hidden reconstruction are explicit architecture adaptations, "
+            "not an official SimVLA reproduction."
         ),
     }
