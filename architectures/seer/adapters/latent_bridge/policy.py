@@ -13,7 +13,7 @@ from .checkpoint import load_bridge_checkpoint, validate_bridge_runtime_provenan
 from .dataset import BridgeTransition, StreamingBridgeTransitionWriter
 from .hooks import SeerBoundaryCapture
 from .layout import SeerTokenLayout
-from .provenance import PUBLIC_SEER_33_SHA256, require_file_hash, sha256_file
+from .provenance import expected_base_checkpoint_sha256, require_file_hash, sha256_file
 from .rendering import configured_renderer_backend
 
 
@@ -36,9 +36,9 @@ class LatentBridgePolicyMixin:
         checkpoint_path = Path(os.environ["SEER_LATENT_BRIDGE_CHECKPOINT"])
         bridge, payload = load_bridge_checkpoint(checkpoint_path, map_location="cpu")
         self._latent_bridge_provenance = validate_bridge_runtime_provenance(payload)
-        require_file_hash(
+        self._latent_bridge_base_checkpoint_sha256 = require_file_hash(
             os.environ["SEER_LATENT_BRIDGE_BASE_CHECKPOINT"],
-            PUBLIC_SEER_33_SHA256,
+            expected_base_checkpoint_sha256(),
             "Latent Bridge runtime base Seer checkpoint",
         )
         self._latent_bridge_payload = payload
@@ -81,7 +81,9 @@ class LatentBridgePolicyMixin:
             )
             self._sync_cuda()
             warmup_t0 = time.perf_counter()
-            with torch.inference_mode():
+            # Match the evaluator's no_grad context so torch.compile does not
+            # recompile on the first timed bridge call.
+            with torch.no_grad():
                 for _ in range(3):
                     self._latent_bridge(*dummy)
             self._sync_cuda()
@@ -330,7 +332,7 @@ class LatentBridgePolicyMixin:
                 ),
                 "stable_layer": self._latent_bridge_config.stable_layer,
                 "stable_token_group": self._latent_bridge_config.stable_token_group,
-                "base_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+                "base_checkpoint_sha256": self._latent_bridge_base_checkpoint_sha256,
                 "refresh_period": int(self.lrnode_query_interval),
                 "action_protocol": (
                     "three-token prediction with temporal ensembling; one executed action"
@@ -352,7 +354,7 @@ class LatentBridgePolicyMixin:
                     "bridge_checkpoint_sha256": sha256_file(
                         os.environ["SEER_LATENT_BRIDGE_CHECKPOINT"]
                     ),
-                    "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+                    "base_checkpoint_sha256": self._latent_bridge_base_checkpoint_sha256,
                     "stable_layer": self._latent_bridge_config.stable_layer,
                     "stable_token_group": self._latent_bridge_config.stable_token_group,
                     "renderer": self._latent_bridge_renderer,

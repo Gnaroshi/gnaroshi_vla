@@ -1407,29 +1407,25 @@ def evaluate_policy_ddp(args, model):
     control_hz = _eval_control_hz()
     settle_steps = _settle_steps(control_hz)
     env_horizon = _env_horizon(args.libero_eval_max_steps, settle_steps)
-    if "libero" in args.finetune_type:
-        if args.finetune_type == "libero_10":
-            global num_eval_episodes
-            global task_num
-            num_eval_episodes = int(os.environ.get("EVAL_NUM_EPISODES_PER_TASK", "20"))
-            task_num = int(os.environ.get("EVAL_NUM_TASKS", "10"))
-            if num_eval_episodes <= 0:
-                raise ValueError(f"EVAL_NUM_EPISODES_PER_TASK must be positive, got {num_eval_episodes}")
-            if task_num <= 0 or task_num > 10:
-                raise ValueError(f"EVAL_NUM_TASKS must be in [1, 10], got {task_num}")
+    if args.finetune_type not in benchmark_map:
+        raise NotImplementedError(f"unsupported LIBERO suite: {args.finetune_type}")
+    global num_eval_episodes
+    global task_num
+    num_eval_episodes = int(os.environ.get("EVAL_NUM_EPISODES_PER_TASK", "20"))
+    task_num = int(os.environ.get("EVAL_NUM_TASKS", "10"))
+    if num_eval_episodes <= 0:
+        raise ValueError(f"EVAL_NUM_EPISODES_PER_TASK must be positive, got {num_eval_episodes}")
+    if task_num <= 0 or task_num > 10:
+        raise ValueError(f"EVAL_NUM_TASKS must be in [1, 10], got {task_num}")
 
-            NUM_SEQUENCES = num_eval_episodes * task_num
-            eval_sequences = list(range(NUM_SEQUENCES))
-            interval_len = int(np.ceil(NUM_SEQUENCES / device_num))
-            eval_sequences = eval_sequences[
-                device_id * interval_len:min((device_id + 1) * interval_len, NUM_SEQUENCES)
-            ]
-            eval_sequence_ids = list(eval_sequences)
-            eval_sequences = tqdm(eval_sequence_ids)
-        else:
-            raise NotImplementedError
-    else:
-        raise NotImplementedError
+    NUM_SEQUENCES = num_eval_episodes * task_num
+    eval_sequences = list(range(NUM_SEQUENCES))
+    interval_len = int(np.ceil(NUM_SEQUENCES / device_num))
+    eval_sequences = eval_sequences[
+        device_id * interval_len:min((device_id + 1) * interval_len, NUM_SEQUENCES)
+    ]
+    eval_sequence_ids = list(eval_sequences)
+    eval_sequences = tqdm(eval_sequence_ids)
     for eval_id in eval_sequences:
         task_id = eval_id // num_eval_episodes
         exp_id = eval_id % num_eval_episodes

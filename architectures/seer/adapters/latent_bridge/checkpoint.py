@@ -12,7 +12,7 @@ from .bridge import SeerFeatureBridge, SeerFeatureBridgeConfig
 from .provenance import (
     OFFICIAL_COMMIT,
     OFFICIAL_MODEL_SHA256,
-    PUBLIC_SEER_33_SHA256,
+    expected_base_checkpoint_sha256,
     sha256_file,
 )
 
@@ -88,11 +88,14 @@ def validate_bridge_runtime_provenance(payload: dict) -> dict:
     }
     if mismatches:
         raise RuntimeError(f"bridge official-source provenance mismatch: {mismatches}")
-    base_hash = metadata.get("public_seer_checkpoint_sha256")
-    if base_hash != PUBLIC_SEER_33_SHA256:
+    base_hash = metadata.get(
+        "base_checkpoint_sha256", metadata.get("public_seer_checkpoint_sha256")
+    )
+    expected_base_hash = expected_base_checkpoint_sha256()
+    if base_hash != expected_base_hash:
         raise RuntimeError(
             "bridge base-checkpoint provenance mismatch: "
-            f"expected={PUBLIC_SEER_33_SHA256}, actual={base_hash}"
+            f"expected={expected_base_hash}, actual={base_hash}"
         )
     if not metadata.get("sync_files"):
         raise RuntimeError("bridge checkpoint does not identify synchronized training data")
@@ -102,7 +105,7 @@ def validate_bridge_runtime_provenance(payload: dict) -> dict:
         "stage": stage,
         "official_commit": official["commit"],
         "official_model_sha256": official["model_sha256"],
-        "public_seer_checkpoint_sha256": base_hash,
+        "base_checkpoint_sha256": base_hash,
         "sync_file_count": len(metadata["sync_files"]),
         "dagger_file_count": len(metadata.get("dagger_files", [])),
     }

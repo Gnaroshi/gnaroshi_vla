@@ -22,7 +22,7 @@ if ! latent_bridge_eval_row_is_complete "${calibration}" 42 2 10; then
     export LATENT_BRIDGE_STABLE_GROUP=visual
     latent_bridge_run_eval \
         architectures.seer.adapters.latent_bridge.continuity_entry \
-        "${calibration}" continuity_public33 42 2 10 "${MASTER_PORT_BASE:-18100}"
+        "${calibration}" "${LATENT_BRIDGE_RUN_LABEL}_continuity" 42 2 10 "${MASTER_PORT_BASE:-18100}"
 fi
 python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/aggregate_continuity.py" \
     --input-dir "${calibration}/shards"
@@ -54,7 +54,7 @@ if ! latent_bridge_eval_row_is_complete "${sync}" 42 30 10; then
     export LATENT_BRIDGE_STABLE_GROUP="${stable_group}"
     latent_bridge_run_eval \
         architectures.seer.adapters.latent_bridge.continuity_entry \
-        "${sync}" sync_public33 42 30 10 "$(( ${MASTER_PORT_BASE:-18100} + 10 ))"
+        "${sync}" "${LATENT_BRIDGE_RUN_LABEL}_sync" 42 30 10 "$(( ${MASTER_PORT_BASE:-18100} + 10 ))"
 fi
 find "${sync}/shards" -name 'sync_transitions_rank*.h5.manifest.json' -type f | sort > \
     "${sync}/transition_manifests.txt"

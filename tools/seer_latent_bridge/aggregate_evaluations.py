@@ -11,9 +11,6 @@ from pathlib import Path
 
 import numpy as np
 
-from architectures.seer.adapters.latent_bridge.provenance import PUBLIC_SEER_33_SHA256
-
-
 ACTION_PROTOCOL = "three-token prediction with temporal ensembling; one executed action"
 
 
@@ -68,11 +65,6 @@ def _validate_runtime_contract(name: str, summary: dict, manifest: dict) -> dict
         manifest["checkpoint_sha256"],
     )
     _require_equal(name, "action_protocol", runtime.get("action_protocol"), ACTION_PROTOCOL)
-    if manifest["checkpoint_sha256"] != PUBLIC_SEER_33_SHA256:
-        raise RuntimeError(
-            "manifest is not locked to public Seer checkpoint 33: "
-            f"{manifest['checkpoint_sha256']}"
-        )
     if expected_period == 1:
         _require_equal(name, "bridge_calls", int(runtime.get("bridge_calls", 0)), 0)
     else:

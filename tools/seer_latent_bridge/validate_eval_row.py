@@ -23,6 +23,7 @@ def validate_eval_row(
     episodes_per_task: int,
     num_tasks: int,
     renderer: str,
+    suite: str = "libero_10",
 ) -> dict:
     root = Path(root)
     analysis = root / "analysis"
@@ -50,6 +51,10 @@ def validate_eval_row(
         raise RuntimeError("evaluation row contains an unexpected execution seed")
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if summary.get("suite") != suite:
+        raise RuntimeError(
+            f"suite mismatch: expected={suite}, actual={summary.get('suite')!r}"
+        )
     runtime = summary.get("lrnode", {})
     if runtime.get("renderer_backend") != renderer:
         raise RuntimeError(
@@ -85,6 +90,7 @@ def validate_eval_row(
         "status": "SEER_LATENT_BRIDGE_EVAL_ROW_COMPLETE",
         "seed": seed,
         "renderer": renderer,
+        "suite": suite,
         "num_tasks": num_tasks,
         "episodes_per_task": episodes_per_task,
         "episodes": expected_count,
@@ -102,6 +108,7 @@ def main() -> None:
     parser.add_argument("--episodes-per-task", type=int, required=True)
     parser.add_argument("--num-tasks", type=int, required=True)
     parser.add_argument("--renderer", choices=("egl", "osmesa"), required=True)
+    parser.add_argument("--suite", required=True)
     parser.add_argument("--write-complete", action="store_true")
     args = parser.parse_args()
     root = Path(args.root)
@@ -111,6 +118,7 @@ def main() -> None:
         episodes_per_task=args.episodes_per_task,
         num_tasks=args.num_tasks,
         renderer=args.renderer,
+        suite=args.suite,
     )
     if args.write_complete:
         _atomic_text(root / "EVAL_COMPLETE", json.dumps(payload, indent=2) + "\n")

@@ -7,12 +7,20 @@ LATENT_BRIDGE_REPO_ROOT="$(cd "${LATENT_BRIDGE_WRAPPER_DIR}/../../../.." && pwd)
 LATENT_BRIDGE_SEER_UPSTREAM="${LATENT_BRIDGE_REPO_ROOT}/architectures/seer/upstream"
 LATENT_BRIDGE_OFFICIAL_SOURCE="${LATENT_BRIDGE_REPO_ROOT}/architectures/latent_bridge/upstream"
 
-LATENT_BRIDGE_PUBLIC33="${LATENT_BRIDGE_PUBLIC33:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/checkpoints_Seer_LIBERO_LONG/Seer/33.pth}"
+LATENT_BRIDGE_BASE_CHECKPOINT="${LATENT_BRIDGE_BASE_CHECKPOINT:-${LATENT_BRIDGE_PUBLIC33:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/checkpoints_Seer_LIBERO_LONG/Seer/33.pth}}"
+LATENT_BRIDGE_PUBLIC33="${LATENT_BRIDGE_BASE_CHECKPOINT}"
+LATENT_BRIDGE_BASE_CHECKPOINT_SHA256="${LATENT_BRIDGE_BASE_CHECKPOINT_SHA256:-a74f200bb91618a27cbb8e25bc6e1008647056ebe4155348095d63b658936646}"
 LATENT_BRIDGE_VIT="${LATENT_BRIDGE_VIT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/vit_mae/mae_pretrain_vit_base.pth}"
 LATENT_BRIDGE_DATASET_ROOT="${LATENT_BRIDGE_DATASET_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/seer_node2/LIBERO_DATASETS/libero_10_converted}"
+LATENT_BRIDGE_DATASET_NAME="${LATENT_BRIDGE_DATASET_NAME:-libero_10_converted}"
+LATENT_BRIDGE_DATASET_INFO="${LATENT_BRIDGE_DATASET_INFO:-${LATENT_BRIDGE_SEER_UPSTREAM}/data_info/libero_10_converted.json}"
 LATENT_BRIDGE_LIBERO_PATH="${LATENT_BRIDGE_LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
 LATENT_BRIDGE_RESULT_ROOT="${LATENT_BRIDGE_RESULT_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/latent_bridge/public33_libero_long}"
 LATENT_BRIDGE_RENDERER="${LATENT_BRIDGE_RENDERER:-osmesa}"
+LATENT_BRIDGE_SUITE="${LATENT_BRIDGE_SUITE:-libero_10}"
+LATENT_BRIDGE_RUN_LABEL="${LATENT_BRIDGE_RUN_LABEL:-seer_latent_bridge}"
+LATENT_BRIDGE_EXPECTED_CONDA_ENV="${LATENT_BRIDGE_EXPECTED_CONDA_ENV:-seer_libero}"
+LATENT_BRIDGE_EXPECTED_CUDA_VISIBLE_DEVICES="${LATENT_BRIDGE_EXPECTED_CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 
 case "${LATENT_BRIDGE_RENDERER}" in
     egl|osmesa) ;;
@@ -20,12 +28,18 @@ case "${LATENT_BRIDGE_RENDERER}" in
 esac
 
 export PYTHONPATH="${LATENT_BRIDGE_REPO_ROOT}:${PYTHONPATH:-}"
+export LATENT_BRIDGE_REPO_ROOT LATENT_BRIDGE_SEER_UPSTREAM
+export LATENT_BRIDGE_BASE_CHECKPOINT LATENT_BRIDGE_BASE_CHECKPOINT_SHA256
+export LATENT_BRIDGE_DATASET_ROOT LATENT_BRIDGE_DATASET_NAME LATENT_BRIDGE_DATASET_INFO
+export LATENT_BRIDGE_LIBERO_PATH LATENT_BRIDGE_RESULT_ROOT LATENT_BRIDGE_RENDERER
+export LATENT_BRIDGE_SUITE LATENT_BRIDGE_RUN_LABEL
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export LATENT_BRIDGE_RENDERER
 export PYOPENGL_PLATFORM="${LATENT_BRIDGE_RENDERER}"
 export MUJOCO_GL="${LATENT_BRIDGE_RENDERER}"
 export LIBERO_GL_BACKEND="${LATENT_BRIDGE_RENDERER}"
+export SEER_LATENT_BRIDGE_BASE_CHECKPOINT_SHA256="${LATENT_BRIDGE_BASE_CHECKPOINT_SHA256}"
 if [[ "${LATENT_BRIDGE_RENDERER}" == "egl" ]]; then
     export LIBERO_GL_REQUIRE_ACTUAL=1
 else
@@ -42,21 +56,31 @@ latent_bridge_fail() {
     exit 1
 }
 
-latent_bridge_require_runtime() {
-    [[ "${CONDA_DEFAULT_ENV:-}" == "seer_libero" ]] || \
-        latent_bridge_fail "activate conda environment seer_libero first"
-    [[ "${CUDA_VISIBLE_DEVICES:-}" == "4,5,6,7" ]] || \
-        latent_bridge_fail "CUDA_VISIBLE_DEVICES must be exactly 4,5,6,7 on sd1"
-    [[ -s "${LATENT_BRIDGE_PUBLIC33}" ]] || latent_bridge_fail "missing public33: ${LATENT_BRIDGE_PUBLIC33}"
+latent_bridge_require_base_runtime() {
+    [[ "${CONDA_DEFAULT_ENV:-}" == "${LATENT_BRIDGE_EXPECTED_CONDA_ENV}" ]] || \
+        latent_bridge_fail "activate conda environment ${LATENT_BRIDGE_EXPECTED_CONDA_ENV} first"
+    [[ "${CUDA_VISIBLE_DEVICES:-}" == "${LATENT_BRIDGE_EXPECTED_CUDA_VISIBLE_DEVICES}" ]] || \
+        latent_bridge_fail "CUDA_VISIBLE_DEVICES must be ${LATENT_BRIDGE_EXPECTED_CUDA_VISIBLE_DEVICES}"
+    [[ -s "${LATENT_BRIDGE_BASE_CHECKPOINT}" ]] || \
+        latent_bridge_fail "missing base checkpoint: ${LATENT_BRIDGE_BASE_CHECKPOINT}"
+    [[ "$(sha256sum "${LATENT_BRIDGE_BASE_CHECKPOINT}" | awk '{print $1}')" == \
+        "${LATENT_BRIDGE_BASE_CHECKPOINT_SHA256}" ]] || \
+        latent_bridge_fail "base checkpoint SHA256 mismatch: ${LATENT_BRIDGE_BASE_CHECKPOINT}"
     [[ -s "${LATENT_BRIDGE_VIT}" ]] || latent_bridge_fail "missing ViT-MAE: ${LATENT_BRIDGE_VIT}"
-    [[ -s "${LATENT_BRIDGE_DATASET_ROOT}/libero_10_converted/meta_info.h5" ]] || \
+    [[ -s "${LATENT_BRIDGE_DATASET_ROOT}/${LATENT_BRIDGE_DATASET_NAME}/meta_info.h5" ]] || \
         latent_bridge_fail "invalid converted dataset root: ${LATENT_BRIDGE_DATASET_ROOT}"
+    [[ -s "${LATENT_BRIDGE_DATASET_INFO}" ]] || \
+        latent_bridge_fail "missing converted dataset info: ${LATENT_BRIDGE_DATASET_INFO}"
     [[ -d "${LATENT_BRIDGE_LIBERO_PATH}/libero/libero" ]] || \
         latent_bridge_fail "invalid LIBERO path: ${LATENT_BRIDGE_LIBERO_PATH}"
     [[ -e "${LATENT_BRIDGE_OFFICIAL_SOURCE}/.git" ]] || \
         latent_bridge_fail "official Latent Bridge source is absent"
     [[ "${NODE_NUM:-4}" == "4" ]] || \
         latent_bridge_fail "the locked training/evaluation contract requires NODE_NUM=4"
+}
+
+latent_bridge_require_runtime() {
+    latent_bridge_require_base_runtime
 }
 
 latent_bridge_next_backup() {
@@ -127,7 +151,7 @@ latent_bridge_eval_row_is_complete() {
     python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/validate_eval_row.py" \
         --root "${output_root}" --seed "${seed}" \
         --episodes-per-task "${episodes_per_task}" --num-tasks "${num_tasks}" \
-        --renderer "${LATENT_BRIDGE_RENDERER}" >/dev/null
+        --renderer "${LATENT_BRIDGE_RENDERER}" --suite "${LATENT_BRIDGE_SUITE}" >/dev/null
 }
 
 latent_bridge_prepare_eval_row() {
@@ -150,7 +174,7 @@ latent_bridge_prepare_eval_row() {
 latent_bridge_common_eval_args() {
     local seed="$1"
     printf '%s\0' \
-        --rgb_pad -1 --gripper_pad -1 \
+        --rgb_pad 10 --gripper_pad 4 --traj_cons \
         --gradient_accumulation_steps 1 \
         --bf16_module vision_encoder \
         --vit_checkpoint_path "${LATENT_BRIDGE_VIT}" \
@@ -160,14 +184,14 @@ latent_bridge_common_eval_args() {
         --batch_size 64 --precision fp32 --weight_decay 1e-4 \
         --num_resampler_query 6 --num_obs_token_per_image 9 \
         --transformer_layers 24 --transformer_heads 12 --hidden_dim 384 \
-        --phase evaluate --finetune_type libero_10 \
+        --phase evaluate --finetune_type "${LATENT_BRIDGE_SUITE}" \
         --save_checkpoint_path "${LATENT_BRIDGE_RESULT_ROOT}/unused_checkpoints" \
         --action_pred_steps 3 --future_steps 3 --sequence_length 7 \
         --obs_pred --gripper_width --eval_libero_ensembling \
         --ensembling_temp 0.01 --multi_step_action 1 \
         --lrnode_eval_profile_full_action_head 1 \
-        --libero_img_size 224 --libero_eval_max_steps 600 \
-        --resume_from_checkpoint "${LATENT_BRIDGE_PUBLIC33}"
+        --libero_img_size 128 --libero_eval_max_steps 600 \
+        --resume_from_checkpoint "${LATENT_BRIDGE_BASE_CHECKPOINT}"
 }
 
 latent_bridge_run_eval() {
@@ -184,8 +208,8 @@ latent_bridge_run_eval() {
     mkdir -p "${output_root}/analysis"
     export LOG_DIR="${output_root}"
     export RUN_NAME="${run_name}"
-    export CKPT_TAG="public33"
-    export SEER_LATENT_BRIDGE_BASE_CHECKPOINT="${LATENT_BRIDGE_PUBLIC33}"
+    export CKPT_TAG="${LATENT_BRIDGE_RUN_LABEL}"
+    export SEER_LATENT_BRIDGE_BASE_CHECKPOINT="${LATENT_BRIDGE_BASE_CHECKPOINT}"
     export EVAL_CONTROL_HZ=20
     export EVAL_NUM_EPISODES_PER_TASK="${episodes_per_task}"
     export EVAL_NUM_TASKS="${num_tasks}"
@@ -208,7 +232,8 @@ latent_bridge_run_eval() {
     if python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/validate_eval_row.py" \
         --root "${output_root}" --seed "${seed}" \
         --episodes-per-task "${episodes_per_task}" --num-tasks "${num_tasks}" \
-        --renderer "${LATENT_BRIDGE_RENDERER}" --write-complete; then
+        --renderer "${LATENT_BRIDGE_RENDERER}" --suite "${LATENT_BRIDGE_SUITE}" \
+        --write-complete; then
         if [[ "${eval_rc}" -ne 0 ]]; then
             echo "[WARN] evaluator exited rc=${eval_rc}, but all expected artifacts passed validation"
         fi

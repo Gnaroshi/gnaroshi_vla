@@ -21,7 +21,7 @@ if ! latent_bridge_eval_row_is_complete "${stage}" 42 30 10; then
     master_port="${MASTER_PORT:-$((base_port + 30))}"
     latent_bridge_run_eval \
         architectures.seer.adapters.latent_bridge.evaluation_entry \
-        "${stage}" dagger_f3_public33 42 30 10 "${master_port}"
+        "${stage}" "${LATENT_BRIDGE_RUN_LABEL}_dagger_f3" 42 30 10 "${master_port}"
 fi
 find "${stage}/shards" -name 'dagger_transitions_rank*.h5.manifest.json' -type f | sort > \
     "${stage}/transition_manifests.txt"

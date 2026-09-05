@@ -22,6 +22,7 @@ import os
 import random
 import re
 import pickle
+from pathlib import Path
 from multiprocessing import Value
 from functools import partial
 import json
@@ -1863,8 +1864,12 @@ class BaseLiberoDataset(Dataset):
         self.act_step = act_step
         logger.info(f"loading dataset at {root_dir}/{dataset_name}")
         logger.info("finished loading dataset")
-        assert os.path.exists(f"./data_info/{self.dataset_info}.json")
-        with open(f"./data_info/{self.dataset_info}.json", 'r') as f:
+        dataset_info_path = Path(self.dataset_info)
+        if not dataset_info_path.is_absolute():
+            dataset_info_path = Path("./data_info") / f"{self.dataset_info}.json"
+        if not dataset_info_path.is_file():
+            raise FileNotFoundError(f"Missing LIBERO episode metadata: {dataset_info_path}")
+        with dataset_info_path.open('r', encoding='utf-8') as f:
             self.episode_info_list = json.load(f)
             self.episode_list = [f[0] for f in self.episode_info_list]
             self.num_step_per_episode = [f[1] - self.max_window_size for f in self.episode_info_list]
@@ -2363,7 +2368,11 @@ def get_libero_pretrain_dataset(args, image_processor, tokenizer, epoch=0, floor
 
 
 def get_libero_finetune_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
-    dataset_names = ["libero_10_converted"]
+    dataset_name = str(getattr(args, "libero_dataset_name", "libero_10_converted"))
+    if not dataset_name:
+        raise ValueError("libero_dataset_name cannot be empty")
+    dataset_names = [dataset_name]
+    dataset_info = str(getattr(args, "libero_dataset_info_path", "")) or dataset_name
     shared_epoch = SharedEpoch(epoch=epoch)
     preprocess_image_fn = functools.partial(
         preprocess_image, image_processor=image_processor
@@ -2388,7 +2397,7 @@ def get_libero_finetune_dataset(args, image_processor, tokenizer, epoch=0, floor
         max_window_size=args.max_window_size,
         primary_mode=args.primary_mode,
         small_size=args.small_size,
-        dataset_info='libero_10_converted',
+        dataset_info=dataset_info,
         gripper_width=args.gripper_width,
         load_libero_file=args.load_libero_file,
     )

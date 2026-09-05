@@ -22,7 +22,8 @@ for seed in "${seeds[@]}"; do
     mkdir -p "${seed_root}"
     manifest="${seed_root}/exact_manifest.json"
     python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/make_eval_manifest.py" \
-        --libero-path "${LATENT_BRIDGE_LIBERO_PATH}" --checkpoint "${LATENT_BRIDGE_PUBLIC33}" \
+        --libero-path "${LATENT_BRIDGE_LIBERO_PATH}" --checkpoint "${LATENT_BRIDGE_BASE_CHECKPOINT}" \
+        --suite "${LATENT_BRIDGE_SUITE}" \
         --output "${manifest}" --seed "${seed}" --num-tasks "${num_tasks}" \
         --episodes-per-task "${episodes_per_task}" \
         --renderer "${LATENT_BRIDGE_RENDERER}" --reuse-if-matching
@@ -32,7 +33,7 @@ for seed in "${seeds[@]}"; do
         "${baseline}" "${seed}" "${episodes_per_task}" "${num_tasks}"; then
         latent_bridge_run_eval \
             architectures.seer.adapters.latent_bridge.baseline_entry \
-            "${baseline}" "public33_compute_matched_f1_seed${seed}" "${seed}" \
+            "${baseline}" "${LATENT_BRIDGE_RUN_LABEL}_f1_seed${seed}" "${seed}" \
             "${episodes_per_task}" "${num_tasks}" "${port}"
     fi
     port=$((port + 10))
@@ -48,7 +49,7 @@ for seed in "${seeds[@]}"; do
             unset SEER_LATENT_BRIDGE_DAGGER_OUTPUT || true
             latent_bridge_run_eval \
                 architectures.seer.adapters.latent_bridge.evaluation_entry \
-                "${row}" "public33_compute_matched_f${period}_seed${seed}" "${seed}" \
+                "${row}" "${LATENT_BRIDGE_RUN_LABEL}_f${period}_seed${seed}" "${seed}" \
                 "${episodes_per_task}" "${num_tasks}" "${port}"
         fi
         port=$((port + 10))
@@ -79,8 +80,11 @@ latency_output="${stage}/component_latency_rtx3090.json"
 if ! latent_bridge_json_has_status "${latency_output}" "PASS"; then
     [[ ! -e "${latency_output}" ]] || latent_bridge_archive_partial "${latency_output}"
     python "${LATENT_BRIDGE_REPO_ROOT}/tools/seer_latent_bridge/latency_benchmark.py" \
-        --checkpoint "${LATENT_BRIDGE_PUBLIC33}" --vit-checkpoint "${LATENT_BRIDGE_VIT}" \
+        --checkpoint "${LATENT_BRIDGE_BASE_CHECKPOINT}" --vit-checkpoint "${LATENT_BRIDGE_VIT}" \
         --dataset-root "${LATENT_BRIDGE_DATASET_ROOT}" --libero-path "${LATENT_BRIDGE_LIBERO_PATH}" \
+        --dataset-name "${LATENT_BRIDGE_DATASET_NAME}" \
+        --dataset-info "${LATENT_BRIDGE_DATASET_INFO}" \
+        --checkpoint-sha256 "${LATENT_BRIDGE_BASE_CHECKPOINT_SHA256}" \
         --bridge-checkpoint "${bridge}" --output "${latency_output}"
 fi
 printf 'SEER_LATENT_BRIDGE_EFFICIENT_EVALUATION_COMPLETE\n' > "${stage}/COMPLETE"

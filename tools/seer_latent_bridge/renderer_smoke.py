@@ -21,6 +21,8 @@ def main() -> None:
     parser.add_argument("--libero-path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--renderer", choices=("egl", "osmesa"), required=True)
+    parser.add_argument("--suite", default="libero_10")
+    parser.add_argument("--image-size", type=int, default=128)
     args = parser.parse_args()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -33,13 +35,13 @@ def main() -> None:
     from libero.libero import benchmark
     from libero.libero.envs import OffScreenRenderEnv
 
-    suite = benchmark.get_benchmark_dict()["libero_10"]()
+    suite = benchmark.get_benchmark_dict()[args.suite]()
     task = suite.get_task(0)
     bddl = Path(args.libero_path) / "libero/libero/bddl_files" / task.problem_folder / task.bddl_file
     init_path = Path(args.libero_path) / "libero/libero/init_files" / task.problem_folder / task.init_states_file
     init_states = torch.load(init_path)
     env = OffScreenRenderEnv(
-        bddl_file_name=str(bddl), camera_heights=224, camera_widths=224,
+        bddl_file_name=str(bddl), camera_heights=args.image_size, camera_widths=args.image_size,
         render_gpu_device_id=renderer_gpu_device_id(0), control_freq=20, horizon=620,
     )
     try:
@@ -52,13 +54,16 @@ def main() -> None:
             "wrist": np.asarray(obs["robot0_eye_in_hand_image"]),
             "next_primary": np.asarray(next_obs["agentview_image"]),
         }
-        if any(image.shape != (224, 224, 3) for image in images.values()):
+        expected_shape = (args.image_size, args.image_size, 3)
+        if any(image.shape != expected_shape for image in images.values()):
             raise RuntimeError(f"unexpected renderer image shapes: {[v.shape for v in images.values()]}")
         if any(float(image.std()) == 0.0 for image in images.values()):
             raise RuntimeError("renderer returned a constant image")
         payload = {
             "status": "PASS",
+            "suite": args.suite,
             "renderer": args.renderer,
+            "image_size": args.image_size,
             "task": task.name,
             "bddl_sha256": hashlib.sha256(bddl.read_bytes()).hexdigest(),
             "init_states_sha256": hashlib.sha256(init_path.read_bytes()).hexdigest(),

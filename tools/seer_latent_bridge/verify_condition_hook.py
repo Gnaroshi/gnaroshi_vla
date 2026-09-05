@@ -27,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--vit-checkpoint", required=True)
     parser.add_argument("--dataset-root", required=True)
+    parser.add_argument("--dataset-name", default="libero_10_converted")
+    parser.add_argument("--dataset-info", default="")
+    parser.add_argument("--checkpoint-sha256", required=True)
     parser.add_argument("--libero-path", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -57,6 +60,9 @@ def main() -> None:
         vit_checkpoint=args.vit_checkpoint,
         dataset_root=args.dataset_root,
         libero_path=args.libero_path,
+        checkpoint_sha256=args.checkpoint_sha256,
+        dataset_name=args.dataset_name,
+        dataset_info_path=args.dataset_info,
     )
     provenance = validate_runtime_spec(spec)
     model, checkpoint = build_seer_model(spec, device=args.device, seed=args.seed)
@@ -138,7 +144,7 @@ def main() -> None:
         f"- Action condition: final `ln_f`, current timestep action slice, shape `[1, {layout.action_tokens}, 384]`",
         "- State input: current end-effector position/orientation (6) plus two gripper positions (2).",
         "- Action input to the bridge: previous executed LIBERO action, shape `[1, 7]`.",
-        "- The batch uses Seer's converted-data reader and CLIP/MAE preprocessing with random shifts disabled.",
+        "- The batch uses Seer's converted-data reader and canonical trajectory-consistent image shifts (RGB 10, wrist 4).",
         "- The original Seer action head is reused; no substitute decoder is involved.",
         "",
         "## Shapes",

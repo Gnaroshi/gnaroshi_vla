@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -12,6 +14,19 @@ OFFICIAL_COMMIT = "ed556014aa96bae8ed85768194f02360389b9365"
 OFFICIAL_MODEL_SHA256 = "df19ff70722347c071fd08244875867d9b8110b76735e72ee50053fbd3351da7"
 PUBLIC_SEER_33_SHA256 = "a74f200bb91618a27cbb8e25bc6e1008647056ebe4155348095d63b658936646"
 SEER_VIT_MAE_SHA256 = "aec5f0b68e5f3193a00b07bc65a37440db549c15b36b8bea242606cc40c4bc5d"
+
+
+def expected_base_checkpoint_sha256() -> str:
+    """Return the launcher's hash-locked Seer checkpoint identity."""
+
+    value = os.environ.get(
+        "SEER_LATENT_BRIDGE_BASE_CHECKPOINT_SHA256", PUBLIC_SEER_33_SHA256
+    ).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(
+            "SEER_LATENT_BRIDGE_BASE_CHECKPOINT_SHA256 must be a lowercase SHA256"
+        )
+    return value
 
 
 def sha256_file(path: str | Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:

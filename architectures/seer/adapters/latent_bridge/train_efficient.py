@@ -32,7 +32,7 @@ from .checkpoint import (
     validate_bridge_runtime_provenance,
 )
 from .dataset import BridgeTransitionDataset
-from .provenance import PUBLIC_SEER_33_SHA256, sha256_file, verify_official_source
+from .provenance import expected_base_checkpoint_sha256, sha256_file, verify_official_source
 from .train import ExactDistributedEvalSampler, _audit_transition_files, _dataset_files
 
 
@@ -399,11 +399,12 @@ def main() -> None:
     if dist.is_initialized():
         dist.barrier()
 
+    base_checkpoint_sha256 = expected_base_checkpoint_sha256()
     base_metadata = {
         "training_protocol": contract.protocol,
         "contract": contract.__dict__,
         "official_source": official,
-        "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+        "base_checkpoint_sha256": base_checkpoint_sha256,
         "parameter_audit": bridge.parameter_audit(),
         "sync_files": sync_records,
         "dagger_files": dagger_records,
@@ -426,7 +427,7 @@ def main() -> None:
         keys = (
             "training_protocol",
             "contract",
-            "public_seer_checkpoint_sha256",
+            "base_checkpoint_sha256",
             "sync_files",
             "dagger_files",
             "precision",

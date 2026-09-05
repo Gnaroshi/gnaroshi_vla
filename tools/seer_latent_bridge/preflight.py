@@ -33,6 +33,10 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--vit-checkpoint", required=True)
     parser.add_argument("--dataset-root", required=True)
+    parser.add_argument("--dataset-name", default="libero_10_converted")
+    parser.add_argument("--dataset-info", default="")
+    parser.add_argument("--checkpoint-sha256", required=True)
+    parser.add_argument("--suite", default="libero_10")
     parser.add_argument("--libero-path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--visible-devices", default="4,5,6,7")
@@ -59,6 +63,9 @@ def main() -> None:
         vit_checkpoint=args.vit_checkpoint,
         dataset_root=args.dataset_root,
         libero_path=args.libero_path,
+        checkpoint_sha256=args.checkpoint_sha256,
+        dataset_name=args.dataset_name,
+        dataset_info_path=args.dataset_info,
     )
     runtime_provenance = validate_runtime_spec(runtime)
     official = verify_official_source(args.official_source)
@@ -66,7 +73,7 @@ def main() -> None:
     state = checkpoint["model_state_dict"]
     key = "module.obs_tokens" if "module.obs_tokens" in state else "obs_tokens"
     if key not in state or tuple(state[key].shape) != (1, 1, 18, 384):
-        raise RuntimeError("public33 observation-token contract changed")
+        raise RuntimeError("Seer observation-token contract changed")
 
     # These values were independently verified from the public checkpoint and
     # real-batch hook; preflight makes accidental CLI drift fail closed.
@@ -115,11 +122,16 @@ def main() -> None:
         },
         "allowed_visible_devices": args.visible_devices,
         "renderer": args.renderer,
+        "suite": args.suite,
         "source_files": {
             str(path.relative_to(repo)): sha256_file(path)
             for path in sorted(
                 list((repo / "architectures/seer/adapters/latent_bridge").glob("*.py"))
-                + [repo / "architectures/seer/upstream/utils/eval_utils_libero.py"]
+                + [
+                    repo / "architectures/seer/upstream/eval_libero.py",
+                    repo / "architectures/seer/upstream/utils/data_utils.py",
+                    repo / "architectures/seer/upstream/utils/eval_utils_libero.py",
+                ]
             )
         },
     }

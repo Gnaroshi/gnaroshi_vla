@@ -305,7 +305,12 @@ def main():
         save_lrnode_run_snapshots(args, ddp_model, analysis_dir, repo_dir=os.getcwd())
 
     ddp_model.eval()
-    if args.finetune_type == "libero_10":
+    if args.finetune_type in {
+        "libero_10",
+        "libero_spatial",
+        "libero_object",
+        "libero_goal",
+    }:
         eval_one_epoch_libero_ddp(
             args=args,
             model=ddp_model,

@@ -7,7 +7,7 @@ import os
 import torch
 
 from .determinism import configure_deterministic_inference
-from .provenance import PUBLIC_SEER_33_SHA256, require_file_hash
+from .provenance import expected_base_checkpoint_sha256, require_file_hash
 from .rendering import configured_renderer_backend
 from .runtime import seer_import_context
 
@@ -57,7 +57,7 @@ def main() -> None:
         raise RuntimeError("SEER_LATENT_BRIDGE_BASE_CHECKPOINT is required")
     checkpoint_hash = require_file_hash(
         checkpoint,
-        PUBLIC_SEER_33_SHA256,
+        expected_base_checkpoint_sha256(),
         "Latent Bridge baseline Seer checkpoint",
     )
     determinism = configure_deterministic_inference()

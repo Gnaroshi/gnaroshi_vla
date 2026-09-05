@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--num-tasks", type=int, default=10)
     parser.add_argument("--episodes-per-task", type=int, default=20)
     parser.add_argument("--renderer", choices=("osmesa", "egl"), default="osmesa")
+    parser.add_argument("--suite", default="libero_10")
     parser.add_argument("--reuse-if-matching", action="store_true")
     args = parser.parse_args()
     output = Path(args.output)
@@ -40,7 +41,7 @@ def main() -> None:
     sys.path.insert(0, args.libero_path)
     from libero.libero import benchmark
 
-    suite = benchmark.get_benchmark_dict()["libero_10"]()
+    suite = benchmark.get_benchmark_dict()[args.suite]()
     episodes = []
     for task_id in range(args.num_tasks):
         task = suite.get_task(task_id)
@@ -67,7 +68,7 @@ def main() -> None:
             )
     payload = {
         "schema_version": 1,
-        "suite": "libero_10",
+        "suite": args.suite,
         "renderer": args.renderer,
         "seed": args.seed,
         "checkpoint": str(Path(args.checkpoint).resolve()),
@@ -82,7 +83,10 @@ def main() -> None:
             "ensembling_temperature": 0.01,
             "control_frequency_hz": 20,
             "max_policy_steps": 600,
-            "observation_preprocessing": "Seer upstream CLIP/MAE evaluation path",
+            "observation_preprocessing": (
+                "Seer upstream CLIP/MAE evaluation path; image=128; "
+                "rgb_pad=10; gripper_pad=4; traj_cons=true"
+            ),
         },
         "episodes": episodes,
     }

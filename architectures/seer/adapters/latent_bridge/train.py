@@ -27,7 +27,7 @@ from .checkpoint import (
     validate_bridge_runtime_provenance,
 )
 from .dataset import BridgeTransitionDataset
-from .provenance import PUBLIC_SEER_33_SHA256, sha256_file, verify_official_source
+from .provenance import expected_base_checkpoint_sha256, sha256_file, verify_official_source
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -292,10 +292,11 @@ def main() -> None:
     dagger_audit = _audit_transition_files(dagger_files, config) if dagger_files else None
     sync_records = [{"path": str(path), "sha256": sha256_file(path)} for path in sync_files]
     dagger_records = [{"path": str(path), "sha256": sha256_file(path)} for path in dagger_files]
+    base_checkpoint_sha256 = expected_base_checkpoint_sha256()
     base_metadata = {
         "contract": contract.__dict__,
         "official_source": official,
-        "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+        "base_checkpoint_sha256": base_checkpoint_sha256,
         "parameter_audit": bridge.parameter_audit(),
         "sync_files": sync_records,
         "dagger_files": dagger_records,
@@ -313,7 +314,7 @@ def main() -> None:
         resume_metadata = resume_payload.get("metadata", {})
         expected_resume_fields = {
             "contract": base_metadata["contract"],
-            "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+            "base_checkpoint_sha256": base_checkpoint_sha256,
             "sync_files": sync_records,
             "dagger_files": dagger_records,
             "precision": args.precision,

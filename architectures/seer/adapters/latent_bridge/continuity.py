@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from .dataset import BridgeTransition, StreamingBridgeTransitionWriter
 from .hooks import SeerBoundaryCapture
 from .layout import SeerTokenLayout
-from .provenance import PUBLIC_SEER_33_SHA256
+from .provenance import expected_base_checkpoint_sha256
 from .rendering import configured_renderer_backend
 
 
@@ -50,6 +50,7 @@ class ContinuityModelWrapperMixin:
     """Mixin applied to upstream ``ModelWrapper`` without modifying upstream."""
 
     def _continuity_initialize(self) -> None:
+        self._continuity_base_checkpoint_sha256 = expected_base_checkpoint_sha256()
         self._continuity_renderer = configured_renderer_backend()
         base = self.model.module if hasattr(self.model, "module") else self.model
         self._continuity_layout = SeerTokenLayout.from_model(base)
@@ -233,7 +234,7 @@ class ContinuityModelWrapperMixin:
                     "rank": self._continuity_rank,
                     "stable_layer": self._continuity_stable_layer,
                     "stable_token_group": self._continuity_stable_group,
-                    "public_seer_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+                    "base_checkpoint_sha256": self._continuity_base_checkpoint_sha256,
                     "eval_seed": self._continuity_eval_seed,
                     "renderer": self._continuity_renderer,
                     "action_protocol": "three-token prediction with temporal ensembling; one executed action",
@@ -256,7 +257,7 @@ class ContinuityModelWrapperMixin:
             {
                 "method": "frozen_seer_continuity_collection",
                 "renderer_backend": self._continuity_renderer,
-                "base_checkpoint_sha256": PUBLIC_SEER_33_SHA256,
+                "base_checkpoint_sha256": self._continuity_base_checkpoint_sha256,
                 "refresh_period": 1,
                 "action_protocol": (
                     "three-token prediction with temporal ensembling; one executed action"

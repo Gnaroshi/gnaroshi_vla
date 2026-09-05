@@ -51,6 +51,9 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--vit-checkpoint", required=True)
     parser.add_argument("--dataset-root", required=True)
+    parser.add_argument("--dataset-name", default="libero_10_converted")
+    parser.add_argument("--dataset-info", default="")
+    parser.add_argument("--checkpoint-sha256", required=True)
     parser.add_argument("--libero-path", required=True)
     parser.add_argument("--bridge-checkpoint", required=True)
     parser.add_argument("--output", required=True)
@@ -67,6 +70,9 @@ def main() -> None:
         vit_checkpoint=args.vit_checkpoint,
         dataset_root=args.dataset_root,
         libero_path=args.libero_path,
+        checkpoint_sha256=args.checkpoint_sha256,
+        dataset_name=args.dataset_name,
+        dataset_info_path=args.dataset_info,
     )
     model, _ = build_seer_model(spec, device=device)
     inputs, batch_audit = build_real_libero_batch(spec, model, device=device)

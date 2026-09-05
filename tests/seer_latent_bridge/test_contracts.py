@@ -362,8 +362,9 @@ def test_eval_row_validation_checks_exact_episode_identity(tmp_path: Path):
         writer.writerows(rows)
     (analysis / "eval_summary.json").write_text(
         json.dumps(
-            {
-                "success_rate": 0.5,
+                {
+                    "suite": "libero_10",
+                    "success_rate": 0.5,
                 "lrnode": {"renderer_backend": "egl"},
                 "environment": {
                     "renderer": {

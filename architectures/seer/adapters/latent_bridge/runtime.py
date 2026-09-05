@@ -26,6 +26,9 @@ class SeerRuntimeSpec:
     vit_checkpoint: str
     dataset_root: str
     libero_path: str
+    checkpoint_sha256: str = PUBLIC_SEER_33_SHA256
+    dataset_name: str = "libero_10_converted"
+    dataset_info_path: str = ""
     sequence_length: int = 7
     num_resampler_query: int = 6
     num_obs_token_per_image: int = 9
@@ -84,21 +87,28 @@ def _strip_ddp_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Te
 
 
 def validate_runtime_spec(spec: SeerRuntimeSpec) -> dict:
-    checkpoint_hash = require_file_hash(spec.checkpoint, PUBLIC_SEER_33_SHA256, "public Seer 33")
+    checkpoint_hash = require_file_hash(
+        spec.checkpoint, spec.checkpoint_sha256, "Seer base checkpoint"
+    )
     vit_hash = require_file_hash(spec.vit_checkpoint, SEER_VIT_MAE_SHA256, "Seer ViT-MAE")
-    dataset = Path(spec.dataset_root) / "libero_10_converted"
+    dataset = Path(spec.dataset_root) / spec.dataset_name
     metadata = dataset / "meta_info.h5"
     if not metadata.is_file():
         raise FileNotFoundError(
-            "dataset_root must contain libero_10_converted/meta_info.h5; "
+            f"dataset_root must contain {spec.dataset_name}/meta_info.h5; "
             f"missing {metadata}"
         )
+    dataset_info = Path(spec.dataset_info_path) if spec.dataset_info_path else None
+    if dataset_info is not None and not dataset_info.is_file():
+        raise FileNotFoundError(f"missing converted-dataset metadata: {dataset_info}")
     if not (Path(spec.libero_path) / "libero/libero").is_dir():
         raise FileNotFoundError(f"invalid LIBERO repository: {spec.libero_path}")
     return {
         "checkpoint_sha256": checkpoint_hash,
         "vit_checkpoint_sha256": vit_hash,
         "dataset_metadata": str(metadata),
+        "dataset_name": spec.dataset_name,
+        "dataset_info_path": str(dataset_info) if dataset_info else "",
         "libero_path": str(Path(spec.libero_path).resolve()),
     }
 
@@ -176,12 +186,14 @@ def build_real_libero_batch(
 
     seed_everything(seed)
     args = SimpleNamespace(
-        rgb_pad=-1,
-        gripper_pad=-1,
-        traj_cons=False,
+        rgb_pad=10,
+        gripper_pad=4,
+        traj_cons=True,
         text_aug=False,
         multi_step_action=1,
         root_dir=spec.dataset_root,
+        libero_dataset_name=spec.dataset_name,
+        libero_dataset_info_path=spec.dataset_info_path,
         image_primary_size=224,
         image_wrist_size=224,
         window_size=spec.sequence_length,
