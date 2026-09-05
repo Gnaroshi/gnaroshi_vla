@@ -244,3 +244,39 @@ def test_selection_diagnostics_do_not_change_reusable_tokens():
     reference, debug = reusable_visual_positions(**kwargs, diagnostics=True)
     assert torch.equal(selected, reference)
     assert report["reusable_count"] == len(debug["reusable_positions"])
+
+
+def test_prepared_indices_match_reference_with_nonmonotone_pruning(monkeypatch):
+    model, _ = _tiny_decoder()
+    fast = IndexedReuseDecoder(model, VLACacheConfig(), diagnostics=True)
+    slow = IndexedReuseDecoder(copy.deepcopy(model), VLACacheConfig(), optimized=False, diagnostics=True)
+    schedule = torch.ones(16)
+    schedule[[2, 6, 9, 11]] = torch.tensor([0.75, 0.25, 0.75, 1.])
+    monkeypatch.setattr("architectures.simvla.adapters.vla_cache.smolvlm_runtime.layer_reuse_schedule",
+                        lambda *args, **kwargs: schedule)
+    with torch.no_grad():
+        first = torch.randn(1, 12, 32)
+        fast.forward(first, reusable_positions=None)
+        slow.forward(first, reusable_positions=None)
+        candidates = torch.tensor([6, 1, 0, 4, 1])
+        plan = fast.prepare_query(candidates, sequence_length=12, device=first.device)
+        assert set(plan.gathers) == {2, 11}
+        assert plan.reusable.tolist() == [0, 1, 4, 6]
+        second = torch.randn_like(first)
+        actual = fast.forward(second, reusable_positions=candidates, prepared_plan=plan)
+        expected = slow.forward(second, reusable_positions=candidates)
+        assert actual.report == expected.report
+        assert torch.equal(actual.hidden_states, expected.hidden_states)
+        for left, right in zip(fast.cache.layers, slow.cache.layers):
+            assert torch.equal(left.keys, right.keys)
+            assert torch.equal(left.values, right.values)
+
+
+@pytest.mark.parametrize("invalid", [[-1], [12]])
+def test_prepared_indices_reject_out_of_range(invalid):
+    _, runtime = _tiny_decoder()
+    with torch.no_grad():
+        inputs = torch.randn(1, 12, 32)
+        runtime.forward(inputs, reusable_positions=None)
+        with pytest.raises(ValueError, match="out of bounds"):
+            runtime.prepare_query(torch.tensor(invalid), sequence_length=12, device=inputs.device)

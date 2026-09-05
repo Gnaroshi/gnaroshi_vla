@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 from .official_contract import VLACacheConfig
 
-IMPLEMENTATION_VERSION = "oft_fidelity_v2"
+IMPLEMENTATION_VERSION = "oft_runtime_v3"
 OFFICIAL_NORM_SHA256 = "5e4dcf9026271137e102f6f784d345f0f03c1fd9963b679631b110a16788149e"
 
 
@@ -52,6 +52,7 @@ def scientific_contract() -> dict[str, object]:
         "implementation_version": IMPLEMENTATION_VERSION,
         "task_relevance_queries": "valid tokenizer text positions; native model mask unchanged",
         "entropy_maps": "all actual decoder layers; no metadata sentinel",
+        "sparse_runtime": "selection before vision; precomputed gather indices; unchanged selected tokens",
         "dense_condition_reconstruction": "previous final hidden at removed positions",
         "training_required": False,
         "condition_refresh_interval": 1,

@@ -37,8 +37,21 @@ sparse computation, optimized-versus-reference equality, and H=10/R=5 queue
 behavior. Encoder timing is diagnostic, not an end-to-end speedup claim.
 
 Run the same wrapper with `--all` to verify and then evaluate only VLA-Cache:
-LIBERO-Long, 10 tasks x 50 trials x 3 seeds. It writes new `oft_fidelity_v2`
+LIBERO-Long, 10 tasks x 50 trials x 3 seeds. It writes new `oft_runtime_v3`
 results and refuses to mix different adapter source versions. Completed
 rows are skipped on restart. The outer tmux wrapper returns zero to preserve
 the pane; `pipeline.status` and the inner launcher's exit status retain errors.
 No success-rate threshold stops the sweep.
+
+The runtime resolves token selection and gather indices before launching the
+current vision encoder. Decoder layers use precomputed index gathers instead
+of boolean indexing that synchronizes CUDA to resolve dynamic output sizes.
+The reference implementation remains available with `optimized=False` for
+condition, action, and K/V equivalence checks.
+
+`tools/simvla/profile_vla_cache.py` measures native SDPA, native eager, a
+no-reuse adapter control, and sparse reuse on the same frozen model and real
+observations. Profiler traces and uninstrumented wall timings are separate.
+Policy timings include preprocessing, ten flow steps and five returned
+actions, but exclude environment stepping. These bounded measurements are
+not replacements for full-suite success rates or paper latency measurements.

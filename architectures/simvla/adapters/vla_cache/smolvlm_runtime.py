@@ -22,6 +22,13 @@ class DecoderResult:
     report: dict[str, Any]
 
 
+@dataclass
+class SparseQueryPlan:
+    reusable: torch.Tensor
+    selections: dict[int, list[int]]
+    gathers: dict[int, tuple[torch.Tensor, torch.Tensor]]
+
+
 class IndexedReuseDecoder:
     """Run current tokens while retaining prior K/V at removed positions."""
 
@@ -50,6 +57,36 @@ class IndexedReuseDecoder:
         self.sequence_length: int | None = None
         self.reuse_age: torch.Tensor | None = None
         self.last_report: dict[str, Any] = {}
+
+    def prepare_query(self, reusable_positions, *, sequence_length, device):
+        """Resolve variable-length indices before launching this query's model."""
+        candidates = [] if self.cache is None or reusable_positions is None else sorted(set(reusable_positions.tolist()))
+        if candidates and (candidates[0] < 0 or candidates[-1] >= sequence_length):
+            raise ValueError("reusable token position is out of bounds")
+        ratios = layer_reuse_schedule(self.previous_attentions, growth_factor=self.config.positive_growth_factor).tolist() if candidates else None
+        selected_by_layer, gathers = {}, {}
+        packed = list(candidates)
+        offsets = {}
+        active = list(range(sequence_length))
+        removed_count = 0
+        for layer in self.config.pruning_layers:
+            if not candidates:
+                break
+            selected = candidates[:max(1, int(ratios[layer] * len(candidates)))]
+            selected_by_layer[layer] = selected
+            if len(selected) > removed_count:
+                excluded = set(selected)
+                keep = [i for i, position in enumerate(active) if position not in excluded]
+                active = [active[i] for i in keep]
+                offsets[layer] = (len(packed), len(keep))
+                packed.extend(keep)
+                packed.extend(active)
+                removed_count = len(selected)
+        # One asynchronous transfer, instead of per-layer boolean nonzero/sync.
+        indices = torch.tensor(packed, dtype=torch.long).to(device, non_blocking=True)
+        for layer, (start, count) in offsets.items():
+            gathers[layer] = (indices[start:start + count], indices[start + count:start + 2 * count])
+        return SparseQueryPlan(indices[:len(candidates)], selected_by_layer, gathers)
 
     def previous_visual_importance(
         self,
@@ -96,6 +133,7 @@ class IndexedReuseDecoder:
         inputs_embeds: torch.Tensor,
         *,
         reusable_positions: torch.Tensor | None,
+        prepared_plan: SparseQueryPlan | None = None,
     ) -> DecoderResult:
         if inputs_embeds.ndim != 3 or inputs_embeds.shape[0] != 1:
             raise ValueError("VLA-Cache inference supports batch size one")
@@ -105,12 +143,18 @@ class IndexedReuseDecoder:
         self.sequence_length = sequence_length
         full_positions = torch.arange(sequence_length, device=inputs_embeds.device)
         first_query = self.cache is None
+        plan = prepared_plan
+        if self.optimized and plan is None:
+            plan = self.prepare_query(reusable_positions, sequence_length=sequence_length, device=inputs_embeds.device)
         if first_query:
             self.cache = StaticCache(
                 config=self.text_model.config,
                 max_cache_len=sequence_length,
             )
             reusable = full_positions[:0]
+            schedule = None
+        elif plan is not None:
+            reusable = plan.reusable
             schedule = None
         else:
             if self.previous_full_hidden is None or self.previous_attentions is None:
@@ -152,19 +196,30 @@ class IndexedReuseDecoder:
                 and reusable.numel()
                 and layer_index in self.config.pruning_layers
             ):
-                assert schedule is not None
-                proportion = schedule[layer_index]
-                selected_count = max(1, int(proportion * reusable.numel()))
-                selected = reusable[:selected_count]
-                if removed.numel() < selected.numel():
-                    keep = ~torch.isin(active_positions, selected)
-                    hidden_states = hidden_states[:, keep]
-                    active_positions = active_positions[keep]
-                    removed = selected
-                    causal_mask = causal_mask[:, :, keep, :]
-                    position_embeddings = tuple(value[:, active_positions] for value in full_position_embeddings)
-                if self.diagnostics:
-                    selected_per_pruning_layer[str(layer_index)] = selected.tolist()
+                if plan is not None:
+                    selected = plan.selections[layer_index]
+                    if layer_index in plan.gathers:
+                        keep, active_positions = plan.gathers[layer_index]
+                        hidden_states = hidden_states.index_select(1, keep)
+                        removed = reusable[:len(selected)]
+                        causal_mask = causal_mask.index_select(2, keep)
+                        position_embeddings = tuple(value.index_select(1, active_positions) for value in full_position_embeddings)
+                    if self.diagnostics:
+                        selected_per_pruning_layer[str(layer_index)] = selected
+                else:
+                    assert schedule is not None
+                    proportion = schedule[layer_index]
+                    selected_count = max(1, int(proportion * reusable.numel()))
+                    selected = reusable[:selected_count]
+                    if removed.numel() < selected.numel():
+                        keep = ~torch.isin(active_positions, selected)
+                        hidden_states = hidden_states[:, keep]
+                        active_positions = active_positions[keep]
+                        removed = selected
+                        causal_mask = causal_mask[:, :, keep, :]
+                        position_embeddings = tuple(value[:, active_positions] for value in full_position_embeddings)
+                    if self.diagnostics:
+                        selected_per_pruning_layer[str(layer_index)] = selected.tolist()
 
             active_tokens_per_layer.append(int(active_positions.numel()))
             query_positions.append(active_positions.detach())
@@ -330,7 +385,6 @@ class SimVLAVLACacheBackbone:
         ):
             self.reset()
         assert self.text_decoder is not None
-        inputs_embeds = self._inputs_embeds(image_input, image_mask, input_ids)
         valid_images = image_input[0, image_mask[0].bool()].detach()
         similarity_images = self._rgb_for_similarity(valid_images)
         visual_tokens = valid_images.shape[0] * self.config.visual_tokens_per_view
@@ -354,9 +408,14 @@ class SimVLAVLACacheBackbone:
                 config=self.config,
                 diagnostics=self.diagnostics,
             )
+        plan = self.text_decoder.prepare_query(
+            reusable, sequence_length=visual_tokens + input_ids.shape[1], device=input_ids.device,
+        ) if self.text_decoder.optimized else None
+        inputs_embeds = self._inputs_embeds(image_input, image_mask, input_ids)
         result = self.text_decoder.forward(
             inputs_embeds,
             reusable_positions=reusable,
+            prepared_plan=plan,
         )
         self.previous_images = similarity_images
         self.previous_input_ids = input_ids.detach().clone()
