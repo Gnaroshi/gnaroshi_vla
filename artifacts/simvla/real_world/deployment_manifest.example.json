@@ -2,7 +2,7 @@
   "schema_version": 4,
   "deployment_id": "replace-with-reviewed-deployment-id",
   "simvla_upstream_commit": "32700d0ad8991996e123e4b685abe370ce6e9aab",
-  "runtime_source_identity_sha256": "87b1ed09ddfd880998001994f6497dc3b8104185899efe14f96ac8e38e57f42e",
+  "runtime_source_identity_sha256": "f10f0dd9ad0c12732b354d699e005ae1ac27c0e51b11a04d57aa1bbcc7637036",
   "artifacts": {
     "official_base_model_directory": {
       "path": "./official_base_model",

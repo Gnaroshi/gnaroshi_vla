@@ -129,6 +129,7 @@ def summarize_rows(rows):
         "selection_metric": "episode_macro_first5_action_l1",
         "selection_score": sum(x["first5_action_l1"] for x in episodes.values()) / len(episodes),
         "robot_success_measured": False,
+        "precision": "float32_no_autocast_matches_real_deployment",
         "evaluation": "held-out observations; fixed per-window noise; fresh H10 Euler10; first R5 action error",
     }
 
@@ -143,7 +144,8 @@ def validate(model, processor, loader, device, output, step, seed):
             inputs = inputs_for(batch, processor, device)
             target = inputs.pop("action")
             noise, tau = sample_noise(batch["episode_id"], batch["frame_index"], seed, device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            # Select checkpoints with the FP32 arithmetic used by live policies.
+            with torch.autocast(device_type=device.type, enabled=False):
                 condition = model.forward_vlm_efficient(
                     inputs["image_input"], inputs["image_mask"], inputs["input_ids"]
                 )["vlm_features"]
@@ -255,6 +257,9 @@ def run(args):
             norm_stats=norm, device=context.device, freeze_vlm=False,
             freeze_action_transformer=False,
         )
+        # from_pretrained leaves the parent in eval even if children are enabled.
+        # Validation restores this mode, so set the entire joint model first.
+        model.train()
         if args.gradient_checkpointing:
             enable_checkpointing(model)
         train_data = RealSimVLADataset(manifest_path, split="train", training=False)
@@ -278,6 +283,8 @@ def run(args):
             "dataset_identity_sha256": dataset_manifest["dataset_identity_sha256"],
             "norm_stats_sha256": sha256_file(norm), "official_base": base.to_dict(),
             "augmentation": "none; identical image processing at training and deployment",
+            "training_precision": "bfloat16_autocast_on_cuda",
+            "validation_precision": "float32_no_autocast_matches_real_deployment",
             "action_transformer_reinitialized": False,
             "task_success_claim": False,
             "torch_version": str(torch.__version__), "hostname": socket.gethostname(),

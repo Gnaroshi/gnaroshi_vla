@@ -137,7 +137,7 @@
       "architectures/simvla/adapters/latentloop_real_deploy/hardware.py": "c7c33e7024d1b7e37dfc47b6a3c3899fa955f87f219802de01d9bce9e59f4aeb",
       "architectures/simvla/adapters/real_world_training/dataset.py": "362fd5f42fd2b4b7859eb83556b2c428cd40c210d9dace58f555a1d128a24c37",
       "architectures/simvla/adapters/real_world_training/model_io.py": "3b145a58401e929cbcee2e61e03098cb5a10e3300ec3eba1b5c86aae9765051c",
-      "architectures/simvla/adapters/real_world_training/train_joint_baseline.py": "44b81a8d8cff60331ad75d4c4ae0954f9e4f3650b511846e2fd465b6a9ba10a2"
+      "architectures/simvla/adapters/real_world_training/train_joint_baseline.py": "69bfc4e61c0fe01234faad76097096b56418d198a0a81cddc4af73d1cd4061b5"
     }
   },
   "operator_authorization": "user_confirmed_emergency_stop_and_requested_direct_baseline_and_ours"

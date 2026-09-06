@@ -66,6 +66,7 @@ class TinyModel(torch.nn.Module):
         return {"vlm_features": self.vlm(image_input[:, :1, :1])}
 
     def forward(self, image_input, image_mask, input_ids, proprio, action):
+        assert self.training and self.vlm.training and self.transformer.training
         condition = self.forward_vlm_efficient(image_input, image_mask, input_ids)["vlm_features"]
         noise = torch.randn_like(action)
         prediction = self.transformer(condition, noise, proprio, torch.ones(len(action)))
@@ -96,10 +97,14 @@ def test_action_evaluation_includes_eight_episodes_and_is_repeatable(tmp_path):
     first = joint.validate(model, PROCESSOR, loader, torch.device("cpu"), tmp_path, 0, 42)
     second = joint.validate(model, PROCESSOR, loader, torch.device("cpu"), tmp_path, 1, 42)
     assert first == second
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        nested = joint.validate(model, PROCESSOR, loader, torch.device("cpu"), tmp_path, 2, 42)
+    assert first == nested
     assert len(first["episodes"]) == 8
     assert first["windows"] == 24
     assert model.training
     assert first["robot_success_measured"] is False
+    assert first["precision"] == "float32_no_autocast_matches_real_deployment"
     assert first["selection_metric"] == "episode_macro_first5_action_l1"
 
 
@@ -129,7 +134,8 @@ def test_joint_checkpoint_restores_vlm_and_head(tmp_path):
         model_io.load_real_action_payload(path)
 
 
-def test_train_save_interrupt_resume_matches_uninterrupted(tmp_path, monkeypatch):
+@pytest.mark.parametrize("loaded_parent_training", [True, False])
+def test_train_save_interrupt_resume_matches_uninterrupted(tmp_path, monkeypatch, loaded_parent_training):
     from architectures.simvla.adapters.real_world_training import artifact_validation
     from architectures.simvla.adapters.real_world_training.distributed import DistributedContext
     norm = tmp_path / "real_norm.json"
@@ -138,7 +144,14 @@ def test_train_save_interrupt_resume_matches_uninterrupted(tmp_path, monkeypatch
     monkeypatch.setattr(artifact_validation, "validate_real_dataset_manifest", lambda *a, **kw: manifest)
     monkeypatch.setattr(joint, "RealSimVLADataset", TinyDataset)
     monkeypatch.setattr(joint, "initialize_distributed", lambda _: DistributedContext(0, 0, 1, torch.device("cpu"), False))
-    monkeypatch.setattr(joint, "load_exact_official_model", lambda **kw: (TinyModel(), PROCESSOR, {}))
+    def load_model(**kwargs):
+        model = TinyModel().train(loaded_parent_training)
+        # HF sets the parent to eval; the shared loader enables its children.
+        model.vlm.train()
+        model.transformer.train()
+        return model, PROCESSOR, {}
+
+    monkeypatch.setattr(joint, "load_exact_official_model", load_model)
     monkeypatch.setattr(joint, "enable_checkpointing", lambda _: None)
     monkeypatch.setattr(joint, "official_base_identity", lambda *a: model_io.OfficialBaseIdentity("base", "sha", "processor", "libero_joint", 10, 1024, 24))
     args = joint.parser().parse_args(["--dataset", str(tmp_path), "--checkpoint", "base", "--processor", "processor",
@@ -205,4 +218,3 @@ def test_outcome_home_permit_is_only_enabled_by_worker_after_save(monkeypatch, c
     assert ("allow_home" in calls) == (cancel is None)
     if cancel is None:
         assert calls.index("saved") < calls.index("allow_home")
-
