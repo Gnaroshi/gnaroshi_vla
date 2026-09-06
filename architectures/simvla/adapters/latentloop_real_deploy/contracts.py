@@ -341,6 +341,8 @@ def _validate_hardware_runtime(payload: Mapping[str, Any]) -> None:
         source = str(robot.get(key, "")).strip()
         if not source:
             raise ValueError(f"hardware.robot.{key} is required")
+    if robot.get("safety_profile", "reviewed_workspace") not in {"reviewed_workspace", "seer_doll"}:
+        raise ValueError("Unknown robot safety_profile")
     workspace = _require_mapping(robot, "workspace_m")
     for key in ("min", "max"):
         values = workspace.get(key)
@@ -401,6 +403,8 @@ def _validate_hardware_runtime(payload: Mapping[str, Any]) -> None:
 
     runtime = _require_mapping(payload, "runtime")
     _require_number(runtime, "control_frequency_hz", positive=True)
+    if "training_sample_hz" in runtime:
+        _require_number(runtime, "training_sample_hz", positive=True)
     if not isinstance(runtime.get("max_steps"), int) or runtime["max_steps"] < 1:
         raise ValueError("runtime.max_steps must be a positive integer")
     if not isinstance(runtime.get("seed"), int):
@@ -582,8 +586,9 @@ def _validate_dataset_cache_semantics(
         raise ValueError("real dataset does not use the predeclared train/validation split")
     if dataset.get("dataset_identity_sha256") != pairing["dataset_identity"]:
         raise ValueError("dataset identity differs from deployment pairing")
-    if float(dataset.get("target_hz", -1)) != float(runtime["control_frequency_hz"]):
-        raise ValueError("dataset sampling rate and deployment control rate differ")
+    sample_hz = runtime.get("training_sample_hz", runtime["control_frequency_hz"])
+    if float(dataset.get("target_hz", -1)) != float(sample_hz):
+        raise ValueError("dataset sampling rate and declared training sample rate differ")
     if dataset.get("action_horizon") != policy["action_horizon"]:
         raise ValueError("dataset and deployment action horizons differ")
     if dataset.get("execution_horizon") != policy["execution_horizon"]:
@@ -846,10 +851,13 @@ def hardware_configuration_issues(contract: DeploymentContract) -> list[str]:
     robot = hardware["robot"]
     cameras = hardware["cameras"]
     review = contract.payload["safety_review"]
+    site_managed = robot.get("safety_profile") == "seer_doll"
     issues: list[str] = []
     if str(robot["ip"]).startswith("replace-with-"):
         issues.append("robot IP is still a template value")
     for key in ("home_pose_source", "workspace_source"):
+        if site_managed and key == "workspace_source":
+            continue
         if str(robot[key]).startswith("replace-with-"):
             issues.append(f"robot {key} is still a template value")
     for name in ("exterior", "wrist"):
@@ -861,6 +869,8 @@ def hardware_configuration_issues(contract: DeploymentContract) -> list[str]:
         "task_home_pose_verified",
         "workspace_bounds_verified",
     ):
+        if site_managed and key == "workspace_bounds_verified":
+            continue
         if not bool(review.get(key)):
             issues.append(f"{key} is not true")
     return issues
@@ -948,6 +958,7 @@ def require_live_authorization(
     contract: DeploymentContract, *, deployment_method: str
 ) -> None:
     review = contract.payload["safety_review"]
+    site_managed = contract.hardware["robot"].get("safety_profile") == "seer_doll"
     failures = []
     failures.extend(hardware_configuration_issues(contract))
     if not contract.live_authorized:
@@ -966,13 +977,18 @@ def require_live_authorization(
         failures.append("physical_emergency_stop_verified is not true")
     if not bool(review.get("runtime_timing_reviewed")):
         failures.append("runtime_timing_reviewed is not true")
-    if deployment_method != "baseline" and not bool(
+    if not site_managed and deployment_method != "baseline" and not bool(
         review.get("baseline_bounded_canary_passed")
     ):
         failures.append("baseline_bounded_canary_passed is not true")
     tracking = contract.hardware["robot"]["control"]["tracking_error_guard"]
-    if not bool(tracking.get("enabled")):
+    if not site_managed and not bool(tracking.get("enabled")):
         failures.append("tracking_error_guard.enabled is not true")
+    if site_managed:
+        if os.environ.get("SIMVLA_REAL_SITE_PROFILE") != "seer_doll":
+            failures.append("SIMVLA_REAL_SITE_PROFILE=seer_doll is absent")
+        if contract.payload.get("site_profile_authorization") != "user_requested_existing_seer_doll_hardware":
+            failures.append("Seer Doll site profile was not explicitly selected")
     if not str(review.get("approved_by", "")).strip():
         failures.append("approved_by is empty")
     if not str(review.get("approved_at", "")).strip():

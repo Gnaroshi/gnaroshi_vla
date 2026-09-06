@@ -124,3 +124,54 @@ def test_report_selection_does_not_select_other_method(tmp_path):
         (run / "output/result.json").write_text("{}")
     path, _ = launcher.completed_report(tmp_path, "artifact-preflight_baseline", "result.json")
     assert path.parent.parent.name == "artifact-preflight_baseline"
+
+
+def test_site_profile_requires_local_physical_stop_confirmation(evidence, monkeypatch):
+    contract, _, _ = evidence
+    preset = {
+        "deployment_id": contract.deployment_id,
+        "robot": copy.deepcopy(contract.hardware["robot"]),
+        "cameras": {**copy.deepcopy(contract.hardware["cameras"]), "fps": 60},
+        "provenance": {"source": "unit-test"}, "target_control_hz": 60,
+    }
+    preset["robot"]["control"].pop("tracking_error_guard")
+    for confirmed in (False, True):
+        payload = launcher.seer_site_payload(contract, preset, 700, confirmed=confirmed)
+        assert payload["runtime"]["control_frequency_hz"] == 60
+        assert payload["runtime"]["training_sample_hz"] == 15
+        assert payload["safety_review"]["workspace_bounds_verified"] is False
+        assert payload["safety_review"]["physical_emergency_stop_verified"] is confirmed
+        assert payload["hardware"]["robot"]["control"]["tracking_error_guard"]["enabled"] is False
+        for key in ("artifacts", "policy", "action", "state", "pairing"):
+            assert payload[key] == contract.payload[key]
+        candidate = DeploymentContract(contract.path, payload, contract.artifacts)
+        monkeypatch.setenv("SIMVLA_REAL_LIVE_RUN", "1")
+        monkeypatch.setenv("SIMVLA_REAL_DEPLOYMENT_ID", contract.deployment_id)
+        monkeypatch.setenv("SIMVLA_REAL_SITE_PROFILE", "seer_doll")
+        if confirmed:
+            require_live_authorization(candidate, deployment_method="baseline")
+        else:
+            with pytest.raises(PermissionError, match="physical_emergency_stop_verified"):
+                require_live_authorization(candidate, deployment_method="baseline")
+    candidate.payload["safety_review"]["physical_emergency_stop_verified"] = False
+    with pytest.raises(PermissionError, match="physical_emergency_stop_verified"):
+        require_live_authorization(candidate, deployment_method="baseline")
+    candidate.payload["safety_review"]["physical_emergency_stop_verified"] = True
+    monkeypatch.delenv("SIMVLA_REAL_SITE_PROFILE")
+    with pytest.raises(PermissionError, match="SITE_PROFILE"):
+        require_live_authorization(candidate, deployment_method="baseline")
+
+
+def test_runtime_revision_only_accepts_reviewed_four_files():
+    preset = json.loads(launcher.SITE_PROFILE.read_text())
+    revision = preset["runtime_revision"]
+    current = launcher.runtime_source_identity()
+    contract = SimpleNamespace(payload={"runtime_source_identity_sha256": current["combined_sha256"]})
+    previous = launcher.sha256_json(revision["previous_files"])
+    launcher.verify_runtime_revision(contract, previous, revision)
+    invalid = copy.deepcopy(revision)
+    invalid["reviewed_files"][next(iter(invalid["reviewed_files"]))] = "bad"
+    with pytest.raises(ValueError):
+        launcher.verify_runtime_revision(contract, previous, invalid)
+    with pytest.raises(ValueError):
+        launcher.verify_runtime_revision(contract, "bad", revision)

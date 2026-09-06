@@ -691,6 +691,56 @@ def test_live_requires_manifest_and_two_environment_confirmations(tmp_path, monk
     require_live_authorization(contract, deployment_method="latentloop")
 
 
+def test_execution_target_rate_is_separate_from_training_sample_rate(tmp_path):
+    path = _manifest(tmp_path)
+    payload = json.loads(path.read_text())
+    original_artifacts = dict(payload["artifacts"])
+    payload["runtime"]["training_sample_hz"] = payload["runtime"]["control_frequency_hz"]
+    payload["runtime"]["control_frequency_hz"] = 60
+    path.write_text(json.dumps(payload))
+    contract = load_deployment_contract(path)
+    assert contract.payload["artifacts"] == original_artifacts
+    assert contract.runtime["control_frequency_hz"] == 60
+    payload["runtime"]["training_sample_hz"] = 999
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="sampling rate"):
+        load_deployment_contract(path)
+
+
+def test_disabling_workspace_does_not_disable_invalid_action_or_stop_checks(monkeypatch):
+    calls = []
+    monkeypatch.setattr(legacy_deploy.UR5eDeployEnv, "step", lambda *args: calls.append(args))
+    environment = object.__new__(SafeUR5eDeployEnv)
+    environment._command_lock = threading.RLock()
+    environment._motion_abort = threading.Event()
+    environment._policy_commands_armed = True
+    environment._cancel_next_disarmed_policy_step = False
+    environment._workspace_min = np.zeros(3)
+    environment._workspace_max = np.ones(3)
+    environment._workspace_guard_enabled = True
+    environment._tracking_guard_enabled = False
+    environment._last_commanded_tcp = None
+    environment._upstream_reference_target = None
+    environment.rtde_rec = SimpleNamespace(getActualTCPPose=lambda: [2.0, 0.5, 0.5, 0, 0, 0])
+    target = np.asarray([2.0, 0.5, 0.5, 0, 0, 0])
+    with pytest.raises(RuntimeError, match="workspace"):
+        environment.step(target, 1.0)
+    assert not calls
+    environment._workspace_guard_enabled = False
+    environment.step(target, 1.0)
+    assert len(calls) == 1
+    with pytest.raises(RuntimeError, match="non-finite"):
+        environment.step(np.full(6, np.nan), 1.0)
+    assert len(calls) == 1
+    environment._motion_abort.set()
+    environment.step(target, 1.0)
+    assert len(calls) == 1
+    environment._motion_abort.clear()
+    with pytest.raises(RuntimeError, match="no live rollout is armed"):
+        environment.step(target, 1.0)
+    assert len(calls) == 1
+
+
 def test_hardware_connection_requires_explicit_review(tmp_path):
     contract = load_deployment_contract(_manifest(tmp_path))
     with pytest.raises(PermissionError, match="hardware_configuration_reviewed"):

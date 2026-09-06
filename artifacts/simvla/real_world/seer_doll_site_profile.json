@@ -1,0 +1,141 @@
+{
+  "deployment_id": "stackcupanddoll_simvla_real_v2_corrected",
+  "target_control_hz": 60,
+  "robot": {
+    "ip": "192.168.56.101",
+    "home_pose": [
+      3.14,
+      -1.57,
+      1.57,
+      -1.57,
+      -1.57,
+      -1.57,
+      0
+    ],
+    "gripper": {
+      "command_mode": "continuous_position_with_crossing_lock",
+      "force": 10,
+      "min_command_delta": 3,
+      "min_command_period_s": 0.05,
+      "open_position_threshold": 0.1,
+      "speed": 255,
+      "startup_force_open_steps": 50,
+      "status_lock_steps": 10
+    },
+    "control": {
+      "acceleration": 0.5,
+      "home_move_duration_s": 3,
+      "home_move_hz": 60,
+      "servoj_gain": 100,
+      "servoj_lookahead_s": 0.2,
+      "servoj_time_s": 0.002,
+      "velocity": 0.5
+    }
+  },
+  "cameras": {
+    "exterior": {
+      "serial": "243722072499"
+    },
+    "fps": 60,
+    "height": 480,
+    "model_input_order": [
+      "exterior",
+      "wrist"
+    ],
+    "width": 640,
+    "wrist": {
+      "serial": "342222070922"
+    }
+  },
+  "provenance": {
+    "host": "robotics",
+    "reference_scripts": [
+      {
+        "path": "/home/jbr/gnaroshi_vla/architectures/seer/upstream/scripts/REAL/deploy_ll_gui_doll_v2.sh",
+        "sha256": "741f4ae208562c8c2e80711dc599317e28ad3f9725c2a88013acb64456cac866"
+      },
+      {
+        "path": "/home/jbr/gnaroshi_vla/architectures/seer/third_party/3dflow_real_deploy/deploy.py",
+        "sha256": "ff6d3f518f0681688105804d635a4598ecb916bc31d50fb5d6367f567feb6d85"
+      }
+    ],
+    "user_authorization": "User explicitly approved disabling the additional workspace/tracking guards, confirmed that the physical emergency stop is prepared, and requested direct baseline and Ours GUI deployment without an extra confirmation dialog. GUI Start is still required for arm motion.",
+    "home_pose_note": "Seer legacy seventh home value -1.57 is clipped to 0.0 gripper target. Six arm joints unchanged.",
+    "model_note": "No Seer checkpoint, state tensor, normalization, temporal window, or training configuration is used. SimVLA action H10/R5 and training sample rate remain unchanged.",
+    "runtime_revision_note": "Existing model/sensor checks are reused with the same weights, preprocessing and forward functions. This revision changes hardware-profile gating, target-rate validation and command-Hz reporting only; it is not a new robot rollout."
+  },
+  "runtime_revision": {
+    "previous_files": {
+      "architectures/simvla/adapters/dcld/__init__.py": "3c8c2996d39ef38cb363e37bf5c180a4fb31d081aeb61007da093997688bdb6e",
+      "architectures/simvla/adapters/dcld/simvla_action_adapter.py": "06be94de845bec9d19ac7502863f63f1bafab70f09441254a99a8d4a22a5405a",
+      "architectures/simvla/adapters/dcld/simvla_condition_adapter.py": "f99f336250606070a52729f5f8afe5437c708ed871b85a21aed1d84d8fbb6636",
+      "architectures/simvla/adapters/dcld/simvla_dcld_distill_trainer.py": "36e0404a871ef20c84c2aed28d3a9d92572e8b03ddc23665c3e4519e1eb830a8",
+      "architectures/simvla/adapters/dcld/simvla_dcld_eval_wrapper.py": "e3b939b52f7ef991e5894b319edc69a3ca42a3d8dadb7894d912471fe14fa96f",
+      "architectures/simvla/adapters/dcld/simvla_delta_obs_adapter.py": "a5dfa089f1c26cbf08a61cc20cca05d3f673216851e12afe5217fa86fa3b7568",
+      "architectures/simvla/adapters/dcld/simvla_teacher_cache.py": "67ebceb726ed4e906c05f76ae287aaeb34a4af69847cc722d5c1c13befa6dd41",
+      "architectures/simvla/adapters/latentloop/efficient_multirate/contracts.py": "377849e6f4d2d984063398161590719a7d84c147cc0de3b05eed6b23819424e9",
+      "architectures/simvla/adapters/latentloop/efficient_multirate/coupled_condition_generation.py": "6a28ded3e0750abdcb72b701c0939c4581bb5e0d3341fbb75848d33c33434e77",
+      "architectures/simvla/adapters/latentloop/efficient_multirate/generation_hidden.py": "58ae5666b9783e5428866032b8a99e0978282dfeeec3eb8c3f259389931af7f1",
+      "architectures/simvla/adapters/latentloop/efficient_multirate/generation_policy.py": "2c1fd5bc027c1923909ed55f8569087159dfbefffb8913c7102bf1d7c1d1ef27",
+      "architectures/simvla/adapters/latentloop/native_v0_condition_hook.py": "5ef8d2776e2317c728e2e50f7aa4167b5841ba6d70b072ceb076b7b708d89c67",
+      "architectures/simvla/adapters/latentloop/native_v0_policy.py": "50a5485d108c9eb2a3b7d65a2b3f0ffad86975de2f5dac7230ad6b5304e0e163",
+      "architectures/simvla/adapters/latentloop_real_deploy/__init__.py": "2301190cf4899391b05febacf6322b3afa2a3793c797b0da537786ffcd0db02d",
+      "architectures/simvla/adapters/latentloop_real_deploy/bootstrap.py": "05393f2f049afd6204ad9c7f36fcc304b1a568a2f0085e87886659bcf822b9d4",
+      "architectures/simvla/adapters/latentloop_real_deploy/cli.py": "2bffc8f7b876a1b5d81a7ef31f06d0d769ae2f31e16114b3ea1e2ab88c81804c",
+      "architectures/simvla/adapters/latentloop_real_deploy/contracts.py": "fcd828b0d436d63741b186c748416f62684d5e8dbbed4adc8b9979f160778552",
+      "architectures/simvla/adapters/latentloop_real_deploy/controller.py": "12f0dd1d6c98a091301fae8a4fbb052cc9bda8a7655d5c0c0cc6214d14611f67",
+      "architectures/simvla/adapters/latentloop_real_deploy/deploy_gui.py": "8658a43e4a48d2c438bfff380219893b4c615d252ee44b96eadd47ec7f6ef299",
+      "architectures/simvla/adapters/latentloop_real_deploy/environment.py": "36b65863691f296dad590db5cc80e160e633d67d08d7d4aed74e479d22e3b9b5",
+      "architectures/simvla/adapters/latentloop_real_deploy/hardware.py": "fb233ed959e125ff6a2c21316105fc1a51de981f04049e318f1d3ac4e7ba0f90",
+      "architectures/simvla/adapters/latentloop_real_deploy/policy.py": "e59d3c635fa6b6d1ac3f6da11017e93803b17b898f612baa66311fd751aa1537",
+      "architectures/simvla/adapters/latentloop_real_deploy/preparation.py": "cb61160b8e2d1b25c0dcd4111002e7860cc3abf733ab32b5e4a826db6eb0a24e",
+      "architectures/simvla/adapters/latentloop_real_deploy/runtime.py": "4aab9ca0b7bf190d5ce8beb8d6ae8a339a847c20fd30f513591b8c71f3210450",
+      "architectures/simvla/adapters/latentloop_real_deploy/source_lock.py": "b2433ce02ad3449c12ea53a1a3153a8ad28aba2ea60c554c87360c066e1165f9",
+      "architectures/simvla/adapters/real_world_training/__init__.py": "9336d0115acb227c5e3d011c88cf017e747f5ea325ec0d91e03e63370c646489",
+      "architectures/simvla/adapters/real_world_training/artifact_validation.py": "9029de330d202decfeee293a50be07990d09b993c375842f535267da93c1bd43",
+      "architectures/simvla/adapters/real_world_training/build_deployment_bundle.py": "fdb4b18408a3ef25b26d81f85fe5d346a18ef9601ed0e9e12ae27ec0275646b3",
+      "architectures/simvla/adapters/real_world_training/build_deployment_manifest.py": "9625235f0f861e4fec042d62f0ea9ce29834e5f140e58771ed78ea488fc95ed9",
+      "architectures/simvla/adapters/real_world_training/condition_cache.py": "c3326a882c37b9c2a0ea96bb3ad389066c29f761bce4c7e21c578e44a15d0f68",
+      "architectures/simvla/adapters/real_world_training/convert_dataset.py": "82b4a0fb217b4eb9ce24ae605e6c846b9c23b9db8502f0f7258ed9857457e678",
+      "architectures/simvla/adapters/real_world_training/dataset.py": "f965a7133d5d4e48501acba517611594f7009653e7f9d3a85f758304c238b8fc",
+      "architectures/simvla/adapters/real_world_training/distributed.py": "19410f2bbf292ce8d2ca79b5708daf7cac101ac7b496f13c4ac2d47ef7845ce3",
+      "architectures/simvla/adapters/real_world_training/geometry.py": "ae1d1bbbf2ffd6a0d7efeef0031257077cf02529a48c95466062412bb4a9a545",
+      "architectures/simvla/adapters/real_world_training/io_utils.py": "113fe936a60e88af425a5a848326874707536e43902fc18ad1b4477c05e3f109",
+      "architectures/simvla/adapters/real_world_training/migrate_condition_cache.py": "859882809267ac2ece592d0ffb8c6e94acad2104e48cde696d4545f1479c0973",
+      "architectures/simvla/adapters/real_world_training/model_io.py": "c5af65dd90f5f9bb18bd96405720fd430806fb49e02943f8c9103a20d43b7c36",
+      "architectures/simvla/adapters/real_world_training/train_baseline.py": "b0bf8e6e0958a50c9f7b77a40df74b3c7650b2a4870265abf83cd3a700fc0c52",
+      "architectures/simvla/adapters/real_world_training/train_coupled_generation.py": "b581dbabd8ad20eb690e171e8593f89a981d171fbd62a727e9e27ca352d2eb8d",
+      "architectures/simvla/adapters/real_world_training/train_updater.py": "0d37e0a1246e146d5146380a65453c75c2ab10933d83dce607c08a92b8e0d375",
+      "architectures/simvla/adapters/real_world_training/updater_data.py": "115023ae1a5599e83050494966a17b1e06679d1dad43ff62c2d68ae9c6dd94a0",
+      "architectures/simvla/adapters/real_world_training/updater_io.py": "0e6ccb51fa11470e68a7d20d1c4b17a68201d00ae792312da8b3ad73148fd317",
+      "architectures/simvla/adapters/real_world_training/verify_condition_cache.py": "6a04386375384d0431b7b02c3f287c6aba048e5725e303855c19831b1876954e",
+      "architectures/simvla/wrappers/dcld_eval/invariants.py": "a9a05ac72910e2e7d1df01042c596656a2d4a6ca8709ebb4967a40a083e2ddfa",
+      "architectures/simvla/wrappers/dcld_eval/rollout_runner.py": "1f4e92b1d52de57f4d1343bb054304599bf79045e3437961b683807f5205b7d8",
+      "methods/dcld/__init__.py": "bd3144fcceac14054e714d4abdb9e515132745091f191e0496e711195cc07b75",
+      "methods/dcld/eval/__init__.py": "3aae41df189038889132d21d9b2825f0cfae5847c3b4570175584cbdbc61eeaa",
+      "methods/dcld/eval/ablation_modes.py": "a7df9369450c4f579188f21b8115a480e2ff80cb9ae21ea90b3caaf8c0075639",
+      "methods/dcld/eval/logging_utils.py": "48acd10cec85ef14667bc5e7df5b7404762a2ef4358561d9cd359bd14a3d0a90",
+      "methods/dcld/eval/shadow_eval.py": "b36109208531841f49673e6457f3f91c810b53155a5164027ea4a40001a1a638",
+      "methods/dcld/eval/skip_scheduler.py": "9acef7fc352e4fd3f8d1f07c354d4265f70f52fbfb65b67889eaa5b1a5e11a62",
+      "methods/dcld/modules/__init__.py": "d0983c69076582f01ea0bfc6ef4d40fbf71ced9bafe636824f1480a459d8654e",
+      "methods/dcld/modules/dcld_core.py": "8149913aaf6ee2bfafd6f44c626918e77bacbdd0bece80c95dc734f5b1845b40",
+      "methods/dcld/modules/fast_delta_encoder.py": "475257d5e2d44291e39c84917d68f5b7df939409307baf19c3cf100a9ddb7535",
+      "methods/dcld/modules/latent_dynamics.py": "1edab4d7671ad4f203254a35e6eb1e162beaa106630965e4b500bc88f57d3094",
+      "methods/dcld/modules/low_rank_latent_dynamics.py": "5a413a10011ba254881917a1b00f3ceec70b9b55c41c68b1bee57b487f2ea6f5",
+      "methods/dcld/modules/time_embedding.py": "71fcca81c290b372d218296b753265e2267039e2f7e9a97169085e89c935a255",
+      "methods/dcld/training/__init__.py": "7b1399da978f05085def1011ebefbde585344704ed431215a15f749ae782b514",
+      "methods/dcld/training/losses.py": "e4363ce6400d435252c997370b50862384a524f83bb6df1211b6900ef0d11d33",
+      "methods/dcld/training/teacher_cache.py": "eaf753099bc1d732f45de8a9157fad89b56cf97775765f675bcaef4390f4c126",
+      "methods/latentloop/modules/__init__.py": "31b4b569211d6e7cb6b3b8ed2f30b9c67001ff45e027e1e8b43b5cdcf5c81f29",
+      "methods/latentloop/modules/native_simvla_v0.py": "555f4ab154ee0353576245d26aa4ba816581fb8ca53c8c21e1d184f790086fd7",
+      "methods/latentloop/modules/simvla_generation_loop.py": "80eeb8cb1a4f1a75d77f50dc55391286c072f260a375e8da5202bef68d1f0789"
+    },
+    "reviewed_files": {
+      "architectures/simvla/adapters/latentloop_real_deploy/contracts.py": "4ee9c98a18d7d63ce0420f7eb2b24ff6cadc6f034670ac3114845246b4fa3372",
+      "architectures/simvla/adapters/latentloop_real_deploy/controller.py": "c4027d4006d123be4736793220d76b7c9eee44ffe51877c20a73935945f28957",
+      "architectures/simvla/adapters/latentloop_real_deploy/deploy_gui.py": "7fababe122230f42ea1665943e6611c4cacf163a5bf7f52087f5eacd812ca4d9",
+      "architectures/simvla/adapters/latentloop_real_deploy/hardware.py": "ddcb3ff72e355225dd4de915a406838dbf57bf3b391156ed90c88b9e23e884ae"
+    }
+  },
+  "operator_authorization": "user_confirmed_emergency_stop_and_requested_direct_baseline_and_ours"
+}

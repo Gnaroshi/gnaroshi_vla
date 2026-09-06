@@ -228,7 +228,9 @@ class SafeUR5eDeployEnv(legacy_deploy.UR5eDeployEnv):
         workspace_min: list[float],
         workspace_max: list[float],
         tracking_error_guard: dict[str, Any] | None = None,
+        workspace_guard_enabled: bool = True,
     ):
+        self._workspace_guard_enabled = bool(workspace_guard_enabled)
         self._workspace_min = np.asarray(workspace_min, dtype=np.float64)
         self._workspace_max = np.asarray(workspace_max, dtype=np.float64)
         tracking = dict(tracking_error_guard or {})
@@ -442,8 +444,8 @@ class SafeUR5eDeployEnv(legacy_deploy.UR5eDeployEnv):
             actual_tcp = np.asarray(self.rtde_rec.getActualTCPPose(), dtype=np.float64)
             if actual_tcp.shape != (6,) or not np.isfinite(actual_tcp).all():
                 raise RuntimeError("Rejected invalid actual TCP feedback")
-            if np.any(actual_tcp[:3] < self._workspace_min) or np.any(
-                actual_tcp[:3] > self._workspace_max
+            if getattr(self, "_workspace_guard_enabled", True) and (
+                np.any(actual_tcp[:3] < self._workspace_min) or np.any(actual_tcp[:3] > self._workspace_max)
             ):
                 raise RuntimeError(
                     "Actual TCP left the reviewed workspace: "
@@ -473,8 +475,8 @@ class SafeUR5eDeployEnv(legacy_deploy.UR5eDeployEnv):
                 actual_tcp,
             )
             xyz = rebased_target[:3]
-            if np.any(xyz < self._workspace_min) or np.any(
-                xyz > self._workspace_max
+            if getattr(self, "_workspace_guard_enabled", True) and (
+                np.any(xyz < self._workspace_min) or np.any(xyz > self._workspace_max)
             ):
                 raise RuntimeError(
                     "Rejected rebased target outside reviewed workspace: "
@@ -508,4 +510,5 @@ def build_live_environment(contract: DeploymentContract, cfg):
         workspace_min=workspace["min"],
         workspace_max=workspace["max"],
         tracking_error_guard=dict(tracking),
+        workspace_guard_enabled=contract.hardware["robot"].get("safety_profile") != "seer_doll",
     )

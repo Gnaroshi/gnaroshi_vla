@@ -28,12 +28,14 @@ class TimedSafeUR5eDeployEnv(SafeUR5eDeployEnv):
         workspace_max,
         tracking_error_guard,
         command_callback,
+        workspace_guard_enabled=True,
     ):
         super().__init__(
             cfg,
             workspace_min=workspace_min,
             workspace_max=workspace_max,
             tracking_error_guard=tracking_error_guard,
+            workspace_guard_enabled=workspace_guard_enabled,
         )
         self._command_callback = command_callback
 
@@ -239,11 +241,14 @@ class SimVLADeployGuiApp(legacy_gui.DeployGuiApp):
         if not hasattr(self, "simvla_controller"):
             return
         metadata = self.simvla_controller.deployment_metadata()
+        times = list(self.simvla_controller.control_command_monotonic_s)
+        actual_hz = f"{(len(times) - 1) / (times[-1] - times[0]):.2f}" if len(times) > 1 and times[-1] > times[0] else "--"
         self.metrics_var.set(
             self.metrics_var.get()
             + "\n\nSimVLA deployment\n"
             + f"{metadata['deployment_id']} / {metadata['deployment_method']}\n"
             + "Protocol: fresh H=10, execute R=5\n"
+            + f"Target: {self.cfg.control_freq:g} Hz / Command rate: {actual_hz} Hz\n"
             + {
                 "baseline": "Compute: K_C=1, N_G=10",
                 "condition_loop": "Compute: K_C=2, N_G=10",
@@ -314,6 +319,7 @@ def run_live_gui(*, controller) -> None:
             workspace_max=workspace["max"],
             tracking_error_guard=dict(tracking),
             command_callback=controller.record_control_command,
+            workspace_guard_enabled=contract.hardware["robot"].get("safety_profile") != "seer_doll",
         )
         SimVLADeployGuiApp(root, cfg, controller, env, gui_args)
         root.deiconify()

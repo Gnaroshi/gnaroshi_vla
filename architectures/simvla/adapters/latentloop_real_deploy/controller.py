@@ -371,6 +371,13 @@ class SimVLARealController:
             "policy_contract": dict(self.contract.policy),
             "state_contract": dict(self.contract.state),
             "action_contract": dict(self.contract.action),
+            "execution_configuration": {
+                "target_control_hz": self.contract.runtime["control_frequency_hz"],
+                "training_sample_hz": self.contract.runtime.get("training_sample_hz", self.contract.runtime["control_frequency_hz"]),
+                "hardware_safety_profile": self.contract.hardware["robot"].get("safety_profile", "reviewed_workspace"),
+                "workspace_guard_enabled": self.contract.hardware["robot"].get("safety_profile") != "seer_doll",
+                "tracking_guard_enabled": self.contract.hardware["robot"]["control"]["tracking_error_guard"]["enabled"],
+            },
             "artifact_sha256": {
                 name: artifact.sha256
                 for name, artifact in self.contract.artifacts.items()
@@ -418,6 +425,8 @@ class SimVLARealController:
             "query_trace": list(getattr(self.policy, "query_trace", [])),
             "control_period_ms": control_period_ms,
             "control_commands": int(command_times.size),
+            "actual_control_command_hz": float(1000.0 / command_intervals_ms.mean())
+            if command_intervals_ms.size and command_intervals_ms.mean() > 0 else None,
             "tracking_error": {
                 "samples": len(self.tracking_errors),
                 "translation_m_max": float(translation_errors.max())
