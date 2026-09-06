@@ -89,6 +89,12 @@ fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../.." && pwd)
+if [[ -n "${manifest}" ]]; then
+    manifest=$(realpath -- "${manifest}")
+fi
+cd "${repo_root}"
+unset PYTHONHOME
+export PYTHONNOUSERSITE=1
 python_bin="${SIMVLA_REAL_PYTHON:-python}"
 python_bin=$(command -v "${python_bin}")
 export PATH="$(dirname -- "${python_bin}"):${PATH}"
@@ -142,7 +148,7 @@ done
 output_dir="${launch_dir}/output"
 
 export CUDA_VISIBLE_DEVICES="${cuda_device}"
-export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${repo_root}"
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1

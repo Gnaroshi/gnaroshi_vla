@@ -57,3 +57,34 @@ def test_launch_context_ignores_foreign_worktree(tmp_path, filename, stop_before
     assert json.loads(result.stdout) == {
         "cwd": str(repo), "pythonpath": str(repo), "source": "ours",
     }
+
+
+@pytest.mark.parametrize("filename,args,stop_before", [
+    ("setup_real_deploy_env.sh", ["--check"], '"${prefix}/bin/python" -c'),
+    ("deploy_latentloop_real.sh", ["source-preflight"], "command=("),
+])
+def test_deploy_context_excludes_user_packages(tmp_path, filename, args, stop_before):
+    repo = tmp_path / "ours"
+    wrappers = repo / "architectures/simvla/wrappers"
+    wrappers.mkdir(parents=True)
+    (repo / "architectures/__init__.py").write_text('SOURCE = "ours"\n')
+    foreign = tmp_path / "foreign"
+    (foreign / "architectures").mkdir(parents=True)
+    (foreign / "architectures/__init__.py").write_text('SOURCE = "foreign"\n')
+    source = (ROOT / "architectures/simvla/wrappers" / filename).read_text()
+    probe = ('import architectures,json,os,site; '
+             'print(json.dumps({"cwd":os.getcwd(),"path":os.environ["PYTHONPATH"],'
+             '"user_site":site.ENABLE_USER_SITE,"source":architectures.SOURCE}))')
+    script = wrappers / filename
+    script.write_text(source[:source.index(stop_before)] +
+                      f'\n{shlex.quote(sys.executable)} -c {shlex.quote(probe)}\n')
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SIMVLA_REAL_")}
+    env.update(PYTHONPATH=str(foreign), PYTHONHOME="/nonexistent/foreign-python",
+               PYTHONNOUSERSITE="0", SIMVLA_REAL_PYTHON=sys.executable,
+               SIMVLA_REAL_ENV_PREFIX=str(Path(sys.executable).parent.parent),
+               SIMVLA_REAL_LOG_ROOT=str(tmp_path / "logs"))
+    result = subprocess.run(["bash", str(script), *args], cwd=foreign, env=env,
+                            capture_output=True, text=True, check=True, timeout=30)
+    assert json.loads(result.stdout) == {
+        "cwd": str(repo), "path": str(repo), "user_site": False, "source": "ours",
+    }

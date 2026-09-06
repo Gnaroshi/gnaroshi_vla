@@ -5,6 +5,10 @@ mode="${1:---check}"
 [[ $# -le 1 ]] || { echo "Usage: $0 [--check|--install]" >&2; exit 2; }
 case "${mode}" in --check|--install) ;; *) echo "Usage: $0 [--check|--install]" >&2; exit 2 ;; esac
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
+cd "${repo}"
+unset PYTHONHOME
+export PYTHONNOUSERSITE=1
+export PYTHONPATH="${repo}"
 prefix="${SIMVLA_REAL_ENV_PREFIX:-${HOME}/gnaroshi_vla_runtime/envs/simvla_real}"
 requirements="${repo}/architectures/simvla/env/requirements.real_deploy.txt"
 [[ "${prefix}" == /* && "${prefix}" != / && "${prefix}" != "${HOME}" ]] || {
@@ -54,7 +58,6 @@ fi
 [[ -x "${prefix}/bin/python" ]] || { echo "[ERROR] Environment not installed: ${prefix}" >&2; exit 2; }
 export CUDA_VISIBLE_DEVICES=''
 export PATH="${prefix}/bin:${PATH}"
-export PYTHONPATH="${repo}${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONDONTWRITEBYTECODE=1
 "${prefix}/bin/python" -c 'import json; from architectures.simvla.adapters.latentloop_real_deploy.environment import inspect_environment; result=inspect_environment(require_cuda=False, require_gui=False); print(json.dumps(result,indent=2)); raise SystemExit(0 if result["verdict"] == "REAL_ENVIRONMENT_PASS" else 1)'
 echo "ENVIRONMENT_READY_FOR_GPU_AND_GUI_CHECKS python=${prefix}/bin/python"
