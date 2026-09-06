@@ -2,6 +2,9 @@ from types import SimpleNamespace
 import copy
 import json
 import threading
+import os
+import subprocess
+from pathlib import Path
 
 import pytest
 import torch
@@ -89,6 +92,19 @@ class TinyDataset(Dataset):
 
 
 PROCESSOR = SimpleNamespace(encode_language=lambda text: {"input_ids": torch.ones(len(text), 1, dtype=torch.long)})
+
+
+def test_preflight_preserves_real_launcher_exit_code(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    status = logs / "launcher.exit_code"
+    status.write_text("130\n")
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "SIMVLA_REAL_PYTHON": "/bin/true",
+           "SIMVLA_DOLL_JOINT_OUTPUT": str(tmp_path), "SIMVLA_REAL_GPU_IDS": "4"}
+    subprocess.run(["bash", str(root / "architectures/simvla/wrappers/train_doll_joint.sh"),
+                    "--preflight"], env=env, check=True, capture_output=True)
+    assert status.read_text() == "130\n"
 
 
 def test_action_evaluation_includes_eight_episodes_and_is_repeatable(tmp_path):

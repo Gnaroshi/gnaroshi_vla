@@ -84,7 +84,7 @@ main() {
 set +e
 ( main )
 status=$?
-if [[ -d "${output}/logs" ]]; then printf '%s\n' "${status}" > "${output}/logs/launcher.exit_code"; fi
+if [[ "${mode}" != --preflight && -d "${output}/logs" ]]; then printf '%s\n' "${status}" > "${output}/logs/launcher.exit_code"; fi
 if (( status != 0 )); then
     echo "DOLL_JOINT_FAILED rc=${status}; inspect the traceback above. tmux pane remains open."
 else
