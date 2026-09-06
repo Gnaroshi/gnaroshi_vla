@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -33,7 +34,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output")
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--require-gui", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--profile-target-hz", type=float)
+    parser.add_argument("--profile-camera-fps", type=int)
+    args = parser.parse_args()
+    if args.profile_target_hz is not None or args.profile_camera_fps is not None:
+        if args.mode != "read-only-profile":
+            parser.error("profile rate overrides are read-only-profile only")
+    if args.profile_target_hz is not None and (
+        not math.isfinite(args.profile_target_hz) or args.profile_target_hz <= 0
+    ):
+        parser.error("--profile-target-hz must be positive and finite")
+    if args.profile_camera_fps is not None and args.profile_camera_fps <= 0:
+        parser.error("--profile-camera-fps must be positive")
+    return args
 
 
 def _write_json(path: str | Path | None, filename: str, payload: dict[str, Any]) -> None:
@@ -185,23 +198,27 @@ def _artifact_preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 def _read_only_profile(args: argparse.Namespace) -> dict[str, Any]:
     contract, controller = _load_controller(args)
-    from .contracts import require_hardware_configuration
+    from .contracts import require_sensor_configuration
     from .hardware import build_deploy_config
     from .runtime import ReadOnlyDeployEnvironment, run_read_only_profile
 
     if not args.output:
         raise ValueError("--output is required for read-only-profile")
-    require_hardware_configuration(contract)
+    require_sensor_configuration(contract)
     steps = int(args.steps or contract.runtime["max_steps"])
     if steps < 11:
         raise ValueError("read-only-profile requires at least 11 steps")
     cfg = build_deploy_config(contract)
     cfg.enable_rollout_media = False
     cfg.enable_observer_media = False
+    camera_fps = getattr(args, "profile_camera_fps", None)
+    if camera_fps is not None:
+        os.environ["SEER_CAMERA_FPS"] = str(camera_fps)
     env = ReadOnlyDeployEnvironment(cfg)
     try:
         return run_read_only_profile(
-            controller=controller, env=env, output=args.output, steps=steps
+            controller=controller, env=env, output=args.output, steps=steps,
+            target_hz=getattr(args, "profile_target_hz", None), camera_fps=camera_fps,
         )
     finally:
         env.close()

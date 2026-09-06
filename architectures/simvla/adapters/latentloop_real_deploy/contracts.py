@@ -872,6 +872,20 @@ def require_hardware_configuration(contract: DeploymentContract) -> None:
         raise PermissionError("Hardware connection rejected: " + "; ".join(issues))
 
 
+def require_sensor_configuration(contract: DeploymentContract) -> None:
+    """A receive-only connection does not require permission to move the arm."""
+    issues = []
+    if str(contract.hardware["robot"]["ip"]).startswith("replace-with-"):
+        issues.append("robot IP is still a template value")
+    for role in ("exterior", "wrist"):
+        if str(contract.hardware["cameras"][role]["serial"]).startswith("replace-with-"):
+            issues.append(f"{role} camera serial is still a template value")
+    if not contract.payload["safety_review"]["camera_role_mapping_verified"]:
+        issues.append("camera_role_mapping_verified is not true")
+    if issues:
+        raise PermissionError("Sensor connection rejected: " + "; ".join(issues))
+
+
 def load_deployment_contract(
     path: str | Path, *, verify_artifacts: bool = True
 ) -> DeploymentContract:

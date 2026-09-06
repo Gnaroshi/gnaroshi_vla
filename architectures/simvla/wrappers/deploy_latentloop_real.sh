@@ -9,6 +9,7 @@ Usage:
   deploy_latentloop_real.sh prepare --manifest FILE [--require-gui]
   deploy_latentloop_real.sh artifact-preflight --manifest FILE [--method baseline|condition_loop|latentloop|vla_cache_full|vla_cache]
   deploy_latentloop_real.sh read-only-profile --manifest FILE [--method baseline|condition_loop|latentloop|vla_cache_full|vla_cache] [--steps N]
+      [--profile-target-hz HZ] [--profile-camera-fps FPS]
   deploy_latentloop_real.sh live --manifest FILE [--method baseline|condition_loop|latentloop|vla_cache_full|vla_cache]
 
 The default path cannot command the robot. Live mode additionally requires the
@@ -41,6 +42,7 @@ method="latentloop"
 manifest=""
 steps=0
 require_gui=0
+profile_options=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --require-gui)
@@ -60,6 +62,14 @@ while [[ $# -gt 0 ]]; do
         --steps)
             [[ $# -ge 2 ]] || { echo "[ERROR] --steps requires a value" >&2; exit 2; }
             steps="$2"
+            shift 2
+            ;;
+        --profile-target-hz|--profile-camera-fps)
+            [[ $# -ge 2 ]] || { echo "[ERROR] $1 requires a value" >&2; exit 2; }
+            [[ "${mode}" == "read-only-profile" ]] || {
+                echo "[ERROR] Profile rate overrides are read-only-profile only" >&2; exit 2;
+            }
+            profile_options+=("$1" "$2")
             shift 2
             ;;
         -h|--help)
@@ -166,6 +176,7 @@ if (( steps > 0 )); then
     command+=(--steps "${steps}")
 fi
 command+=(--output "${output_dir}")
+command+=("${profile_options[@]}")
 if (( require_gui )); then
     command+=(--require-gui)
 fi

@@ -31,15 +31,19 @@ class InstrumentedRealSenseCamera:
         config = rs.config()
         config.enable_device(self.serial_number)
         config.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
-        profile = self.pipeline.start(config)
-        stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
-        self.active_profile = {
-            "serial": self.serial_number,
-            "width": int(stream.width()),
-            "height": int(stream.height()),
-            "fps": int(stream.fps()),
-            "format": str(stream.format()),
-        }
+        try:
+            profile = self.pipeline.start(config)
+            stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            self.active_profile = {
+                "serial": self.serial_number,
+                "width": int(stream.width()),
+                "height": int(stream.height()),
+                "fps": int(stream.fps()),
+                "format": str(stream.format()),
+            }
+        except BaseException:
+            self.close()
+            raise
         self.last_read_metadata: dict[str, Any] | None = None
 
     def read(self) -> np.ndarray:
@@ -71,19 +75,25 @@ class ReadOnlyDeployEnvironment:
         import rtde_receive
 
         self.cfg = cfg
-        self.rtde_rec = rtde_receive.RTDEReceiveInterface(cfg.robot_ip)
-        self.gripper = legacy_deploy.RobotiqGripper()
-        self.gripper.connect(cfg.robot_ip, 63352)
-        serials = dict(cfg.camera_serial_cache)
-        width = int(os.environ["SEER_CAMERA_WIDTH"])
-        height = int(os.environ["SEER_CAMERA_HEIGHT"])
-        fps = int(os.environ["SEER_CAMERA_FPS"])
-        self.exterior_camera = InstrumentedRealSenseCamera(
-            serials["exterior"], width=width, height=height, fps=fps
-        )
-        self.wrist_camera = InstrumentedRealSenseCamera(
-            serials["wrist"], width=width, height=height, fps=fps
-        )
+        self.rtde_rec = self.gripper = None
+        self.exterior_camera = self.wrist_camera = None
+        try:
+            self.rtde_rec = rtde_receive.RTDEReceiveInterface(cfg.robot_ip)
+            self.gripper = legacy_deploy.RobotiqGripper()
+            self.gripper.connect(cfg.robot_ip, 63352)
+            serials = dict(cfg.camera_serial_cache)
+            width = int(os.environ["SEER_CAMERA_WIDTH"])
+            height = int(os.environ["SEER_CAMERA_HEIGHT"])
+            fps = int(os.environ["SEER_CAMERA_FPS"])
+            self.exterior_camera = InstrumentedRealSenseCamera(
+                serials["exterior"], width=width, height=height, fps=fps
+            )
+            self.wrist_camera = InstrumentedRealSenseCamera(
+                serials["wrist"], width=width, height=height, fps=fps
+            )
+        except BaseException:
+            self.close()
+            raise
         self.observer_camera = None
         self.deploy_camera_serials = serials
         self.camera_serials = {**serials, "observer": None}
@@ -108,16 +118,15 @@ class ReadOnlyDeployEnvironment:
         return [self.exterior_camera.read(), self.wrist_camera.read()]
 
     def close(self) -> None:
-        self.exterior_camera.close()
-        self.wrist_camera.close()
-        try:
-            self.gripper.disconnect()
-        except Exception:
-            pass
-        try:
-            self.rtde_rec.disconnect()
-        except Exception:
-            pass
+        for name, operation in (("exterior_camera", "close"), ("wrist_camera", "close"),
+                                ("gripper", "disconnect"), ("rtde_rec", "disconnect")):
+            resource = getattr(self, name, None)
+            if resource is not None:
+                try:
+                    getattr(resource, operation)()
+                except Exception:
+                    pass
+                setattr(self, name, None)
 
 
 def _distribution(values: list[float]) -> dict[str, float | int]:
@@ -134,7 +143,8 @@ def _distribution(values: list[float]) -> dict[str, float | int]:
 
 
 def _validate_robot_state(
-    state: dict[str, np.ndarray], *, workspace_min: np.ndarray, workspace_max: np.ndarray
+    state: dict[str, np.ndarray], *, workspace_min: np.ndarray | None,
+    workspace_max: np.ndarray | None,
 ) -> None:
     expected = {
         "pose6d": (6,),
@@ -148,7 +158,11 @@ def _validate_robot_state(
         if value.shape != shape or not np.isfinite(value).all():
             raise RuntimeError(f"read-only robot state {key} must be finite {shape}")
     position = np.asarray(state["pose6d"], dtype=np.float64)[:3]
-    if np.any(position < workspace_min) or np.any(position > workspace_max):
+    if (workspace_min is None) != (workspace_max is None):
+        raise ValueError("workspace bounds must be supplied together")
+    if workspace_min is not None and (
+        np.any(position < workspace_min) or np.any(position > workspace_max)
+    ):
         raise RuntimeError(
             "read-only actual TCP is outside the reviewed workspace: "
             f"xyz={position.tolist()}"
@@ -245,19 +259,32 @@ def _expected_policy_counters(method: str, steps: int) -> dict[str, int]:
 
 
 def run_read_only_profile(
-    *, controller, env: ReadOnlyDeployEnvironment, output: str | Path, steps: int
+    *, controller, env: ReadOnlyDeployEnvironment, output: str | Path, steps: int,
+    target_hz: float | None = None, camera_fps: int | None = None,
 ) -> dict[str, Any]:
+    target_hz = float(controller.contract.runtime["control_frequency_hz"]
+                      if target_hz is None else target_hz)
+    if not np.isfinite(target_hz) or target_hz <= 0:
+        raise ValueError("profile target Hz must be positive and finite")
+    if steps < 11:
+        raise ValueError("read-only profile needs at least 11 steps")
     output_dir = Path(output).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
     controller.attach_session_dir(output_dir)
     instruction = str(controller.contract.runtime["instructions"][0])
     cameras = controller.contract.hardware["cameras"]
     workspace = controller.contract.hardware["robot"]["workspace_m"]
-    workspace_min = np.asarray(workspace["min"], dtype=np.float64)
-    workspace_max = np.asarray(workspace["max"], dtype=np.float64)
+    review = controller.contract.payload["safety_review"]
+    workspace_reviewed = bool(review["workspace_bounds_verified"]) and not str(
+        controller.contract.hardware["robot"]["workspace_source"]
+    ).startswith("replace-with-")
+    workspace_min = np.asarray(workspace["min"], dtype=np.float64) if workspace_reviewed else None
+    workspace_max = np.asarray(workspace["max"], dtype=np.float64) if workspace_reviewed else None
     expected_width = int(cameras["width"])
     expected_height = int(cameras["height"])
-    expected_fps = int(cameras["fps"])
+    expected_fps = int(cameras["fps"] if camera_fps is None else camera_fps)
+    if expected_fps <= 0:
+        raise ValueError("profile camera FPS must be positive")
     previous_camera: dict[str, dict[str, Any] | None] = {
         "exterior": None,
         "wrist": None,
@@ -298,9 +325,9 @@ def run_read_only_profile(
 
     rows = []
     tick_starts: list[float] = []
-    control_period_s = 1.0 / float(
-        controller.contract.runtime["control_frequency_hz"]
-    )
+    query_starts: list[float] = []
+    preview_images = None
+    control_period_s = 1.0 / target_hz
     for step in range(int(steps)):
         started = time.perf_counter()
         tick_starts.append(started)
@@ -330,6 +357,9 @@ def run_read_only_profile(
             )
             previous_camera[role] = camera_metadata[role]
         policy_started = time.perf_counter()
+        is_query = controller.needs_policy_query
+        if is_query:
+            query_starts.append(policy_started)
         _, _, _, info = controller.forward(
             {
                 "robot_state": robot_state,
@@ -348,6 +378,7 @@ def run_read_only_profile(
                 "camera_pair_read_ms": camera_ms,
                 "policy_call_ms": policy_ms,
                 "tick_compute_ms": compute_ms,
+                "is_policy_query": is_query,
                 "nominal_deadline_missed": compute_ms > control_period_s * 1000.0,
                 "robot_command_issued": False,
                 "actual_tcp_rotvec": np.concatenate(
@@ -365,10 +396,16 @@ def run_read_only_profile(
                 "wrist_camera": camera_metadata["wrist"],
             }
         )
+        if preview_images is None:
+            preview_images = images
         sleep_left = control_period_s - (time.perf_counter() - started)
         if sleep_left > 0:
             time.sleep(sleep_left)
     controller.write_runtime_summary()
+    from PIL import Image
+
+    for role, image in zip(("exterior", "wrist"), preview_images):
+        Image.fromarray(image).save(output_dir / f"first_{role}.png")
     with (output_dir / "read_only_steps.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
@@ -395,7 +432,21 @@ def run_read_only_profile(
     summary = {
         "verdict": "READ_ONLY_PROFILE_PASS",
         "robot_command_issued": False,
-        "hardware_contract_validated": True,
+        "sensor_contract_validated": True,
+        "workspace_validated": workspace_reviewed,
+        "live_authorization_granted": False,
+        "deployment_target_hz": controller.contract.runtime["control_frequency_hz"],
+        "profile_target_hz": target_hz,
+        "profile_camera_fps": expected_fps,
+        "read_only_tick_hz": (len(tick_starts) - 1) / (tick_starts[-1] - tick_starts[0]),
+        "policy_query_start_hz": (len(query_starts) - 1) / (query_starts[-1] - query_starts[0])
+        if len(query_starts) > 1 else None,
+        "actual_robot_command_hz": None,
+        "observed_tcp_xyz_m": {
+            "min": np.min([row["actual_tcp_rotvec"][:3] for row in rows], axis=0).tolist(),
+            "max": np.max([row["actual_tcp_rotvec"][:3] for row in rows], axis=0).tolist(),
+            "not_a_safe_workspace_estimate": True,
+        },
         "policy_schedule_validated": True,
         "nominal_timing_is_measurement_not_authorization": True,
         "warmup_steps": warmup_steps,
