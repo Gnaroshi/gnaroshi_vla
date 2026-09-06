@@ -234,6 +234,8 @@ class RealSimVLADataset(Dataset[dict[str, Any]]):
             )
         if not self.samples:
             raise ValueError(f"split {split!r} contains no full H={action_horizon} samples")
+        # Never inherit open HDF5 handles into forked DataLoader workers.
+        self.store.close()
         self.image_transform = build_real_image_transform(training=self.training)
 
     def __len__(self) -> int:

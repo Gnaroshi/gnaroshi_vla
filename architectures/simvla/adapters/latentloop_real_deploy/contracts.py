@@ -206,6 +206,8 @@ def _verify_artifacts(
         "generation_updater",
         "coupled_generation_updater",
     )
+    if payload.get("enabled_methods") == ["baseline"]:
+        file_names = ("official_base_model_weights", "norm_stats", "dataset_manifest", "real_action_transformer")
     verified: dict[str, VerifiedArtifact] = {}
     for name in file_names:
         spec = _require_mapping(raw, name)
@@ -430,6 +432,11 @@ def _validate_hardware_runtime(payload: Mapping[str, Any]) -> None:
 
 def _validate_pairing(payload: Mapping[str, Any]) -> None:
     pairing = _require_mapping(payload, "pairing")
+    if payload.get("enabled_methods") == ["baseline"]:
+        for key in ("official_base_model_identity", "real_baseline_identity", "norm_stats_identity", "dataset_identity"):
+            if not SHA256_PATTERN.fullmatch(str(pairing.get(key, ""))):
+                raise ValueError(f"invalid baseline pairing.{key}")
+        return
     for key in (
         "official_base_model_identity",
         "real_baseline_identity",
@@ -466,6 +473,7 @@ def _validate_artifact_pairing(
         "coupled_condition_updater_identity": "condition_updater",
         "coupled_generation_identity": "coupled_generation_updater",
     }
+    direct = {key: name for key, name in direct.items() if name in artifacts}
     mismatches = {
         key: {
             "declared": pairing.get(key),
@@ -477,14 +485,16 @@ def _validate_artifact_pairing(
     dataset = json.loads(
         artifacts["dataset_manifest"].path.read_text(encoding="utf-8")
     )
-    cache = json.loads(
-        artifacts["condition_cache_manifest"].path.read_text(encoding="utf-8")
-    )
     if pairing.get("dataset_identity") != dataset.get("dataset_identity_sha256"):
         mismatches["dataset_identity"] = {
             "declared": pairing.get("dataset_identity"),
             "manifest": dataset.get("dataset_identity_sha256"),
         }
+    if "condition_cache_manifest" not in artifacts:
+        if mismatches:
+            raise ValueError(f"deployment artifact pairing mismatch: {mismatches}")
+        return
+    cache = json.loads(artifacts["condition_cache_manifest"].path.read_text(encoding="utf-8"))
     if pairing.get("condition_cache_identity") != cache.get(
         "condition_cache_identity_sha256"
     ):
@@ -548,12 +558,6 @@ def _validate_dataset_cache_semantics(
 ) -> None:
     dataset = json.loads(
         artifacts["dataset_manifest"].path.read_text(encoding="utf-8")
-    )
-    cache = json.loads(
-        artifacts["condition_cache_manifest"].path.read_text(encoding="utf-8")
-    )
-    attestation = json.loads(
-        artifacts["condition_cache_attestation"].path.read_text(encoding="utf-8")
     )
     policy = payload["policy"]
     state = payload["state"]
@@ -666,6 +670,11 @@ def _validate_dataset_cache_semantics(
     if training_samples < 1:
         raise ValueError("dataset contains no timing-valid H=10 samples")
 
+    if payload.get("enabled_methods") == ["baseline"]:
+        # A joint baseline has no frozen-condition cache and no paired updater.
+        return
+    cache = json.loads(artifacts["condition_cache_manifest"].path.read_text(encoding="utf-8"))
+    attestation = json.loads(artifacts["condition_cache_attestation"].path.read_text(encoding="utf-8"))
     if cache.get("schema_version") != REAL_CONDITION_CACHE_SCHEMA:
         raise ValueError("unsupported real Condition cache schema")
     if cache.get("verdict") != "REAL_CONDITION_CACHE_PASS":

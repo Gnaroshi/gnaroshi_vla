@@ -30,6 +30,11 @@ REVIEWED_RUNTIME_CHANGES = {
     "architectures/simvla/adapters/latentloop_real_deploy/" + name
     for name in ("contracts.py", "hardware.py", "deploy_gui.py", "controller.py")
 }
+REVIEWED_RUNTIME_CHANGES.update({
+    "architectures/simvla/adapters/real_world_training/model_io.py",
+    "architectures/simvla/adapters/real_world_training/dataset.py",
+    "architectures/simvla/adapters/real_world_training/train_joint_baseline.py",
+})
 PHYSICAL_REVIEW_FIELDS = (
     "hardware_configuration_reviewed", "camera_role_mapping_verified",
     "task_home_pose_verified", "workspace_bounds_verified",
@@ -105,8 +110,8 @@ def validate_evidence(contract: DeploymentContract, artifact: dict, profile: dic
 def reviewed_payload(contract: DeploymentContract, profile: dict, minimum: list[float], maximum: list[float], tracking: list[float], max_steps: int, approval: str) -> dict:
     if approval != "DEPLOY":
         raise PermissionError("승인하지 않았습니다. 하드웨어를 초기화하지 않습니다.")
-    if not (0 < max_steps <= int(contract.runtime["max_steps"])):
-        raise ValueError("실행 길이는 1 이상, 기존 최대 step 이하이어야 합니다.")
+    if max_steps < 1:
+        raise ValueError("max_steps는 양의 정수이어야 합니다.")
     if len(minimum) != 3 or len(maximum) != 3 or len(tracking) != 2:
         raise ValueError("작업범위 또는 추종오차 차원이 잘못됐습니다.")
     if not all(math.isfinite(v) for v in minimum + maximum + tracking) or not all(v > 0 for v in tracking):
@@ -137,7 +142,7 @@ def reviewed_payload(contract: DeploymentContract, profile: dict, minimum: list[
 
 
 def seer_site_payload(contract: DeploymentContract, preset: dict, max_steps: int, *, confirmed: bool) -> dict:
-    if contract.deployment_id != preset["deployment_id"]:
+    if contract.deployment_id != preset["deployment_id"] and contract.payload.get("task_id") != "stackcupanddoll":
         raise ValueError("이 현장 설정은 확인된 Doll 배포에만 사용할 수 있습니다.")
     robot = contract.hardware["robot"]
     for field in ("ip", "home_pose", "gripper"):
@@ -150,8 +155,8 @@ def seer_site_payload(contract: DeploymentContract, preset: dict, max_steps: int
     for field, value in preset["cameras"].items():
         if field != "fps" and cameras[field] != value:
             raise ValueError(f"Seer Doll 카메라 설정 {field}가 다릅니다.")
-    if not 0 < max_steps <= int(contract.runtime["max_steps"]):
-        raise ValueError("기존 최대 step을 초과할 수 없습니다.")
+    if max_steps < 1:
+        raise ValueError("max_steps는 양의 정수이어야 합니다.")
     payload = copy.deepcopy(contract.payload)
     robot = payload["hardware"]["robot"]
     robot["safety_profile"] = "seer_doll"
@@ -185,12 +190,32 @@ def write_manifest(contract: DeploymentContract, payload: dict) -> Path:
     return Path(filename)
 
 
+def apply_runtime_options(payload: dict, args: argparse.Namespace) -> dict:
+    if not math.isfinite(args.control_hz) or args.control_hz <= 0:
+        raise ValueError("control_hz는 유한한 양수이어야 합니다.")
+    if args.num_rollouts < 1 or args.warmup_steps < 0:
+        raise ValueError("num_rollouts >= 1, warmup_steps >= 0이어야 합니다.")
+    if args.camera_fps not in (15, 30, 60):
+        raise ValueError("camera_fps는 15, 30, 60 중 선택하세요.")
+    payload["runtime"].update(
+        control_frequency_hz=args.control_hz,
+        num_rollouts_per_instruction=args.num_rollouts,
+        warmup_steps=args.warmup_steps,
+    )
+    payload["hardware"]["cameras"]["fps"] = args.camera_fps
+    return payload
+
+
 def main() -> int:
     runtime = Path.home() / "gnaroshi_vla_runtime"
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=runtime / "artifacts/stackcupanddoll/deployment_manifest.site.json")
     parser.add_argument("--log-root", type=Path, default=Path(os.environ.get("SIMVLA_REAL_LOG_ROOT", runtime / "results/simvla/real_deploy")))
     parser.add_argument("--max-steps", type=int, default=700)
+    parser.add_argument("--control-hz", type=float, default=60.0)
+    parser.add_argument("--camera-fps", type=int, default=60)
+    parser.add_argument("--num-rollouts", type=int, default=15)
+    parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--site-profile", choices=("reviewed_workspace", "seer_doll"), default="reviewed_workspace")
     parser.add_argument("--method", choices=("baseline", "condition_loop", "latentloop"), default="baseline")
     parser.add_argument("--check", action="store_true", help="기존 결과만 확인. 하드웨어/GUI 실행 없음.")
@@ -211,7 +236,7 @@ def main() -> int:
     print("기존 모델·실제 입력 점검 확인 완료. 재학습/재추론 점검은 하지 않습니다.", flush=True)
     if args.check:
         if preset:
-            candidate_path = write_manifest(contract, seer_site_payload(contract, preset, args.max_steps, confirmed=False))
+            candidate_path = write_manifest(contract, apply_runtime_options(seer_site_payload(contract, preset, args.max_steps, confirmed=False), args))
             try:
                 load_deployment_contract(candidate_path, verify_artifacts=True)
             finally:
@@ -224,7 +249,7 @@ def main() -> int:
     if preset:
         if preset.get("operator_authorization") != "user_confirmed_emergency_stop_and_requested_direct_baseline_and_ours":
             raise PermissionError("현장 사용자의 직접 배포 승인이 기록되지 않았습니다.")
-        payload = seer_site_payload(contract, preset, args.max_steps, confirmed=True)
+        payload = apply_runtime_options(seer_site_payload(contract, preset, args.max_steps, confirmed=True), args)
         payload["operator_review_evidence"] = {
             "artifact_preflight": {"path": str(model_path), "sha256": sha256_file(model_path)},
             "read_only_profile": {"path": str(profile_path), "sha256": sha256_file(profile_path)},
@@ -238,7 +263,7 @@ def main() -> int:
         os.environ.update(SIMVLA_REAL_LIVE_RUN="1", SIMVLA_REAL_DEPLOYMENT_ID=contract.deployment_id, SIMVLA_REAL_SITE_PROFILE="seer_doll")
         require_live_authorization(load_deployment_contract(path, verify_artifacts=False), deployment_method=args.method)
         description = {"baseline": "Baseline K_C=1,N_G=10", "condition_loop": "Ours Condition K_C=2,N_G=10", "latentloop": "Ours Condition+Generation K_C=2,N_G=3 (coupled checkpoint)"}[args.method]
-        print(f"{description}: 목표 60 Hz / H=10,R=5 / 1 rollout. GUI Start로 시작합니다.", flush=True)
+        print(f"{description}: 목표 {args.control_hz:g} Hz / H=10,R=5 / 최대 {args.max_steps} steps / {args.num_rollouts} rollouts. GUI Start로 시작합니다.", flush=True)
         return subprocess.call(["bash", str(ROOT / "architectures/simvla/wrappers/deploy_latentloop_real.sh"), "live", "--manifest", str(path), "--method", args.method])
     print(f"\nDoll baseline / H=10, R=5, flow=10 / 목표 {contract.runtime['control_frequency_hz']} Hz")
     print(f"한 번의 rollout, 최대 {args.max_steps} step. GUI에서 Start New Rollout을 눌러 시작합니다.")

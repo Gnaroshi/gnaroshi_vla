@@ -74,8 +74,8 @@ def main():
     parser.add_argument("--gpu-id", type=int, default=0)
     args = parser.parse_args()
     try:
-        pids = [int(value) for value in args.parent_pids.split(",")]
-        if not pids or any(pid <= 1 for pid in pids):
+        pids = [] if args.parent_pids == "none" else [int(value) for value in args.parent_pids.split(",")]
+        if any(pid <= 1 for pid in pids):
             raise ValueError
     except ValueError:
         parser.error("parent-pids must be comma-separated process IDs greater than 1")

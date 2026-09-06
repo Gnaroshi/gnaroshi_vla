@@ -17,6 +17,7 @@ from .io_utils import sha256_file
 
 
 REAL_ACTION_CHECKPOINT_FORMAT = "simvla_real_action_transformer_v2"
+REAL_JOINT_CHECKPOINT_FORMAT = "simvla_real_joint_vlm_action_v3"
 OFFICIAL_SIMVLA_LIBERO_WEIGHTS_SHA256 = (
     "9d3b1767773da86906d771b1eca2c2911087371bf8b3890a7336b6773270f6be"
 )
@@ -243,13 +244,36 @@ def save_real_action_checkpoint(
 
 def load_real_action_payload(path: str | Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    if payload.get("checkpoint_format") != REAL_ACTION_CHECKPOINT_FORMAT:
+    if payload.get("checkpoint_format") not in (REAL_ACTION_CHECKPOINT_FORMAT, REAL_JOINT_CHECKPOINT_FORMAT):
         raise ValueError(
             f"unsupported real action checkpoint: {payload.get('checkpoint_format')!r}"
         )
     if payload.get("initialization_contract", {}).get("action_transformer_reinitialized") is not False:
         raise ValueError("checkpoint does not prove full official action-head initialization")
+    if payload["checkpoint_format"] == REAL_JOINT_CHECKPOINT_FORMAT:
+        if not payload.get("vlm_state_dict") or payload["initialization_contract"].get("vlm_frozen_during_real_adaptation") is not False:
+            raise ValueError("joint checkpoint must contain the fine-tuned VLM, not just the head")
     return payload
+
+
+def save_real_joint_checkpoint(path, *, model, official_base, norm_stats_path,
+                               dataset_identity_sha256, optimizer_step,
+                               training_config, validation):
+    return _atomic_torch_save({
+        "checkpoint_format": REAL_JOINT_CHECKPOINT_FORMAT,
+        "vlm_state_dict": {k: v.detach().cpu() for k, v in model.vlm.state_dict().items()},
+        "action_transformer_state_dict": {k: v.detach().cpu() for k, v in model.transformer.state_dict().items()},
+        "official_base": official_base.to_dict(),
+        "norm_stats_sha256": sha256_file(norm_stats_path),
+        "dataset_identity_sha256": dataset_identity_sha256,
+        "optimizer_step": optimizer_step,
+        "training_config": dict(training_config), "validation": dict(validation),
+        "initialization_contract": {
+            "source": "complete released SimVLA-LIBERO checkpoint",
+            "action_transformer_reinitialized": False,
+            "vlm_frozen_during_real_adaptation": False,
+        },
+    }, path)
 
 
 def apply_real_action_checkpoint(
@@ -316,10 +340,14 @@ def apply_real_action_checkpoint(
     model.transformer.load_state_dict(
         payload["action_transformer_state_dict"], strict=True
     )
+    if payload["checkpoint_format"] == REAL_JOINT_CHECKPOINT_FORMAT:
+        model.vlm.load_state_dict(payload["vlm_state_dict"], strict=True)
     return {
         "path": str(Path(path).expanduser().resolve()),
         "sha256": sha256_file(path),
         "optimizer_step": observed_step,
         "dataset_identity_sha256": str(payload["dataset_identity_sha256"]),
         "strict_state_dict_load": True,
+        "checkpoint_format": payload["checkpoint_format"],
+        "vlm_overlay_loaded": payload["checkpoint_format"] == REAL_JOINT_CHECKPOINT_FORMAT,
     }

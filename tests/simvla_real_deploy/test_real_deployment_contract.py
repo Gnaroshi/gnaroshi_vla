@@ -1,7 +1,6 @@
 import ast
 import argparse
-import collections
-import json
+
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +47,31 @@ from architectures.simvla.adapters.latentloop_real_deploy.source_lock import (
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_joint_baseline_contract_does_not_require_old_updaters(tmp_path):
+    path = _manifest(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["enabled_methods"] = ["baseline"]
+    required = {"official_base_model_weights", "official_base_model_directory",
+                "processor_directory", "norm_stats", "dataset_manifest", "real_action_transformer"}
+    payload["artifacts"] = {k: v for k, v in payload["artifacts"].items() if k in required}
+    keep_pairing = {"official_base_model_identity", "real_baseline_identity", "norm_stats_identity", "dataset_identity"}
+    payload["pairing"] = {k: v for k, v in payload["pairing"].items() if k in keep_pairing}
+    payload["pairing"]["baseline_optimizer_step"] = 1500
+    path.write_text(json.dumps(payload))
+    contract = load_deployment_contract(path)
+    assert set(contract.artifacts) == required
+    from architectures.simvla.adapters.latentloop_real_deploy.controller import SimVLARealController
+    with pytest.raises(ValueError, match="no newly trained"):
+        SimVLARealController.from_contract(contract, deployment_method="condition_loop", device="cpu")
+    payload["pairing"]["real_baseline_identity"] = "0" * 64
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="pairing"):
+        load_deployment_contract(path)
+
+import collections
+import json
 
 
 def _manifest(tmp_path: Path) -> Path:

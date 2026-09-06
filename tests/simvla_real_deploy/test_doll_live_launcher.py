@@ -12,6 +12,13 @@ from tools.simvla import launch_doll_baseline as launcher
 
 ROOT = Path(__file__).resolve().parents[2]
 
+def test_operator_can_raise_max_steps_above_old_manifest(evidence):
+    contract, _, profile = evidence
+    result = launcher.reviewed_payload(contract, profile, [0.2, -0.6, 0.05], [0.8, 0.6, 0.8], [0.04, 0.1], 5000, "DEPLOY")
+    assert result["runtime"]["max_steps"] == 5000
+    assert result["policy"] == contract.policy
+
+
 
 @pytest.fixture
 def evidence():

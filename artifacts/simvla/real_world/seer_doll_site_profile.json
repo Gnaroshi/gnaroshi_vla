@@ -131,10 +131,13 @@
       "methods/latentloop/modules/simvla_generation_loop.py": "80eeb8cb1a4f1a75d77f50dc55391286c072f260a375e8da5202bef68d1f0789"
     },
     "reviewed_files": {
-      "architectures/simvla/adapters/latentloop_real_deploy/contracts.py": "4ee9c98a18d7d63ce0420f7eb2b24ff6cadc6f034670ac3114845246b4fa3372",
-      "architectures/simvla/adapters/latentloop_real_deploy/controller.py": "c4027d4006d123be4736793220d76b7c9eee44ffe51877c20a73935945f28957",
-      "architectures/simvla/adapters/latentloop_real_deploy/deploy_gui.py": "7fababe122230f42ea1665943e6611c4cacf163a5bf7f52087f5eacd812ca4d9",
-      "architectures/simvla/adapters/latentloop_real_deploy/hardware.py": "ddcb3ff72e355225dd4de915a406838dbf57bf3b391156ed90c88b9e23e884ae"
+      "architectures/simvla/adapters/latentloop_real_deploy/contracts.py": "1498754cee87f161c6863c6f0b5affeff46984b9122d2665c475f193b14ea372",
+      "architectures/simvla/adapters/latentloop_real_deploy/controller.py": "a94929a44cec25b3c9ba5fa4bf39b83c02ddf6779301ab69e5289a035dcd5069",
+      "architectures/simvla/adapters/latentloop_real_deploy/deploy_gui.py": "00a60e12aa0756c8a5191c8d5809aa41df032433ec95b8f16899773f49e8d8b3",
+      "architectures/simvla/adapters/latentloop_real_deploy/hardware.py": "c7c33e7024d1b7e37dfc47b6a3c3899fa955f87f219802de01d9bce9e59f4aeb",
+      "architectures/simvla/adapters/real_world_training/dataset.py": "362fd5f42fd2b4b7859eb83556b2c428cd40c210d9dace58f555a1d128a24c37",
+      "architectures/simvla/adapters/real_world_training/model_io.py": "3b145a58401e929cbcee2e61e03098cb5a10e3300ec3eba1b5c86aae9765051c",
+      "architectures/simvla/adapters/real_world_training/train_joint_baseline.py": "44b81a8d8cff60331ad75d4c4ae0954f9e4f3650b511846e2fd465b6a9ba10a2"
     }
   },
   "operator_authorization": "user_confirmed_emergency_stop_and_requested_direct_baseline_and_ours"

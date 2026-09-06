@@ -149,6 +149,8 @@ class SimVLARealController:
         )
 
         target_device = torch.device(device)
+        if deployment_method not in contract.payload.get("enabled_methods", ["baseline", "condition_loop", "latentloop", "vla_cache", "vla_cache_full"]):
+            raise ValueError("This baseline has no newly trained, paired Ours updater")
         base_directory = contract.artifacts["official_base_model_directory"].path
         processor_directory = contract.artifacts["processor_directory"].path
         model, processor, loading_report = load_exact_official_model(
@@ -162,13 +164,9 @@ class SimVLARealController:
             expected_dataset_identity_sha256=str(
                 contract.pairing["dataset_identity"]
             ),
-            expected_cache_identity_sha256=str(
-                contract.pairing["condition_cache_identity"]
-            ),
-            expected_cache_attestation_identity_sha256=str(
-                contract.pairing["condition_cache_attestation_identity"]
-            ),
-            expected_real_action_optimizer_step=3000,
+            expected_cache_identity_sha256=contract.pairing.get("condition_cache_identity"),
+            expected_cache_attestation_identity_sha256=contract.pairing.get("condition_cache_attestation_identity"),
+            expected_real_action_optimizer_step=contract.pairing.get("baseline_optimizer_step"),
         )
         freeze_module(model)
 
@@ -285,6 +283,7 @@ class SimVLARealController:
         self,
         timestamp: float | None = None,
         tracking_error: Mapping[str, float] | None = None,
+        control_sample: Mapping[str, Any] | None = None,
     ) -> None:
         self.control_command_monotonic_s.append(
             time.perf_counter() if timestamp is None else float(timestamp)
@@ -293,6 +292,14 @@ class SimVLARealController:
             self.tracking_errors.append(
                 {key: float(value) for key, value in tracking_error.items()}
             )
+        if control_sample is not None and self.session_dir is not None:
+            path = self.session_dir / f"robot_commands_rollout_{self.rollout_index:03d}.jsonl"
+            with path.open("a") as handle:
+                handle.write(json.dumps({
+                    "command_index": len(self.control_command_monotonic_s) - 1,
+                    "monotonic_s": self.control_command_monotonic_s[-1],
+                    **control_sample,
+                }) + "\n")
 
     @property
     def needs_policy_query(self) -> bool:

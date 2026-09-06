@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import threading
 import tkinter as tk
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,7 +44,7 @@ class TimedSafeUR5eDeployEnv(SafeUR5eDeployEnv):
         result = super().step(target_pose6d, target_gripper)
         if result is POLICY_STEP_CANCELLED:
             return result
-        self._command_callback(time.perf_counter(), self.last_tracking_error)
+        self._command_callback(time.perf_counter(), self.last_tracking_error, self.last_control_sample)
         return result
 
 
@@ -53,6 +54,8 @@ class SimVLADeployGuiApp(legacy_gui.DeployGuiApp):
     def __init__(self, root, cfg, controller, env, gui_args):
         self.simvla_controller = controller
         self.emergency_stop_reports = []
+        self._outcome_lock = threading.RLock()
+        self._outcome_home_pending = False
         cfg.results_dir = str(
             Path(cfg.results_dir)
             / controller.contract.deployment_id
@@ -95,7 +98,16 @@ class SimVLADeployGuiApp(legacy_gui.DeployGuiApp):
             raise
 
     def set_run_state(self, message, color="#16a34a"):
+        if message == "MOVING HOME" and getattr(self, "_outcome_home_pending", False):
+            with self._outcome_lock:
+                events = self.current_events
+                if self._outcome_home_pending and not (events["retry"].is_set() or events["stop"].is_set()):
+                    self.env.allow_outcome_home()
+                self._outcome_home_pending = False
+        if message == "WAITING FOR OUTCOME":
+            self._request_arm_stop("max_steps_reached")
         if message == "ERROR" and hasattr(self, "env"):
+            self._outcome_home_pending = False
             self._request_arm_stop("rollout_exception")
         elif message in {"READY TO START", "STOPPED", "RETRY STOP"} and hasattr(
             self, "env"
@@ -104,17 +116,23 @@ class SimVLADeployGuiApp(legacy_gui.DeployGuiApp):
         return super().set_run_state(message, color)
 
     def signal_current(self, action):
+        # Serialize operator cancellation with the worker's outcome-home permit.
+        if not hasattr(self, "_outcome_lock"):
+            self._outcome_lock = threading.RLock()
+        with self._outcome_lock:
+            return self._signal_current_locked(action)
+
+    def _signal_current_locked(self, action):
         if action not in {"stop", "retry", "success", "failure"}:
             raise ValueError(f"Unsupported rollout signal: {action}")
         if self.current_events is None:
             self.set_status("No active rollout.")
             return
 
-        # The copied GUI checks its event only at loop boundaries and its
-        # ``stop`` branch automatically moves home. Halt the active servo now,
-        # then use the motion-free discard branch. A later Start action performs
-        # the reviewed home move.
+        # Stop in-flight policy commands now. The worker saves Success/Failure
+        # before permitting home; Stop/Retry remain motion-free discard paths.
         report = self._request_arm_stop(f"operator_{action}")
+        self._outcome_home_pending = action in {"success", "failure"} and bool(report.get("stopped"))
         self.env.cancel_pending_policy_step()
         if action in {"stop", "retry"}:
             self.current_events["retry"].set()
@@ -126,7 +144,8 @@ class SimVLADeployGuiApp(legacy_gui.DeployGuiApp):
         if report.get("stopped"):
             disposition = "saved" if action in {"success", "failure"} else "discarded"
             self.set_status(
-                f"Arm stopped; rollout will be {disposition} without an automatic home move."
+                f"Arm stopped; rollout will be {disposition}. "
+                + ("Returning home after saving." if self._outcome_home_pending else "Remaining stationary.")
             )
         else:
             self.set_status(
@@ -280,6 +299,16 @@ class SimVLADeployGuiApp(legacy_gui.DeployGuiApp):
         self.simvla_controller.write_runtime_summary()
 
     def on_close(self):
+        if not hasattr(self, "_outcome_lock"):
+            self._outcome_lock = threading.RLock()
+        with self._outcome_lock:
+            self._outcome_home_pending = False
+            if self.current_events is not None:
+                self.current_events["retry"].set()
+                self._request_arm_stop("gui_close")
+        return self._close_after_cancel()
+
+    def _close_after_cancel(self):
         if self.current_events is not None:
             self._request_arm_stop("gui_close")
             # The copied close path sets the event that triggers an automatic

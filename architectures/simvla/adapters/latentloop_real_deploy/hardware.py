@@ -296,6 +296,16 @@ class SafeUR5eDeployEnv(legacy_deploy.UR5eDeployEnv):
             self._policy_commands_armed = False
             self._cancel_next_disarmed_policy_step = True
 
+    def allow_outcome_home(self) -> None:
+        """Called by the rollout worker after saving an operator outcome.
+
+        Re-enable only home motion, never a late policy output. The GUI
+        serializes this with Stop/Retry/Exit, which can abort home at any time.
+        """
+        with self._command_lock:
+            self._policy_commands_armed = False
+            self._motion_abort.clear()
+
     def move_to_home(self):
         if len(self.cfg.home_pose) < 6:
             raise ValueError("home_pose must contain at least 6 joint values")
@@ -491,6 +501,16 @@ class SafeUR5eDeployEnv(legacy_deploy.UR5eDeployEnv):
                 self._cancel_next_disarmed_policy_step = False
                 return POLICY_STEP_CANCELLED
             result = super().step(rebased_target, float(target_gripper))
+            self.last_control_sample = {
+                "actual_tcp_rotvec_before_command": actual_tcp.tolist(),
+                "commanded_tcp_rotvec": legacy_deploy._pose6d_to_ur_tcp(rebased_target).tolist(),
+                "requested_gripper_model": float(target_gripper),
+                "sent_gripper_position": getattr(self, "_last_gripper_pos", None),
+                "previous_target_tracking_error": (
+                    tcp_tracking_error(actual_tcp, self._last_commanded_tcp)
+                    if self._last_commanded_tcp is not None else None
+                ),
+            }
             self._upstream_reference_target = target.copy()
             self._last_commanded_tcp = legacy_deploy._pose6d_to_ur_tcp(rebased_target)
             return result
