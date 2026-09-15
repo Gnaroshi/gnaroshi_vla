@@ -259,6 +259,51 @@ def validate_completion(output, identity):
     return True
 
 
+def recover_stage_summary(output, stage, identity):
+    """Repair a final-write failure from complete units, without loading a model."""
+    from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mechanism import REGIMES, VARIANTS, completed_unit
+    directory = output / stage
+    final = directory / "summary.json"
+    if final.exists():
+        return completed_unit(final, identity) is not None
+    selection = directory / "selection.json"
+    if not selection.exists():
+        return False
+    selected = json.loads(selection.read_text())
+    if selected["identity"] != identity:
+        raise RuntimeError("Cannot recover a foreign selection")
+    result = {"identity": identity, "complete": True, "recovered_from_units_without_gpu": True}
+    if stage == "offline":
+        units = list((directory / "units").glob("*.json"))
+        if len(units) != len(selected["heldout"]):
+            return False
+        expected_keys = {(r, a, v) for r in REGIMES for a in (1, 2, 3) for v in VARIANTS}
+        for path in units:
+            unit = completed_unit(path, identity)
+            keys = {(r["regime"], r["age"], r["variant"]) for r in unit["rows"]}
+            if keys != expected_keys or len(unit["rows"]) != len(expected_keys):
+                return False
+        result.update(windows=len(units), rows=len(units) * len(expected_keys))
+    else:
+        invalid = branches = 0
+        for case in selected["cases"]:
+            unit = directory / "units" / f"task_{case['task_id']:02d}_trial_{case['trial_id']:02d}"
+            record = completed_unit(unit / "case.json", identity)
+            if record is None:
+                return False
+            if record.get("invalid_reason"):
+                invalid += 1
+                continue
+            for world in ("nominal", "displaced"):
+                for method in ("baseline", "hold", "zero_feature", "full_update"):
+                    if completed_unit(unit / f"{world}_{method}.json", identity) is None:
+                        return False
+                    branches += 1
+        result.update(planned_cases=len(selected["cases"]), invalid_cases=invalid, completed_branches=branches)
+    write_json(final, result)
+    return True
+
+
 def aggregate(output, identity):
     import numpy as np
     from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mechanism import action_metrics
@@ -310,6 +355,26 @@ def aggregate(output, identity):
                 response = action_metrics(torch.tensor([a["first_action_chunk"]]), torch.tensor([b["first_action_chunk"]]))
                 if method in ("hold", "zero_feature") and response["first5_action_l1"] > 1e-6:
                     raise RuntimeError("An image-independent first query changed its action under an image-only intervention")
+                baseline_pair = {}
+                for world in ("nominal", "displaced"):
+                    baseline_path = case_path.parent / f"{world}_baseline.json"
+                    if baseline_path.exists():
+                        baseline_pair[world] = json.loads(baseline_path.read_text())
+                if len(baseline_pair) == 2 and all(r["first_action_chunk"] is not None for r in baseline_pair.values()):
+                    nominal = np.asarray(a["first_action_chunk"])
+                    displaced = np.asarray(b["first_action_chunk"])
+                    original_nominal = np.asarray(baseline_pair["nominal"]["first_action_chunk"])
+                    original_displaced = np.asarray(baseline_pair["displaced"]["first_action_chunk"])
+                    change = (displaced[:5] - nominal[:5]).reshape(-1)
+                    original_change = (original_displaced[:5] - original_nominal[:5]).reshape(-1)
+                    denominator = np.linalg.norm(change) * np.linalg.norm(original_change)
+                    response.update(
+                        baseline_response_l1=float(np.abs(original_change).mean()),
+                        response_alignment_cosine=None if denominator < 1e-12 else float(np.dot(change, original_change) / denominator),
+                        response_error_vs_baseline_l1=float(np.abs(change - original_change).mean()),
+                        nominal_first5_error_vs_baseline=float(np.abs(nominal[:5] - original_nominal[:5]).mean()),
+                        displaced_first5_error_vs_baseline=float(np.abs(displaced[:5] - original_displaced[:5]).mean()),
+                    )
                 responses.append({"task_id": case["task_id"], "trial_id": case["trial_id"], "method": method,
                                   "same_proprio": a["proprio_sha256"] == b["proprio_sha256"],
                                   "same_previous_condition": a["previous_condition_sha256"] == b["previous_condition_sha256"],
@@ -329,6 +394,7 @@ def aggregate(output, identity):
             "- 물체 변위는 첫 5개 action 후 주며, 양쪽에 동일한 prefix action을 실행하고 simulator state를 비교한다.",
             "- baseline이 회복하지 못한 사례, 관측 반응이 없는 사례도 제외하지 않는다.",
             "- 두 세계 간 첫 query action 차이는 반응의 크기이지 올바른 수정 방향 또는 인과 기여도의 증명은 아니다.",
+            "- 반응 방향 cosine은 같은 상황의 baseline 반응과 비교한다. 정답 행동이라고 가정하지 않으며 무반응일 때는 빈 값이다.",
             "- 계측 중 wall time은 논문용 policy latency가 아니다.", "", "## 동일 입력 첫 갱신", "",
             "| 방법 | 첫 5 action L1 | Condition cosine | Gate 평균 |", "|---|---:|---:|---:|"]
     for row in summary:
@@ -401,7 +467,11 @@ def main():
                     child.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     os.killpg(child.pid, signal.SIGTERM)
-                    child.wait(timeout=30)
+                    try:
+                        child.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(child.pid, signal.SIGKILL)
+                        child.wait()
             write_json(status, {"state": "INTERRUPTED", "signal": signum, "completed_units_preserved": True})
             raise KeyboardInterrupt
         signal.signal(signal.SIGINT, interrupt)
@@ -412,6 +482,8 @@ def main():
                 write_json(status, {"state": "PREFLIGHT_PASS", "identity": identity})
                 return 0
             failed = []
+            for stage in ("offline", "environment"):
+                recover_stage_summary(output, stage, identity)
             if not args.aggregate_only:
                 for number, stage in ((2, "offline"), (3, "environment")):
                     final = output / stage / "summary.json"
@@ -448,7 +520,7 @@ def main():
                                     log.flush()
                             rc = child.wait()
                             child = None
-                        if rc == 0 and final.exists():
+                        if recover_stage_summary(output, stage, identity):
                             break
                         print(f"{stage} 실행 오류 rc={rc}. 완료 단위는 보존합니다.", flush=True)
                     else:

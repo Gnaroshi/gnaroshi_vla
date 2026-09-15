@@ -15,6 +15,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mech
 )
 from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mechanism_environment import InterventionPolicy, assert_same_prefix
 from methods.latentloop.modules.native_simvla_v0 import TokenSharedConditionUpdater
+from tools.simvla.condition_mechanism_pipeline import recover_stage_summary
 
 
 @pytest.fixture
@@ -160,3 +161,31 @@ def test_native_queue_and_query_schedule(state, variant, refresh_count):
     assert len(calls) == refresh_count
     assert policy.query_index == 4
     assert np.array_equal(policy.first_intervention_chunk, chunk[0].numpy())
+
+
+def test_postprocess_only_recovery_needs_all_expected_rows(tmp_path):
+    from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mechanism import REGIMES, write_json
+    output = tmp_path / "offline"
+    write_json(output / "selection.json", {"identity": "x", "heldout": [[0, "demo", 0]]})
+    rows = [{"regime": r, "age": a, "variant": v} for r in REGIMES for a in (1, 2, 3) for v in VARIANTS]
+    path = output / "units/window_00000.json"
+    write_json(path, {"identity": "x", "complete": True, "rows": rows[:-1]})
+    assert not recover_stage_summary(tmp_path, "offline", "x")
+    write_json(path, {"identity": "x", "complete": True, "rows": rows})
+    assert recover_stage_summary(tmp_path, "offline", "x")
+    assert json.loads((output / "summary.json").read_text())["recovered_from_units_without_gpu"]
+
+
+def test_postprocess_environment_does_not_hide_missing_branch(tmp_path):
+    from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mechanism import write_json
+    output = tmp_path / "environment"
+    write_json(output / "selection.json", {"identity": "x", "cases": [{"task_id": 0, "trial_id": 0}]})
+    unit = output / "units/task_00_trial_00"
+    write_json(unit / "case.json", {"identity": "x", "complete": True, "invalid_reason": None})
+    for world in ("nominal", "displaced"):
+        for method in ("baseline", "hold", "zero_feature", "full_update"):
+            if (world, method) != ("displaced", "full_update"):
+                write_json(unit / f"{world}_{method}.json", {"identity": "x", "complete": True})
+    assert not recover_stage_summary(tmp_path, "environment", "x")
+    write_json(unit / "displaced_full_update.json", {"identity": "x", "complete": True})
+    assert recover_stage_summary(tmp_path, "environment", "x")
