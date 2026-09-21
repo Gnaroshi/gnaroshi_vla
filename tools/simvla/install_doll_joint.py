@@ -48,7 +48,9 @@ def relocation_payload(source, reference, checkpoint_digest, runtime_digest):
     for field in ("ip", "home_pose", "gripper", "control"):
         if source["hardware"]["robot"][field] != reference["hardware"]["robot"][field]:
             raise ValueError(f"Robot {field} differs from the existing Doll site")
-    if source["hardware"]["cameras"] != reference["hardware"]["cameras"]:
+    source_cameras = {k: v for k, v in source["hardware"]["cameras"].items() if k != "fps"}
+    reference_cameras = {k: v for k, v in reference["hardware"]["cameras"].items() if k != "fps"}
+    if source_cameras != reference_cameras:
         raise ValueError("Camera mapping/configuration differs from the existing Doll site")
     if not reference["safety_review"]["camera_role_mapping_verified"]:
         raise ValueError("The reference site has no reviewed camera mapping")
@@ -112,6 +114,9 @@ def install(source_path, reference_path, checkpoint, output):
             "robot_connected": False, "robot_commands_issued": 0,
             "model_inference_verified": False, "live_authorized": False,
             "immutable_model_files_hardlinked_when_possible": True,
+            "camera_fps": {"previous_manifest": reference["hardware"]["cameras"]["fps"],
+                           "requested": payload["hardware"]["cameras"]["fps"],
+                           "requires_fresh_sensor_profile": True},
         }
         (staging / "installation.json").write_text(json.dumps(report, indent=2) + "\n")
         os.rename(staging, output)

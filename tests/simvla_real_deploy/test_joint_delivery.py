@@ -45,6 +45,16 @@ def test_install_keeps_policy_and_rejects_stale_approval(manifests):
     assert payload["artifacts"]["real_action_transformer"]["path"].startswith("./checkpoints/")
 
 
+def test_camera_rate_is_not_a_camera_role_review(manifests):
+    new, old = manifests
+    old["hardware"]["cameras"]["fps"] = 30
+    new["hardware"]["cameras"]["fps"] = 60
+    result = relocation_payload(new, old, "a" * 64, new["runtime_source_identity_sha256"])
+    assert result["hardware"]["cameras"]["fps"] == 60
+    assert result["safety_review"]["camera_role_mapping_verified"]
+    assert not result["safety_review"]["read_only_profile_passed"]
+
+
 @pytest.mark.parametrize("change", ["checkpoint", "runtime", "camera", "norm", "action", "ours"])
 def test_install_rejects_mismatches(manifests, change):
     new, old = manifests
