@@ -48,11 +48,11 @@ def deterministic(seed):
     torch.use_deterministic_algorithms(True)
 
 
-def load_components(config):
+def load_components(config, condition_path=None):
     import torch
     from openpi.policies import policy_config
     from openpi.training import config as config_api
-    from architectures.openpi.adapters.latentloop.serialization import load_adapter_checkpoint
+    from architectures.openpi.adapters.latentloop.aligned_condition import load_condition
     deterministic(config["train_seed"])
     torch.cuda.set_per_process_memory_fraction(0.90)
     base = policy_config.create_trained_policy(
@@ -60,15 +60,14 @@ def load_components(config):
         pytorch_device="cuda", sample_kwargs={"num_steps": 10})
     model = base._model
     model.requires_grad_(False).eval()
-    condition, payload = load_adapter_checkpoint(config["condition_checkpoint"], "cuda")
-    condition.requires_grad_(False).eval()
+    condition = None
+    if condition_path is not None:
+        condition, _ = load_condition(condition_path, "cuda", config_id=config["config_id"])
+        condition.requires_grad_(False).eval()
     if model.config.action_horizon != 10:
         raise ValueError("expected the reproduced H=10 pi0.5 policy")
-    # The old checkpoint must identify the same teacher, not just compatible tensor shapes.
-    provenance = payload.get("config", {}).get("provenance", {})
-    expected = config["baseline_model_sha256"]
-    if provenance.get("checkpoint_model_sha256") != expected:
-        raise ValueError(f"condition teacher hash mismatch: {provenance.get('checkpoint_model_sha256')}")
+    if model.config.discrete_state_input:
+        raise ValueError("the reproduced baseline uses a fixed instruction, without state tokenization")
     return base, model, condition
 
 
@@ -93,6 +92,45 @@ class TrainingPairs:
                     int(underlying.episode_data_index["to"][e.episode_id])) != (e.dataset_frame_start, e.dataset_frame_stop):
                     raise ValueError("dataset frame boundaries changed")
         self.final_manifest = read_json(config["final_manifest"])
+        train_ids = {e.episode_id for e in self.roles["train"]}
+        heldout_ids = {e.episode_id for e in self.roles["checkpoint_validation"]}
+        if train_ids & heldout_ids:
+            raise ValueError("train/heldout episode overlap")
+        for role, rows in self.roles.items():
+            if {e.benchmark_task_index for e in rows} != set(range(10)):
+                raise ValueError(f"{role} must cover all ten LIBERO-Long tasks")
+
+    @property
+    def validation_count(self):
+        return 3 * len(self.roles["checkpoint_validation"])
+
+    def window(self, index, role="train"):
+        import numpy as np
+        import torch
+        from architectures.openpi.adapters.latentloop.streaming_teacher import _raw_policy_observation
+        from architectures.openpi.adapters.latentloop.policy_io import prepare_policy_observation
+        from architectures.openpi.adapters.latentloop.cache_contract_v2 import resolve_task_identity
+        rows = self.roles[role]
+        if role == "checkpoint_validation":
+            if not 0 <= index < self.validation_count:
+                raise IndexError("validation index outside the frozen episode/stage manifest")
+            e = rows[index // 3]
+            start = round((index % 3) * (e.query_count - 4) / 2)
+        else:
+            rng = np.random.default_rng(np.random.SeedSequence([self.config["train_seed"], index]))
+            e = rows[int(rng.integers(len(rows)))]
+            start = int(rng.integers(e.query_count - 3))
+        observations = []
+        for q in range(start, start + 4):
+            sample = self.dataset[e.dataset_frame_start + q * 5]
+            task = resolve_task_identity(int(sample["task_index"]), str(sample["prompt"]), self.final_manifest)
+            if (task["suite"], int(task["benchmark_task_index"])) != (e.suite, e.benchmark_task_index):
+                raise ValueError("demonstration task identity mismatch")
+            if int(sample["frame_index"]) != q * 5 or bool(torch.as_tensor(sample["actions_is_pad"][:5]).any()):
+                raise ValueError("window crosses an episode boundary")
+            observations.append(prepare_policy_observation(self.policy, _raw_policy_observation(sample))[0])
+        return observations, {"episode_id": e.episode_id, "task_id": e.benchmark_task_index,
+                              "query_index": start, "role": role}
 
     def pair(self, index, role="train"):
         import numpy as np
@@ -133,18 +171,15 @@ def training_prefix(model, condition, observations, executed, approximate):
         if not approximate:
             extraction = hook.extract(observations[1])
             return extraction.state, extraction.robot_state
-        previous = hook.extract(observations[0]).state
-        current, robot_state, _ = hook.embed(observations[1])
-        update = condition(previous, current, previous.embeddings, executed, robot_state,
-                           delta_q=1, delta_a=5, full_refresh_age=1,
-                           executed_action_lengths=torch.tensor([5], device=executed.device))
-        return update.state.detach(), robot_state
+        raise ValueError("Generation is trained independently on full teacher conditions")
 
 
 def load_generation(path, device="cuda"):
     import torch
     from methods.latentloop.modules.flow_hidden_update import FlowHiddenConfig, FlowHiddenUpdater
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload.get("format") != "pi05_simvla_core_generation_v1":
+        raise ValueError("not a method-aligned Generation checkpoint")
     module = FlowHiddenUpdater(FlowHiddenConfig(**payload["updater_config"]))
     module.load_state_dict(payload["updater"], strict=True)
     return module.to(device).eval(), payload

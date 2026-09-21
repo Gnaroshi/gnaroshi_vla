@@ -54,7 +54,7 @@ def test_ng3_counters_and_gradients():
     assert result.metrics["oracle_calls"] == 7
     assert result.metrics["flow_iterations"] == 10
     result.loss.backward()
-    assert updater.up.weight.grad.abs().sum() > 0
+    assert updater.core.hidden_up.weight.grad.abs().sum() > 0
     assert all(p.grad is None for p in model.parameters())
 
 

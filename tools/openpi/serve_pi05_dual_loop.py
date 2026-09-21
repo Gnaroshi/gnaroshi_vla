@@ -16,9 +16,9 @@ from openpi.serving.websocket_policy_server import WebsocketPolicyServer
 
 
 class ServingPolicy:
-    def __init__(self, config, generation_path):
+    def __init__(self, config, condition_path, generation_path):
         self.config = config
-        self.base, model, condition = load_components(config)
+        self.base, model, condition = load_components(config, condition_path)
         generation, payload = load_generation(generation_path)
         if payload["config_id"] != config["config_id"]:
             raise ValueError("generation checkpoint belongs to a different experiment contract")
@@ -29,6 +29,10 @@ class ServingPolicy:
         self.metadata = {"config_id": config["config_id"], "rows": list(ROWS), "action_horizon": 10,
                          "execution_horizon": 5, "integration_steps": 10,
                          "generation_step": payload["step"], "generation_checkpoint": str(generation_path)}
+        from dual_loop_runtime import sha256
+        self.metadata.update(condition_checkpoint=str(condition_path),
+                             condition_sha256=sha256(condition_path), generation_sha256=sha256(generation_path),
+                             method_contract="simvla_core_condition_and_generation_v1")
 
     def reset(self):
         self.episode = None
@@ -80,10 +84,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
     p.add_argument("--generation", required=True)
+    p.add_argument("--condition", required=True)
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--ready", required=True)
     args = p.parse_args()
-    policy = ServingPolicy(read_json(args.config), Path(args.generation))
+    policy = ServingPolicy(read_json(args.config), Path(args.condition), Path(args.generation))
     server = WebsocketPolicyServer(policy, host="127.0.0.1", port=args.port, metadata=policy.metadata)
     atomic_json(args.ready, policy.metadata)
     server.serve_forever()

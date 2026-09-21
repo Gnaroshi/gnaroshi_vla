@@ -16,7 +16,7 @@ ROWS = {
     "dual_k2_ng3": (2, 3),
     "naive_nfe3": (1, 3),
 }
-ANCHORS = {10: tuple(range(10)), 3: (0, 4, 7)}
+ANCHORS = {10: tuple(range(10)), 3: (0, 4, 8), 2: (0, 5)}
 
 
 def sync(device):
@@ -55,7 +55,7 @@ class GenerationResult:
 
 def generate(model, hook, prefix, robot_state, noise, updater, *, n_g=3, train=False):
     if n_g not in ANCHORS or (n_g != 10 and updater is None):
-        raise ValueError("generation supports N_G=3 or exact N_G=10")
+        raise ValueError("generation supports N_G=2,3 or exact N_G=10")
     if model.config.action_horizon != 10:
         raise ValueError("this checkpoint contract requires H=10")
     device = noise.device
@@ -102,8 +102,8 @@ def generate(model, hook, prefix, robot_state, noise, updater, *, n_g=3, train=F
                         model, robot_state, prefix.pad_mask, cache, x.detach(), t)
                 h_loss = F.mse_loss(F.layer_norm(hidden.float(), (hidden.shape[-1],)),
                                     F.layer_norm(target_hidden.float(), (hidden.shape[-1],)))
-                v_loss = F.mse_loss(velocity, target_velocity) / target_velocity.square().mean().clamp_min(1e-4)
-                losses.append(h_loss + v_loss)
+                v_loss = F.l1_loss(velocity, target_velocity)
+                losses.append(h_loss)
                 hidden_losses.append(h_loss.detach())
                 velocity_losses.append(v_loss.detach())
                 metrics["oracle_calls"] += 1
@@ -116,7 +116,7 @@ def generate(model, hook, prefix, robot_state, noise, updater, *, n_g=3, train=F
     loss = torch.stack(losses).mean() if losses else None
     if losses:
         metrics["hidden_normalized_mse"] = float(torch.stack(hidden_losses).mean())
-        metrics["velocity_relative_mse"] = float(torch.stack(velocity_losses).mean())
+        metrics["velocity_l1_monitor_only"] = float(torch.stack(velocity_losses).mean())
     if not torch.isfinite(x).all():
         raise FloatingPointError("nonfinite generation output")
     return GenerationResult(x, metrics, loss)
@@ -133,7 +133,7 @@ class DualLoopPolicy:
     def reset(self):
         self.query_index = 0
         self.prefix = None
-        self.previous_embeddings = None
+        self.previous_observation = None
 
     @torch.no_grad()
     def query(self, observation, noise, executed_actions=None):
@@ -157,20 +157,15 @@ class DualLoopPolicy:
                            "prefix_transformer_ms": extraction.full_prefix_ms,
                            "condition_updater_ms": 0.0}
             else:
-                current, robot_state, embedding_ms = self.hook.embed(observation)
-                if executed_actions is None or tuple(executed_actions.shape[1:]) != (5, 7):
-                    raise ValueError("condition update requires the previous five executed physical actions")
+                robot_state = observation.state
                 sync(noise.device)
                 start = time.perf_counter()
-                update = self.condition_updater(
-                    self.prefix, current, self.previous_embeddings, executed_actions, robot_state,
-                    delta_q=1, delta_a=5, full_refresh_age=self.query_index % self.k_c,
-                    executed_action_lengths=torch.full((noise.shape[0],), 5, device=noise.device, dtype=torch.long))
-                self.prefix = update.state
+                self.prefix, _ = self.condition_updater(
+                    self.prefix, self.previous_observation, observation, age=self.query_index % self.k_c)
                 sync(noise.device)
-                metrics = {"prefix_embedding_ms": embedding_ms, "prefix_transformer_ms": 0.0,
+                metrics = {"prefix_embedding_ms": 0.0, "prefix_transformer_ms": 0.0,
                            "condition_updater_ms": (time.perf_counter() - start) * 1000}
-            self.previous_embeddings = self.prefix.embeddings
+            self.previous_observation = observation
             result = generate(self.model, self.hook, self.prefix, robot_state, noise,
                               self.generation_updater, n_g=self.n_g)
             actions = result.actions

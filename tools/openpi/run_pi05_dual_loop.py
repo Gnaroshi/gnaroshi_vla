@@ -24,7 +24,6 @@ def configure(storage, output):
     old = storage / "results/openpi/latentloop/contracts/pi05_v0_mode_b_rb2_seed42_30k"
     source = read_json(old / "source_lock_v2.json")
     checkpoint = Path(source["checkpoint"]["directory"])
-    condition = storage / "results/openpi/latentloop/cacheless_streaming/train/pi05_v0_mode_b_rb2_seed42_30k/checkpoints/best.pt"
     for path, expected in ((checkpoint / "model.safetensors", source["checkpoint"]["model_sha256"]),
                            (checkpoint / "assets/physical-intelligence/libero/norm_stats.json", source["normalization"]["sha256"])):
         if sha256(path) != expected:
@@ -42,21 +41,34 @@ def configure(storage, output):
                 "src/openpi/training/config.py", "src/openpi/policies/policy_config.py"):
         sources["upstream/" + rel] = sha256(UPSTREAM / rel)
     config = {
-        "run_name": "pi05_dual_loop_long_seed7", "checkpoint": str(checkpoint),
+        "run_name": "pi05_method_aligned_long_seed7", "checkpoint": str(checkpoint),
         "baseline_model_sha256": source["checkpoint"]["model_sha256"],
         "normalization_sha256": source["normalization"]["sha256"],
-        "condition_checkpoint": str(condition), "condition_checkpoint_sha256": sha256(condition),
+        "method_contract": "simvla_core_condition_and_generation_v1",
+        "condition_initialization": "fresh; legacy pi05 checkpoints prohibited",
         "split_contract": str(old / "protocol/pi05_split_contract_v2.json"),
         "final_manifest": str(old / "protocol/pi05_final_evaluation_manifest_v2.json"),
-        "train_seed": 42, "noise_seed": 7, "train_steps": 10000, "validation_queries": 20,
+        "train_seed": 42, "noise_seed": 7,
+        "train_steps": int(os.environ.get("PI05_GENERATION_STEPS", "10000")),
+        "condition_steps": int(os.environ.get("PI05_CONDITION_STEPS", "10000")),
+        "validation": "all heldout LIBERO-Long episodes x early/middle/late windows",
+        "checkpoint_selection": "final step for both modules; validation best is diagnostic only",
         "learning_rate": {"peak": 1e-4, "warmup_steps": 200, "final": 1e-5, "schedule": "cosine_10k"},
-        "training_objective": "layer_normalized_hidden_MSE + relative_velocity_MSE_at_student_x",
-        "condition_training": "reuse_frozen_previous_V0_best; no additional condition optimization",
-        "generation_training": "50% exact prefix, 50% frozen condition age1; separate updater, not joint finetuning",
-        "H": 10, "R": 5, "integration_steps": 10, "generation_anchors_zero_based": [0, 4, 7],
+        "training_objective": "layer_normalized_hidden_MSE_at_student_x; velocity L1 monitor only",
+        "condition_training": "three recursive updates, no teacher forcing, full BPTT, checkpointed frozen expert",
+        "condition_weights": {"condition": 0.5, "first5_action": 2.0, "full_chunk_action": 0.5,
+                              "continuous_gripper": 0.25, "update_regularization": 0.001},
+        "loss_weight_provenance": "transferred from actual SimVLA native V0 150K checkpoint; not pi05 tuned",
+        "generation_training": "full teacher prefix only; independent training, no joint finetuning",
+        "H": 10, "R": 5, "integration_steps": 10, "generation_anchors_zero_based": [0, 4, 8],
+        "generation_training_anchors_zero_based": [0, 5],
         "rows": list(ROWS), "episodes_per_row": 500, "source_sha256": sources,
         "wandb_mode": os.environ.get("WANDB_MODE", "online"),
     }
+    if min(config["condition_steps"], config["train_steps"]) < 1:
+        raise ValueError("training budgets must be positive")
+    config["learning_rate"] = {"peak": 1e-4, "warmup": "min(200,total_steps//20), at least 1",
+                               "final": 1e-5, "schedule": "cosine with each module's declared total_steps"}
     for field in ("split_contract", "final_manifest"):
         config[field + "_sha256"] = sha256(config[field])
     config["config_id"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
@@ -124,7 +136,7 @@ def run_logged(command, logfile):
                     process.wait()
 
 
-def eval_rows(config_path, generation, output, rows, smoke=False):
+def eval_rows(config_path, condition, generation, output, rows, smoke=False):
     from websockets.sync.client import connect
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -132,7 +144,7 @@ def eval_rows(config_path, generation, output, rows, smoke=False):
     ready = output / "server_ready.json"
     ready.unlink(missing_ok=True)
     server_cmd = [sys.executable, ROOT / "tools/openpi/serve_pi05_dual_loop.py", "--config", config_path,
-                  "--generation", generation, "--port", str(port), "--ready", ready]
+                  "--condition", condition, "--generation", generation, "--port", str(port), "--ready", ready]
     output.mkdir(parents=True, exist_ok=True)
     with (output / "server.log").open("a") as log:
         server = subprocess.Popen([str(x) for x in server_cmd], stdout=log, stderr=subprocess.STDOUT)
@@ -179,8 +191,9 @@ def aggregate(output):
     atomic_json(output / "combined_summary.json", summaries)
     baseline_ms = summaries["baseline"]["policy_ms_per_actual_action"]
     lines = ["# pi0.5 LIBERO-Long 두 Loop 결과", "", "각 행 10 tasks x 50 trials, seed 7. rb2 RTX5090.",
-             "Condition은 기존 V0 checkpoint를 고정하고 Generation만 10K 학습했다. 두 모듈 공동학습은 아니다.",
-             "학습 손실은 새 이식의 설계 선택이며 원 논문의 공식 pi0.5 설정이 아니다.", "",
+             "SimVLA와 동일한 updater core를 pi0.5 KV/hidden 입출력에 연결했다. 두 모듈을 새로 독립 학습했다.",
+             "사전에 고정한 마지막 학습 step을 평가하며, 과거 pi0.5 Condition checkpoint를 사용하지 않는다.",
+             "단일 evaluation seed의 신규 architecture 이식 결과이며, 공식 pi0.5 논문 재현 수치가 아니다.", "",
              "| 구성 | 성공 | 성공률 | policy ms/실행 action | baseline 대비 가속 |",
              "|---|---:|---:|---:|---:|"]
     for row, s in summaries.items():
@@ -191,7 +204,7 @@ def aggregate(output):
               "이는 한 seed의 신규 평가이며 이전 4-suite 평균과 직접 동일시하지 않는다."]
     (output / "report_ko.md").write_text("\n".join(lines) + "\n")
     with zipfile.ZipFile(output / "results_for_chatgpt.zip", "w", zipfile.ZIP_DEFLATED) as archive:
-        for pattern in ("*.json", "*.md", "train/*.json", "eval/*/*.json", "eval/*/*.csv"):
+        for pattern in ("*.json", "*.md", "condition/*.json", "train/*.json", "eval/*/*.json", "eval/*/*.csv"):
             for path in output.glob(pattern):
                 archive.write(path, path.relative_to(output))
 
@@ -201,7 +214,7 @@ def main():
     p.add_argument("mode", choices=("prepare", "verify", "all", "summarize"))
     args = p.parse_args()
     storage = Path(os.environ["PI05_STORAGE"])
-    output = Path(os.environ.get("PI05_DUAL_OUTPUT", storage / "results/openpi/dual_loop/libero_long_seed7"))
+    output = Path(os.environ.get("PI05_DUAL_OUTPUT", storage / "results/openpi/dual_loop/method_aligned_long_seed7"))
     output.mkdir(parents=True, exist_ok=True)
     (output / "logs").mkdir(exist_ok=True)
     lock = (output / "pipeline.lock").open("w")
@@ -229,17 +242,26 @@ def main():
         atomic_json(status, {"phase": phase, "state": "running"})
         wait_gpu()
         verification = output / "verification.json"
-        if not verification.exists():
+        if not verification.exists() or not read_json(verification).get("pass"):
             phase = "bounded_verification"
             atomic_json(status, {"phase": phase, "state": "running"})
+            run_logged([sys.executable, ROOT / "tools/openpi/train_pi05_condition.py", "--config", config_path,
+                        "--output", output / "smoke_condition", "--steps", "2", "--smoke"], output / "logs/verify_condition.log")
             run_logged([sys.executable, ROOT / "tools/openpi/train_pi05_generation.py", "--config", config_path,
                         "--output", output / "smoke_train", "--steps", "2", "--smoke"], output / "logs/verify_train.log")
-            eval_rows(config_path, output / "smoke_train/best.pt", output / "smoke_eval", ROWS, smoke=True)
+            eval_rows(config_path, output / "smoke_condition/final.pt", output / "smoke_train/final.pt",
+                      output / "smoke_eval", ROWS, smoke=True)
             atomic_json(verification, {"pass": True, "config_id": config["config_id"],
-                                      "scope": "2 training steps + 10 environment steps per row; no SR claim"})
+                                      "scope": "2 steps per module + 10 environment steps per row; no SR claim"})
         if args.mode == "verify":
             atomic_json(status, {"phase": "verified", "state": "complete"})
             return
+        phase = "condition_train"
+        atomic_json(status, {"phase": phase, "state": "running"})
+        condition_summary = output / "condition/summary.json"
+        if not condition_summary.exists() or not read_json(condition_summary).get("complete"):
+            run_logged([sys.executable, ROOT / "tools/openpi/train_pi05_condition.py", "--config", config_path,
+                        "--output", output / "condition", "--steps", str(config["condition_steps"])], output / "logs/condition.log")
         phase = "generation_train"
         atomic_json(status, {"phase": phase, "state": "running"})
         train_summary = output / "train/summary.json"
@@ -248,7 +270,7 @@ def main():
                         "--output", output / "train", "--steps", str(config["train_steps"])], output / "logs/train.log")
         phase = "libero_long_eval"
         atomic_json(status, {"phase": phase, "state": "running"})
-        eval_rows(config_path, output / "train/best.pt", output / "eval", ROWS)
+        eval_rows(config_path, output / "condition/final.pt", output / "train/final.pt", output / "eval", ROWS)
         phase = "summarize"
         aggregate(output)
         atomic_json(status, {"phase": "complete", "state": "complete", "config_id": config["config_id"]})
