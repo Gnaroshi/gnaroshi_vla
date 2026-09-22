@@ -182,7 +182,8 @@ def test_old_command_delegates_to_one_configuration(name):
     assert "doll_joint_baseline:" in result.stdout
 
 
-@pytest.mark.parametrize("preset,success", [("doll_joint_baseline", True), ("doll_joint_ours", False), ("doll_legacy_baseline", False)])
+@pytest.mark.parametrize("preset,success", [("doll_joint_baseline", True), ("doll_joint_ours", False), ("doll_legacy_baseline", False),
+                                          ("doll_baseline", True), ("doll_ours", False)])
 def test_real_selection_rejects_wrong_teacher_before_sensors(tmp_path, preset, success):
     manifest = selection_manifest(tmp_path)
     result = subprocess.run(["/bin/bash", str(ENTRY), "--inspect", "--preset", preset, "--max-steps", "9000"],
@@ -193,6 +194,7 @@ def test_real_selection_rejects_wrong_teacher_before_sensors(tmp_path, preset, s
     if success:
         assert '"max_steps": 9000' in result.stdout
         assert '"robot_connected": false' in result.stdout
+        assert '3.0502887' in result.stdout
     else:
         assert "[1/2]" not in result.stdout
 
@@ -203,3 +205,52 @@ def test_retired_entrypoints_and_presets_are_removed():
     result = subprocess.run(["/bin/bash", str(ENTRY), "--list"], capture_output=True, text=True)
     assert "legacy" not in result.stdout
     assert "doll_joint_baseline" in result.stdout
+
+
+def test_print_config_needs_no_python_assets_or_log_files(tmp_path):
+    logs = tmp_path / "logs"
+    result = subprocess.run(["/bin/bash", str(ENTRY), "--print-config", "--control-freq", "40",
+                             "--max-steps", "1234", "--gui-font-backend", "conda"], capture_output=True, text=True,
+        env={**os.environ, "SIMVLA_STRICT_EXIT": "1", "SIMVLA_REAL_PYTHON": "/does/not/exist",
+             "SIMVLA_REAL_LOG_ROOT": str(logs)})
+    assert result.returncode == 0
+    assert "target_control_hz=40" in result.stdout and "max_steps=1234" in result.stdout
+    assert "gui_font_backend=conda" in result.stdout and "mode=--live" in result.stdout
+    assert not logs.exists()
+
+
+def test_profile_arguments_reach_read_only_engine(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    marker = tmp_path / "engine_command"
+    python = bindir / "python"
+    python.write_text('#!/bin/sh\nexit 0\n')
+    python.chmod(0o755)
+    bash = bindir / "bash"
+    bash.write_text('#!/bin/sh\nprintf "%s|%s\\n" "$SIMVLA_REAL_CUDA_DEVICE" "$*" > "$MARKER"\n')
+    bash.chmod(0o755)
+    result = subprocess.run(["/bin/bash", str(ENTRY), "--profile", "--profile-steps", "23",
+                            "--control-freq", "40", "--camera-fps", "30", "--cuda-device", "5"],
+        capture_output=True, text=True,
+        env={**os.environ, "SIMVLA_STRICT_EXIT": "1", "SIMVLA_REAL_PYTHON": str(python),
+             "SIMVLA_REAL_LOG_ROOT": str(tmp_path / "logs"), "MARKER": str(marker),
+             "PATH": str(bindir) + ":" + os.environ["PATH"]})
+    assert result.returncode == 0
+    command = marker.read_text()
+    assert command.startswith("5|") and "read-only-profile" in command
+    assert "--steps 23" in command and "--profile-target-hz 40" in command
+    assert "--profile-camera-fps 30" in command
+
+
+@pytest.mark.parametrize("replacement", ["", '"doll_baseline" "doll_ours"'])
+def test_ambiguous_top_level_selection_stops_before_python(tmp_path, replacement):
+    script = ENTRY.read_text()
+    start = script.index("deploy_presets=(")
+    end = script.index(")", start) + 1
+    entry = tmp_path / "a/b/c/deploy_ll.sh"
+    entry.parent.mkdir(parents=True)
+    entry.write_text(script[:start] + f"deploy_presets=({replacement})" + script[end:])
+    result = subprocess.run(["/bin/bash", str(entry)], capture_output=True, text=True,
+        env={**os.environ, "SIMVLA_STRICT_EXIT": "1", "SIMVLA_REAL_PYTHON": "/does/not/exist"})
+    assert result.returncode == 2
+    assert "deploy_presets에서 하나만" in result.stdout

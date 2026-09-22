@@ -172,6 +172,81 @@ def test_numeric_input():
     assert launcher.numbers("0.1, 0.2, 0.3", 3) == [0.1, 0.2, 0.3]
 
 
+def home_options(**changes):
+    return SimpleNamespace(**{
+        "control_hz": 60.0, "num_rollouts": 15, "warmup_steps": 3, "camera_fps": 60,
+        "home_pose_json": "[3.0502887,-1.6030570,1.8191951,-1.8019783,-1.5417574,-1.6144441,0.0]",
+        "home_pose_source": "stackcupanddoll/0511_172010 first joint_positions; gripper open",
+        **changes,
+    })
+
+
+def test_home_override_preserves_model_action_and_original_manifest(evidence):
+    contract, _, _ = evidence
+    original = copy.deepcopy(contract.payload)
+    payload = copy.deepcopy(original)
+    payload["task_id"] = "stackcupanddoll"
+    result = launcher.apply_runtime_options(payload, home_options())
+    assert contract.payload == original
+    for key in ("policy", "state", "action", "artifacts", "pairing", "runtime_source_identity_sha256"):
+        assert result[key] == original[key]
+    assert result["hardware"]["robot"]["home_pose"] == json.loads(home_options().home_pose_json)
+    audit = result["launch_home_pose"]
+    assert audit["manifest_home_pose"] == original["hardware"]["robot"]["home_pose"]
+    assert audit["selected_home_pose"] == result["hardware"]["robot"]["home_pose"]
+    assert audit["robot_movement_verified"] is False
+
+
+@pytest.mark.parametrize("home", ["[]", "{}", "[0,0,0,0,0,0]", "[true,0,0,0,0,0,0]",
+                                  "[NaN,0,0,0,0,0,0]", "[0,0,0,0,0,0,2]", "[7,0,0,0,0,0,0]"])
+def test_invalid_home_is_rejected(evidence, home):
+    contract, _, _ = evidence
+    contract.payload["task_id"] = "stackcupanddoll"
+    with pytest.raises(ValueError, match="home_pose"):
+        launcher.apply_runtime_options(contract.payload, home_options(home_pose_json=home))
+
+
+def test_doll_home_cannot_be_applied_to_another_task(evidence):
+    contract, _, _ = evidence
+    contract.payload["task_id"] = "cabinet"
+    with pytest.raises(ValueError, match="다른 task"):
+        launcher.apply_runtime_options(contract.payload, home_options())
+
+
+def test_home_requires_provenance(evidence):
+    contract, _, _ = evidence
+    contract.payload["task_id"] = "stackcupanddoll"
+    with pytest.raises(ValueError, match="home_pose_source"):
+        launcher.apply_runtime_options(contract.payload, home_options(home_pose_source=""))
+
+
+def test_system_tk_changes_only_child_environment(monkeypatch):
+    monkeypatch.setattr(launcher.Path, "is_file", lambda self: True)
+    original = {"LD_PRELOAD": "/existing.so", "CUDA_VISIBLE_DEVICES": "0"}
+    result = launcher.gui_environment(original, "system")
+    assert original == {"LD_PRELOAD": "/existing.so", "CUDA_VISIBLE_DEVICES": "0"}
+    assert result["LD_PRELOAD"].endswith(":/existing.so")
+    assert "libtcl8.6.so" in result["LD_PRELOAD"] and "libtk8.6.so" in result["LD_PRELOAD"]
+    assert result["TCL_LIBRARY"] == "/usr/share/tcltk/tcl8.6"
+    assert result["TK_LIBRARY"] == "/usr/share/tcltk/tk8.6"
+    assert result["CUDA_VISIBLE_DEVICES"] == "0"
+    assert launcher.gui_environment(original, "conda") == original
+    monkeypatch.setattr(launcher.Path, "is_file", lambda self: False)
+    with pytest.raises(FileNotFoundError, match="conda"):
+        launcher.gui_environment(original, "system")
+
+
+def test_hidden_gui_probe_uses_selected_backend_without_cuda(monkeypatch):
+    monkeypatch.setattr(launcher, "desktop_environment", lambda env: {"DISPLAY": ":1"})
+    seen = []
+    monkeypatch.setattr(launcher, "gui_environment", lambda env, backend: {**env, "TEST_BACKEND": backend})
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: seen.append(k) or SimpleNamespace(returncode=0))
+    exports = launcher.checked_desktop_exports({}, "system")
+    assert "DISPLAY=:1" in exports
+    assert seen[0]["env"]["CUDA_VISIBLE_DEVICES"] == ""
+    assert seen[0]["env"]["TEST_BACKEND"] == "system"
+
+
 def test_report_selection_does_not_select_other_method(tmp_path):
     for name, status in [("artifact-preflight_baseline", "0"), ("artifact-preflight_baseline_r2", "1"), ("artifact-preflight_baseline_fake", "0")]:
         run = tmp_path / name

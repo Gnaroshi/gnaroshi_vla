@@ -81,12 +81,31 @@ def desktop_environment(environ: dict, proc_root: Path = Path("/proc")) -> dict[
     return {"DISPLAY": display, **({"XAUTHORITY": authority} if authority else {})}
 
 
-def checked_desktop_exports(environ: dict) -> str:
+def gui_environment(environ: dict, backend: str) -> dict:
+    """Select Tk for this child only, without changing the model environment."""
+    result = dict(environ)
+    if backend == "conda":
+        return result
+    if backend != "system":
+        raise ValueError("gui_font_backend는 system 또는 conda이어야 합니다.")
+    libraries = [Path('/usr/lib/x86_64-linux-gnu') / name
+                 for name in ('libtcl8.6.so', 'libtk8.6.so')]
+    tcl, tk = Path('/usr/share/tcltk/tcl8.6'), Path('/usr/share/tcltk/tk8.6')
+    for path in [*libraries, tcl / 'init.tcl', tk / 'tk.tcl']:
+        if not path.is_file():
+            raise FileNotFoundError(f"System Tk 파일 없음: {path}. gui_font_backend=conda로 설정하세요.")
+    result.update(TCL_LIBRARY=str(tcl), TK_LIBRARY=str(tk),
+                  LD_PRELOAD=":".join([*(str(p) for p in libraries),
+                                       *([result['LD_PRELOAD']] if result.get('LD_PRELOAD') else [])]))
+    return result
+
+
+def checked_desktop_exports(environ: dict, backend: str = "conda") -> str:
     values = desktop_environment(environ)
     # A hidden Tk window verifies authentication without importing any robot interfaces.
     probe = subprocess.run([sys.executable, "-c",
         "import tkinter as tk; r=tk.Tk(); r.withdraw(); r.update_idletasks(); r.destroy()"],
-        env={**environ, **values, "CUDA_VISIBLE_DEVICES": ""},
+        env=gui_environment({**environ, **values, "CUDA_VISIBLE_DEVICES": ""}, backend),
         text=True, capture_output=True, timeout=10)
     if probe.returncode:
         raise RuntimeError(f"GUI 연결 확인 실패: {probe.stderr.strip()}")
@@ -339,6 +358,28 @@ def apply_runtime_options(payload: dict, args: argparse.Namespace) -> dict:
         warmup_steps=args.warmup_steps,
     )
     payload["hardware"]["cameras"]["fps"] = args.camera_fps
+    home_json = getattr(args, 'home_pose_json', None)
+    if home_json is not None:
+        if payload.get('task_id') != 'stackcupanddoll':
+            raise ValueError('Doll 시작 자세를 다른 task에 적용할 수 없습니다.')
+        home = json.loads(home_json)
+        if (not isinstance(home, list) or len(home) != 7
+                or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                       or not math.isfinite(x) for x in home)
+                or any(abs(x) > 2 * math.pi for x in home[:6])
+                or not 0 <= home[6] <= 1):
+            raise ValueError('home_pose는 6개 관절각(rad, +/-2pi)와 gripper(0~1)의 JSON 배열이어야 합니다.')
+        source = getattr(args, 'home_pose_source', '')
+        if not source.strip():
+            raise ValueError('home_pose_source가 필요합니다.')
+        robot = payload['hardware']['robot']
+        payload['launch_home_pose'] = {
+            'manifest_home_pose': list(robot['home_pose']), 'selected_home_pose': home,
+            'source': source, 'scope': 'home target only; model/action normalization unchanged',
+            'robot_movement_verified': False,
+        }
+        robot['home_pose'] = home
+        robot['home_pose_source'] = source
     return payload
 
 
@@ -366,13 +407,15 @@ def inspect_selection(args: argparse.Namespace) -> dict:
             raise FileNotFoundError(f"{key} 파일이 없습니다: {paths[key]}")
     if args.max_steps < 1:
         raise ValueError("max_steps는 양의 정수이어야 합니다.")
-    apply_runtime_options(copy.deepcopy(payload), args)
+    apply_runtime_options(payload, args)
     policy = payload["policy"]
     return {
         "verdict": "PRESET_SELECTION_PASS", "deployment_id": deployment, "task_id": task,
         "method": args.method, "manifest": str(args.manifest.resolve()),
         "instruction": payload["runtime"]["instructions"],
         "home_pose": payload["hardware"]["robot"]["home_pose"],
+        "home_pose_source": payload["hardware"]["robot"].get("home_pose_source"),
+        "launch_home_pose": payload.get("launch_home_pose"),
         "camera_serials": {role: payload["hardware"]["cameras"][role]["serial"] for role in ("exterior", "wrist")},
         "artifacts": {k: str(v) for k, v in paths.items()},
         "checkpoint_sha256": artifacts["real_action_transformer"]["sha256"],
@@ -394,6 +437,9 @@ def main() -> int:
     parser.add_argument("--camera-fps", type=int, default=60)
     parser.add_argument("--num-rollouts", type=int, default=15)
     parser.add_argument("--warmup-steps", type=int, default=3)
+    parser.add_argument("--home-pose-json", help="6개 관절각(rad) + gripper(0~1). TCP pose가 아님.")
+    parser.add_argument("--home-pose-source", default="")
+    parser.add_argument("--gui-font-backend", choices=("system", "conda"), default="conda")
     parser.add_argument("--site-profile", choices=("reviewed_workspace", "seer_doll"), default="reviewed_workspace")
     parser.add_argument("--method", choices=("baseline", "condition_loop", "latentloop"), default="baseline")
     parser.add_argument("--check", action="store_true", help="기존 결과만 확인. 하드웨어/GUI 실행 없음.")
@@ -404,7 +450,7 @@ def main() -> int:
     parser.add_argument("--expected-task-id")
     args = parser.parse_args()
     if args.desktop_environment:
-        print(checked_desktop_exports(dict(os.environ)))
+        print(checked_desktop_exports(dict(os.environ), args.gui_font_backend))
         return 0
     if args.inspect:
         print(json.dumps(inspect_selection(args), indent=2, ensure_ascii=False), flush=True)
@@ -445,12 +491,16 @@ def main() -> int:
             "confirmation": preset["operator_authorization"],
             "selected_method": args.method,
         }
+        payload["gui_font_backend"] = args.gui_font_backend
         path = write_manifest(contract, payload)
         os.environ.update(SIMVLA_REAL_LIVE_RUN="1", SIMVLA_REAL_DEPLOYMENT_ID=contract.deployment_id, SIMVLA_REAL_SITE_PROFILE="seer_doll")
         require_live_authorization(load_deployment_contract(path, verify_artifacts=False), deployment_method=args.method)
         description = {"baseline": "Baseline K_C=1,N_G=10", "condition_loop": "Ours Condition K_C=2,N_G=10", "latentloop": "Ours Condition+Generation K_C=2,N_G=3 (coupled checkpoint)"}[args.method]
         print(f"{description}: 목표 {args.control_hz:g} Hz / H=10,R=5 / 최대 {args.max_steps} steps / {args.num_rollouts} rollouts. GUI Start로 시작합니다.", flush=True)
-        return subprocess.call(["bash", str(ROOT / "architectures/simvla/wrappers/deploy_latentloop_real.sh"), "live", "--manifest", str(path), "--method", args.method])
+        print(f"시작 관절각(rad)+gripper: {payload['hardware']['robot']['home_pose']}", flush=True)
+        print(f"시작 자세 근거: {payload['hardware']['robot'].get('home_pose_source')}", flush=True)
+        return subprocess.call(["bash", str(ROOT / "architectures/simvla/wrappers/deploy_latentloop_real.sh"), "live", "--manifest", str(path), "--method", args.method],
+                               env=gui_environment(dict(os.environ), args.gui_font_backend))
     print(f"\nDoll baseline / H=10, R=5, flow=10 / 목표 {contract.runtime['control_frequency_hz']} Hz")
     print(f"한 번의 rollout, 최대 {args.max_steps} step. GUI에서 Start New Rollout을 눌러 시작합니다.")
     print(f"로봇 IP: {robot['ip']} / 시작 관절각(rad): {robot['home_pose']}")
