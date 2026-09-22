@@ -254,12 +254,56 @@ def apply_runtime_options(payload: dict, args: argparse.Namespace) -> dict:
     return payload
 
 
+def inspect_selection(args: argparse.Namespace) -> dict:
+    payload = json.loads(args.manifest.read_text())
+    deployment = payload.get("deployment_id")
+    if args.expected_deployment_id and deployment != args.expected_deployment_id:
+        raise ValueError(f"선택한 preset과 checkpoint 배포 ID가 다릅니다: {deployment} != {args.expected_deployment_id}")
+    task = payload.get("task_id")
+    if task is None and deployment == "stackcupanddoll_simvla_real_v2_corrected":
+        task = "stackcupanddoll"
+    if args.expected_task_id and task != args.expected_task_id:
+        raise ValueError(f"선택한 task와 manifest가 다릅니다: {task} != {args.expected_task_id}")
+    allowed = payload.get("enabled_methods", ["baseline", "condition_loop", "latentloop"])
+    if args.method not in allowed:
+        raise ValueError(f"이 checkpoint는 {args.method}를 지원하지 않습니다. 허용된 방법: {allowed}. 이전 Ours를 연결하지 않습니다.")
+    required = ["real_action_transformer", "norm_stats"]
+    if args.method != "baseline":
+        required += ["condition_updater"]
+    if args.method == "latentloop":
+        required += ["coupled_generation_updater"]
+    artifacts = payload.get("artifacts", {})
+    paths = {}
+    for key in required:
+        paths[key] = (args.manifest.parent / artifacts[key]["path"]).resolve()
+        if not paths[key].is_file():
+            raise FileNotFoundError(f"{key} 파일이 없습니다: {paths[key]}")
+    if args.max_steps < 1:
+        raise ValueError("max_steps는 양의 정수이어야 합니다.")
+    apply_runtime_options(copy.deepcopy(payload), args)
+    policy = payload["policy"]
+    return {
+        "verdict": "PRESET_SELECTION_PASS", "deployment_id": deployment, "task_id": task,
+        "method": args.method, "manifest": str(args.manifest.resolve()),
+        "instruction": payload["runtime"]["instructions"],
+        "home_pose": payload["hardware"]["robot"]["home_pose"],
+        "camera_serials": {role: payload["hardware"]["cameras"][role]["serial"] for role in ("exterior", "wrist")},
+        "artifacts": {k: str(v) for k, v in paths.items()},
+        "checkpoint_sha256": artifacts["real_action_transformer"]["sha256"],
+        "action_horizon": policy["action_horizon"], "execution_horizon": policy["execution_horizon"],
+        "flow_steps": policy["flow_steps"], "target_control_hz": args.control_hz,
+        "max_steps": args.max_steps, "num_rollouts": args.num_rollouts,
+        "checkpoint_hash_verified": False, "live_readiness_verified": False,
+        "robot_connected": False, "camera_opened": False,
+    }
+
+
 def main() -> int:
     runtime = Path(os.environ.get("SIMVLA_REAL_RUNTIME_ROOT", ROOT / "runtime"))
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=runtime / "artifacts/stackcupanddoll/deployment_manifest.site.json")
     parser.add_argument("--log-root", type=Path, default=Path(os.environ.get("SIMVLA_REAL_LOG_ROOT", runtime / "results/simvla/real_deploy")))
-    parser.add_argument("--max-steps", type=int, default=700)
+    parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--control-hz", type=float, default=60.0)
     parser.add_argument("--camera-fps", type=int, default=60)
     parser.add_argument("--num-rollouts", type=int, default=15)
@@ -268,10 +312,18 @@ def main() -> int:
     parser.add_argument("--method", choices=("baseline", "condition_loop", "latentloop"), default="baseline")
     parser.add_argument("--check", action="store_true", help="기존 결과만 확인. 하드웨어/GUI 실행 없음.")
     parser.add_argument("--desktop-environment", action="store_true", help="GUI 연결만 확인하고 화면 환경을 출력. 로봇/카메라 접근 없음.")
+    parser.add_argument("--inspect", action="store_true", help="task/방법/checkpoint 경로 선택만 검사. 모델/센서 실행 없음.")
+    parser.add_argument("--expected-deployment-id")
+    parser.add_argument("--expected-task-id")
     args = parser.parse_args()
     if args.desktop_environment:
         print(checked_desktop_exports(dict(os.environ)))
         return 0
+    if args.inspect:
+        print(json.dumps(inspect_selection(args), indent=2, ensure_ascii=False), flush=True)
+        return 0
+    if args.expected_deployment_id or args.expected_task_id:
+        inspect_selection(args)
     if args.site_profile != "seer_doll" and args.method != "baseline":
         parser.error("Ours direct launch requires the explicitly approved seer_doll profile")
     verify_source_snapshots()

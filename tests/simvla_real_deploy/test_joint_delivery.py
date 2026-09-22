@@ -10,6 +10,19 @@ import pytest
 from tools.simvla.install_doll_joint import relocation_payload
 
 ROOT = Path(__file__).resolve().parents[2]
+ENTRY = ROOT / "architectures/simvla/wrappers/deploy_ll.sh"
+
+
+def selection_manifest(tmp_path):
+    data = json.loads((ROOT / "artifacts/simvla/real_world/deployment_manifest.example.json").read_text())
+    data.update(deployment_id="doll_joint_v1", task_id="stackcupanddoll", enabled_methods=["baseline"])
+    for name in ("real_action_transformer", "norm_stats"):
+        artifact = tmp_path / name
+        artifact.write_text("test fixture only")
+        data["artifacts"][name] = {"path": str(artifact), "sha256": "a" * 64}
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(data))
+    return path
 
 
 @pytest.fixture
@@ -77,12 +90,11 @@ def test_sensor_failure_never_reaches_live_gui(tmp_path, strict, expected):
     stub = bin_dir / "bash"
     stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$MARKER"\nexit 9\n')
     stub.chmod(0o755)
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text("{}")
+    manifest = selection_manifest(tmp_path)
     master, slave = pty.openpty()
     try:
         result = subprocess.run(
-            ["/bin/bash", str(ROOT / "architectures/simvla/wrappers/deploy_doll_joint_baseline.sh")],
+            ["/bin/bash", str(ENTRY)],
             stdin=slave, capture_output=True, text=True,
             env={**os.environ, "PATH": str(bin_dir) + ":" + os.environ["PATH"],
                  "DISPLAY": ":test", "MARKER": str(marker), "SIMVLA_STRICT_EXIT": strict,
@@ -95,14 +107,13 @@ def test_sensor_failure_never_reaches_live_gui(tmp_path, strict, expected):
     assert result.returncode == expected
     calls = marker.read_text().splitlines()
     assert len(calls) == 1 and "read-only-profile" in calls[0]
-    assert "DOLL_JOINT_COMMAND_FAILED rc=9" in result.stdout
+    assert "SIMVLA_DEPLOY_COMMAND_FAILED rc=9" in result.stdout
     assert (tmp_path / "logs/launcher.exit_code").read_text().strip() == "9"
 
 
 def test_missing_desktop_is_explained_and_logged(tmp_path):
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text("{}")
-    result = subprocess.run(["/bin/bash", str(ROOT / "architectures/simvla/wrappers/deploy_doll_joint_baseline.sh")],
+    manifest = selection_manifest(tmp_path)
+    result = subprocess.run(["/bin/bash", str(ENTRY)],
         input="", text=True, capture_output=True,
         env={**os.environ, "DISPLAY": "", "SIMVLA_REAL_PYTHON": os.sys.executable,
              "SIMVLA_DOLL_MANIFEST": str(manifest), "SIMVLA_REAL_LOG_ROOT": str(tmp_path / "logs"),
@@ -127,7 +138,7 @@ def test_interactive_launcher_recovers_missing_display_before_sensor_check(tmp_p
     master, slave = pty.openpty()
     try:
         result = subprocess.run(
-            ["/bin/bash", str(ROOT / "architectures/simvla/wrappers/deploy_doll_joint_baseline.sh")],
+            ["/bin/bash", str(ENTRY)],
             stdin=slave, capture_output=True, text=True,
             env={**os.environ, "DISPLAY": "", "PATH": str(bin_dir) + ":" + os.environ["PATH"],
                  "MARKER": str(marker), "SIMVLA_STRICT_EXIT": "1", "SIMVLA_REAL_PYTHON": str(python),
@@ -143,8 +154,41 @@ def test_interactive_launcher_recovers_missing_display_before_sensor_check(tmp_p
 
 
 def test_single_repository_paths():
-    for name in ("deploy_doll_baseline.sh", "deploy_doll_joint_baseline.sh"):
+    for name in ("deploy_doll_baseline.sh", "deploy_doll_joint_baseline.sh", "deploy_doll_ours.sh"):
         text = (ROOT / "architectures/simvla/wrappers" / name).read_text()
         assert "gnaroshi_vla_runtime" not in text
-        assert "${root}/runtime" in text
+        assert '/deploy_ll.sh" --preset ' in text
+        assert len(text.splitlines()) == 3
+    assert "${root}/runtime" in ENTRY.read_text()
     assert 'ROOT / "runtime"' in (ROOT / "tools/simvla/launch_doll_baseline.py").read_text()
+
+
+@pytest.mark.parametrize("name", ["basketball", "cabinet", "stack_cups", "fruit", "unknown"])
+def test_unavailable_task_stops_without_running_python(tmp_path, name):
+    result = subprocess.run(["/bin/bash", str(ENTRY), "--preset", name], capture_output=True, text=True,
+        env={**os.environ, "SIMVLA_STRICT_EXIT": "1", "SIMVLA_REAL_PYTHON": "/does/not/exist"})
+    assert result.returncode == 2
+    assert "SIMVLA_DEPLOY_COMMAND_FAILED" in result.stdout
+    assert "Python을 찾을" not in result.stdout
+
+
+@pytest.mark.parametrize("name", ["deploy_doll_baseline.sh", "deploy_doll_joint_baseline.sh", "deploy_doll_ours.sh"])
+def test_old_command_delegates_to_one_configuration(name):
+    result = subprocess.run(["/bin/bash", str(ENTRY.parent / name), "--list"], capture_output=True, text=True)
+    assert result.returncode == 0
+    assert "doll_joint_baseline:" in result.stdout
+
+
+@pytest.mark.parametrize("preset,success", [("doll_joint_baseline", True), ("doll_joint_ours", False), ("doll_legacy_baseline", False)])
+def test_real_selection_rejects_wrong_teacher_before_sensors(tmp_path, preset, success):
+    manifest = selection_manifest(tmp_path)
+    result = subprocess.run(["/bin/bash", str(ENTRY), "--inspect", "--preset", preset, "--max-steps", "9000"],
+        capture_output=True, text=True,
+        env={**os.environ, "SIMVLA_STRICT_EXIT": "1", "SIMVLA_REAL_PYTHON": os.sys.executable,
+             "SIMVLA_DOLL_MANIFEST": str(manifest), "SIMVLA_REAL_LOG_ROOT": str(tmp_path / "logs")})
+    assert (result.returncode == 0) == success
+    if success:
+        assert '"max_steps": 9000' in result.stdout
+        assert '"robot_connected": false' in result.stdout
+    else:
+        assert "[1/2]" not in result.stdout
