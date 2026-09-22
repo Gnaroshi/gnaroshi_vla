@@ -12,6 +12,55 @@ from tools.simvla import launch_doll_baseline as launcher
 
 ROOT = Path(__file__).resolve().parents[2]
 
+
+def test_desktop_discovery_uses_current_session_and_whitelisted_fields(tmp_path):
+    authority = tmp_path / "Xauthority"
+    authority.write_text("test-only")
+    for pid, comm in (("1", "gnome-shell"), ("2", "gnome-session-b"), ("3", "unrelated")):
+        process = tmp_path / pid
+        process.mkdir()
+        (process / "comm").write_text(comm)
+        display = ":1" if pid != "3" else ":9"
+        (process / "environ").write_bytes(
+            f"DISPLAY={display}\0XAUTHORITY={authority}\0UNRELATED_SECRET=do_not_propagate\0".encode())
+    assert launcher.desktop_environment({}, tmp_path) == {"DISPLAY": ":1", "XAUTHORITY": str(authority)}
+
+
+def test_explicit_display_is_not_replaced(tmp_path):
+    assert launcher.desktop_environment({"DISPLAY": "localhost:10.0"}, tmp_path) == {"DISPLAY": "localhost:10.0"}
+
+
+def test_no_desktop_does_not_guess_display_zero(tmp_path):
+    with pytest.raises(RuntimeError, match="하나로"):
+        launcher.desktop_environment({}, tmp_path)
+
+
+def test_multiple_desktops_are_not_silently_selected(tmp_path):
+    for pid in ("1", "2"):
+        process = tmp_path / pid
+        process.mkdir()
+        (process / "comm").write_text("gnome-shell")
+        (process / "environ").write_bytes(f"DISPLAY=:{pid}\0".encode())
+    with pytest.raises(RuntimeError, match="하나로"):
+        launcher.desktop_environment({}, tmp_path)
+
+
+def test_other_user_desktop_is_not_selected(tmp_path, monkeypatch):
+    process = tmp_path / "1"
+    process.mkdir()
+    (process / "comm").write_text("gnome-shell")
+    (process / "environ").write_bytes(b"DISPLAY=:1\0")
+    monkeypatch.setattr(launcher.os, "getuid", lambda: process.stat().st_uid + 1)
+    with pytest.raises(RuntimeError):
+        launcher.desktop_environment({}, tmp_path)
+
+
+def test_desktop_probe_failure_is_not_ignored(monkeypatch):
+    monkeypatch.setattr(launcher, "desktop_environment", lambda env: {"DISPLAY": ":1"})
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stderr="not authorized"))
+    with pytest.raises(RuntimeError, match="not authorized"):
+        launcher.checked_desktop_exports({})
+
 def test_operator_can_raise_max_steps_above_old_manifest(evidence):
     contract, _, profile = evidence
     result = launcher.reviewed_payload(contract, profile, [0.2, -0.6, 0.05], [0.8, 0.6, 0.8], [0.04, 0.1], 5000, "DEPLOY")

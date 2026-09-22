@@ -18,16 +18,25 @@ main() (
     wrapper=${root}/architectures/simvla/wrappers
     mode=${1:---live}
     case "$mode" in
-        --preflight|--profile|--check|--live) if (($#)); then shift; fi ;;
+        --preflight|--profile|--check|--display-check|--live) if (($#)); then shift; fi ;;
         --max-steps|--control-hz|--camera-fps|--num-rollouts|--warmup-steps) mode=--live ;;
         -h|--help)
-            echo 'Usage: deploy_doll_joint_baseline.sh [--live|--preflight|--profile|--check] [options]'
+            echo 'Usage: deploy_doll_joint_baseline.sh [--live|--preflight|--profile|--check|--display-check] [options]'
             echo 'Live options: --max-steps N --control-hz HZ --camera-fps FPS --num-rollouts N --warmup-steps N'
             echo 'Defaults are editable at the top of deploy_doll_baseline.sh.'
             return 0 ;;
         *) echo 'Unknown mode. Use --help for supported modes/options.'; return 2 ;;
     esac
+    configure_display() {
+        local display_exports
+        display_exports=$(PYTHONPATH="$root" "$SIMVLA_REAL_PYTHON" -m tools.simvla.launch_doll_baseline --desktop-environment) || return
+        eval "$display_exports"
+        echo "GUI_CONNECTION_PASS DISPLAY=$DISPLAY"
+    }
     case "$mode" in
+        --display-check)
+            configure_display
+            ;;
         --preflight)
             bash "$wrapper/deploy_latentloop_real.sh" artifact-preflight --manifest "$manifest" --method baseline "$@"
             ;;
@@ -38,11 +47,14 @@ main() (
             bash "$wrapper/deploy_doll_baseline.sh" --manifest "$manifest" --check "$@"
             ;;
         --live)
-            [[ -n ${DISPLAY:-} && -t 0 ]] || {
+            [[ -t 0 ]] || {
                 echo "Cannot open live GUI: DISPLAY=${DISPLAY:-unset}, interactive_stdin=$([[ -t 0 ]] && echo yes || echo no)."
                 echo 'Run this command in a terminal on the inference-computer desktop; --preflight needs no desktop.'
                 return 2
             }
+            if [[ -z ${DISPLAY:-} ]]; then
+                configure_display
+            fi
             # Fresh inputs are checked for the NEW checkpoint; never reuse old-model evidence.
             echo '[1/2] Current-camera/state check (receive only; no robot commands)'
             bash "$wrapper/deploy_latentloop_real.sh" read-only-profile --manifest "$manifest" --method baseline --steps 15

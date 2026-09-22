@@ -112,6 +112,36 @@ def test_missing_desktop_is_explained_and_logged(tmp_path):
     assert "interactive_stdin=no" in (tmp_path / "logs/launcher.log").read_text()
 
 
+def test_interactive_launcher_recovers_missing_display_before_sensor_check(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "commands"
+    python = bin_dir / "python"
+    python.write_text('#!/bin/sh\nprintf "export DISPLAY=:1\\nexport XAUTHORITY=/test/auth\\n"\n')
+    python.chmod(0o755)
+    bash = bin_dir / "bash"
+    bash.write_text('#!/bin/sh\nprintf "%s|%s|%s\\n" "$DISPLAY" "$XAUTHORITY" "$*" >> "$MARKER"\nexit 9\n')
+    bash.chmod(0o755)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    master, slave = pty.openpty()
+    try:
+        result = subprocess.run(
+            ["/bin/bash", str(ROOT / "architectures/simvla/wrappers/deploy_doll_joint_baseline.sh")],
+            stdin=slave, capture_output=True, text=True,
+            env={**os.environ, "DISPLAY": "", "PATH": str(bin_dir) + ":" + os.environ["PATH"],
+                 "MARKER": str(marker), "SIMVLA_STRICT_EXIT": "1", "SIMVLA_REAL_PYTHON": str(python),
+                 "SIMVLA_DOLL_MANIFEST": str(manifest), "SIMVLA_REAL_LOG_ROOT": str(tmp_path / "logs")})
+    finally:
+        os.close(master)
+        os.close(slave)
+    assert result.returncode == 9
+    assert "GUI_CONNECTION_PASS DISPLAY=:1" in result.stdout
+    calls = marker.read_text().splitlines()
+    assert len(calls) == 1 and calls[0].startswith(":1|/test/auth|")
+    assert "read-only-profile" in calls[0]
+
+
 def test_single_repository_paths():
     for name in ("deploy_doll_baseline.sh", "deploy_doll_joint_baseline.sh"):
         text = (ROOT / "architectures/simvla/wrappers" / name).read_text()

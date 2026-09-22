@@ -10,6 +10,8 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -42,6 +44,52 @@ PHYSICAL_REVIEW_FIELDS = (
     "gripper_no_software_stop_acknowledged", "physical_emergency_stop_verified",
     "runtime_timing_reviewed",
 )
+
+
+def desktop_environment(environ: dict, proc_root: Path = Path("/proc")) -> dict[str, str]:
+    """Use an explicit display or the current user's unambiguous local desktop."""
+    if environ.get("DISPLAY"):
+        return {key: environ[key] for key in ("DISPLAY", "XAUTHORITY") if environ.get(key)}
+    candidates = set()
+    for process in proc_root.iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            if (process / "comm").read_text().strip() not in (
+                "gnome-shell", "gnome-session-b", "xfce4-session", "ksmserver", "plasmashell",
+            ):
+                continue
+            # Read only display configuration; never propagate the session's other variables.
+            env = {}
+            for entry in (process / "environ").read_bytes().split(b"\0"):
+                key, sep, value = entry.partition(b"=")
+                if sep and key in (b"DISPLAY", b"XAUTHORITY"):
+                    env[key.decode()] = value.decode()
+            display, authority = env.get("DISPLAY", ""), env.get("XAUTHORITY", "")
+            if re.fullmatch(r":\d+(?:\.\d+)?", display) and (
+                not authority or os.access(authority, os.R_OK)
+            ):
+                candidates.add((display, authority))
+        except (OSError, UnicodeError):
+            continue
+    if len(candidates) != 1:
+        raise RuntimeError("사용자의 로컬 데스크톱을 하나로 확인하지 못했습니다. DISPLAY와 XAUTHORITY를 직접 지정하세요.")
+    display, authority = candidates.pop()
+    return {"DISPLAY": display, **({"XAUTHORITY": authority} if authority else {})}
+
+
+def checked_desktop_exports(environ: dict) -> str:
+    values = desktop_environment(environ)
+    # A hidden Tk window verifies authentication without importing any robot interfaces.
+    probe = subprocess.run([sys.executable, "-c",
+        "import tkinter as tk; r=tk.Tk(); r.withdraw(); r.update_idletasks(); r.destroy()"],
+        env={**environ, **values, "CUDA_VISIBLE_DEVICES": ""},
+        text=True, capture_output=True, timeout=10)
+    if probe.returncode:
+        raise RuntimeError(f"GUI 연결 확인 실패: {probe.stderr.strip()}")
+    return "\n".join(f"export {key}={shlex.quote(value)}" for key, value in values.items())
 
 
 def numbers(text: str, count: int, *, positive: bool = False) -> list[float]:
@@ -219,7 +267,11 @@ def main() -> int:
     parser.add_argument("--site-profile", choices=("reviewed_workspace", "seer_doll"), default="reviewed_workspace")
     parser.add_argument("--method", choices=("baseline", "condition_loop", "latentloop"), default="baseline")
     parser.add_argument("--check", action="store_true", help="기존 결과만 확인. 하드웨어/GUI 실행 없음.")
+    parser.add_argument("--desktop-environment", action="store_true", help="GUI 연결만 확인하고 화면 환경을 출력. 로봇/카메라 접근 없음.")
     args = parser.parse_args()
+    if args.desktop_environment:
+        print(checked_desktop_exports(dict(os.environ)))
+        return 0
     if args.site_profile != "seer_doll" and args.method != "baseline":
         parser.error("Ours direct launch requires the explicitly approved seer_doll profile")
     verify_source_snapshots()
