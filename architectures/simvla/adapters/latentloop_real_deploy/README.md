@@ -39,12 +39,12 @@ baseline canary must pass before LatentLoop can be authorized.
 SIMVLA_REAL_ENV_INSTALL=1 \
 bash architectures/simvla/wrappers/setup_real_deploy_env.sh --install
 
-export SIMVLA_REAL_PYTHON="$HOME/gnaroshi_vla_runtime/envs/simvla_real/bin/python"
+export SIMVLA_REAL_PYTHON="$HOME/gnaroshi_vla/runtime/envs/simvla_real/bin/python"
 export SIMVLA_REAL_CUDA_DEVICE=0
-export SIMVLA_REAL_LOG_ROOT="$HOME/gnaroshi_vla_runtime/results/simvla/real_deploy"
+export SIMVLA_REAL_LOG_ROOT="$HOME/gnaroshi_vla/runtime/results/simvla/real_deploy"
 
 bash architectures/simvla/wrappers/deploy_latentloop_real.sh prepare \
-  --manifest "$HOME/gnaroshi_vla_runtime/artifacts/stackcupanddoll/deployment_manifest.json" \
+  --manifest "$HOME/gnaroshi_vla/runtime/artifacts/stackcupanddoll/deployment_manifest.json" \
   --require-gui
 ```
 

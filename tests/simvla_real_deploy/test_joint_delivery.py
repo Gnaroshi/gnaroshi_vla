@@ -77,13 +77,17 @@ def test_sensor_failure_never_reaches_live_gui(tmp_path, strict, expected):
     stub = bin_dir / "bash"
     stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$MARKER"\nexit 9\n')
     stub.chmod(0o755)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
     master, slave = pty.openpty()
     try:
         result = subprocess.run(
             ["/bin/bash", str(ROOT / "architectures/simvla/wrappers/deploy_doll_joint_baseline.sh")],
             stdin=slave, capture_output=True, text=True,
             env={**os.environ, "PATH": str(bin_dir) + ":" + os.environ["PATH"],
-                 "DISPLAY": ":test", "MARKER": str(marker), "SIMVLA_STRICT_EXIT": strict},
+                 "DISPLAY": ":test", "MARKER": str(marker), "SIMVLA_STRICT_EXIT": strict,
+                 "SIMVLA_REAL_PYTHON": os.sys.executable, "SIMVLA_DOLL_MANIFEST": str(manifest),
+                 "SIMVLA_REAL_LOG_ROOT": str(tmp_path / "logs")},
         )
     finally:
         os.close(master)
@@ -92,3 +96,25 @@ def test_sensor_failure_never_reaches_live_gui(tmp_path, strict, expected):
     calls = marker.read_text().splitlines()
     assert len(calls) == 1 and "read-only-profile" in calls[0]
     assert "DOLL_JOINT_COMMAND_FAILED rc=9" in result.stdout
+    assert (tmp_path / "logs/launcher.exit_code").read_text().strip() == "9"
+
+
+def test_missing_desktop_is_explained_and_logged(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    result = subprocess.run(["/bin/bash", str(ROOT / "architectures/simvla/wrappers/deploy_doll_joint_baseline.sh")],
+        input="", text=True, capture_output=True,
+        env={**os.environ, "DISPLAY": "", "SIMVLA_REAL_PYTHON": os.sys.executable,
+             "SIMVLA_DOLL_MANIFEST": str(manifest), "SIMVLA_REAL_LOG_ROOT": str(tmp_path / "logs"),
+             "SIMVLA_STRICT_EXIT": "1"})
+    assert result.returncode == 2
+    assert "DISPLAY=unset" in result.stdout
+    assert "interactive_stdin=no" in (tmp_path / "logs/launcher.log").read_text()
+
+
+def test_single_repository_paths():
+    for name in ("deploy_doll_baseline.sh", "deploy_doll_joint_baseline.sh"):
+        text = (ROOT / "architectures/simvla/wrappers" / name).read_text()
+        assert "gnaroshi_vla_runtime" not in text
+        assert "${root}/runtime" in text
+    assert 'ROOT / "runtime"' in (ROOT / "tools/simvla/launch_doll_baseline.py").read_text()

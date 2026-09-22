@@ -14,8 +14,9 @@ cd "${root}"
 unset PYTHONHOME
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="${root}"
-export SIMVLA_REAL_PYTHON="${SIMVLA_REAL_PYTHON:-${HOME}/gnaroshi_vla_runtime/envs/simvla_real/bin/python}"
-export SIMVLA_REAL_LOG_ROOT="${SIMVLA_REAL_LOG_ROOT:-${HOME}/gnaroshi_vla_runtime/results/simvla/real_deploy}"
+export SIMVLA_REAL_RUNTIME_ROOT="${SIMVLA_REAL_RUNTIME_ROOT:-${root}/runtime}"
+export SIMVLA_REAL_PYTHON="${SIMVLA_REAL_PYTHON:-${SIMVLA_REAL_RUNTIME_ROOT}/envs/simvla_real/bin/python}"
+export SIMVLA_REAL_LOG_ROOT="${SIMVLA_REAL_LOG_ROOT:-${SIMVLA_REAL_RUNTIME_ROOT}/results/simvla/real_deploy}"
 export PATH="$(dirname -- "${SIMVLA_REAL_PYTHON}"):${PATH}"
 "${SIMVLA_REAL_PYTHON}" -m tools.simvla.launch_doll_baseline \
     --site-profile seer_doll --max-steps "${max_steps}" \

@@ -16,6 +16,7 @@ __pycache__/
 .venvs/
 env/
 venv/
+/runtime/
 
 # Agent-generated documentation and outputs
 codex_outputs/

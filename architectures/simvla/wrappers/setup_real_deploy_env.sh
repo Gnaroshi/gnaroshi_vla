@@ -9,7 +9,8 @@ cd "${repo}"
 unset PYTHONHOME
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="${repo}"
-prefix="${SIMVLA_REAL_ENV_PREFIX:-${HOME}/gnaroshi_vla_runtime/envs/simvla_real}"
+runtime="${SIMVLA_REAL_RUNTIME_ROOT:-${repo}/runtime}"
+prefix="${SIMVLA_REAL_ENV_PREFIX:-${runtime}/envs/simvla_real}"
 requirements="${repo}/architectures/simvla/env/requirements.real_deploy.txt"
 [[ "${prefix}" == /* && "${prefix}" != / && "${prefix}" != "${HOME}" ]] || {
     echo "[ERROR] An absolute dedicated environment prefix is required" >&2; exit 2;
@@ -39,8 +40,8 @@ if [[ "${mode}" == "--install" ]]; then
     else
         printf '%s\n' "${signature}" > "${state}/spec"
     fi
-    export CONDA_PKGS_DIRS="${HOME}/gnaroshi_vla_runtime/downloads/conda"
-    export PIP_CACHE_DIR="${HOME}/gnaroshi_vla_runtime/downloads/pip"
+    export CONDA_PKGS_DIRS="${runtime}/downloads/conda"
+    export PIP_CACHE_DIR="${runtime}/downloads/pip"
     if [[ ! -f "${state}/installed" ]]; then
         if [[ ! -x "${prefix}/bin/python" ]]; then
             "${conda_bin}" create --yes --override-channels -c conda-forge \

@@ -207,7 +207,7 @@ def apply_runtime_options(payload: dict, args: argparse.Namespace) -> dict:
 
 
 def main() -> int:
-    runtime = Path.home() / "gnaroshi_vla_runtime"
+    runtime = Path(os.environ.get("SIMVLA_REAL_RUNTIME_ROOT", ROOT / "runtime"))
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=runtime / "artifacts/stackcupanddoll/deployment_manifest.site.json")
     parser.add_argument("--log-root", type=Path, default=Path(os.environ.get("SIMVLA_REAL_LOG_ROOT", runtime / "results/simvla/real_deploy")))

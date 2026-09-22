@@ -41,7 +41,7 @@ fi
 [[ "${SIMVLA_REAL_TRANSFER_RUN:-0}" == 1 ]] || { echo "[ERROR] Set SIMVLA_REAL_TRANSFER_RUN=1" >&2; exit 2; }
 destination="${SIMVLA_REAL_REMOTE:-jbr@210.107.197.121}"
 port="${SIMVLA_REAL_SSH_PORT:-9000}"
-remote_root="${SIMVLA_REAL_REMOTE_BUNDLE:-/home/jbr/gnaroshi_vla_runtime/artifacts/stackcupanddoll}"
+remote_root="${SIMVLA_REAL_REMOTE_BUNDLE:-/home/jbr/gnaroshi_vla/runtime/artifacts/stackcupanddoll}"
 [[ "${destination}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*@[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || {
     echo "[ERROR] Destination must be user@host" >&2; exit 2;
 }
