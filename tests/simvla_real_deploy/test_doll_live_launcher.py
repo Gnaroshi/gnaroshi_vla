@@ -231,3 +231,81 @@ def test_runtime_revision_only_accepts_reviewed_four_files():
         launcher.verify_runtime_revision(contract, previous, invalid)
     with pytest.raises(ValueError):
         launcher.verify_runtime_revision(contract, "bad", revision)
+
+
+@pytest.fixture
+def saved_checks(tmp_path, evidence):
+    original, model, profile = evidence
+    contract = DeploymentContract(tmp_path / "site.json", original.payload, original.artifacts)
+    args = SimpleNamespace(log_root=tmp_path / "logs", check=True, refresh_checks=False,
+                           control_hz=60, camera_fps=60)
+    profile.update(profile_target_hz=60, profile_camera_fps=60)
+    first = {f"{role}_camera": {
+        "serial": contract.hardware["cameras"][role]["serial"], "fps": 60,
+        "width": contract.hardware["cameras"]["width"],
+        "height": contract.hardware["cameras"]["height"],
+    } for role in ("exterior", "wrist")}
+    for stem, name, data in (("artifact-preflight_baseline", "artifact_preflight.json", model),
+                             ("read-only-profile_baseline", "read_only_summary.json", profile)):
+        output = args.log_root / stem / "output"
+        output.mkdir(parents=True)
+        (output.parent / "exit_code.txt").write_text("0")
+        (output / name).write_text(json.dumps(data))
+    (output / "read_only_steps.jsonl").write_text(json.dumps(first) + "\n")
+    return contract, args
+
+
+def test_checks_can_be_reused_without_old_logs_or_model_load(saved_checks, monkeypatch):
+    import shutil
+    contract, args = saved_checks
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: pytest.fail("must not load a model or sensor"))
+    first = launcher.obtain_evidence(contract, args, None)
+    assert first[0].name == "deployment_checks.json"
+    shutil.rmtree(args.log_root)
+    assert launcher.obtain_evidence(contract, args, None) == first
+
+
+@pytest.mark.parametrize("change", ["hardware", "fps", "hz", "environment", "camera", "source"])
+def test_changed_checks_do_not_reuse_stale_evidence(saved_checks, monkeypatch, change):
+    contract, args = saved_checks
+    path, _, _, _ = launcher.obtain_evidence(contract, args, None)
+    if change == "hardware": contract.payload["hardware"]["robot"]["home_pose"][0] += 0.1
+    elif change == "fps": args.camera_fps = 30
+    elif change == "hz": args.control_hz = 15
+    elif change == "environment": monkeypatch.setattr(launcher.importlib.metadata, "version", lambda n: "different")
+    elif change == "source": contract.payload["runtime_source_identity_sha256"] = "changed"
+    else:
+        saved = json.loads(path.read_text())
+        saved["first_sensor_frame"]["wrist_camera"]["serial"] = "wrong"
+        path.write_text(json.dumps(saved))
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: pytest.fail("--check must remain read-only"))
+    with pytest.raises(ValueError, match="재사용 가능한"):
+        launcher.obtain_evidence(contract, args, None)
+
+
+def test_refresh_failure_does_not_launch_live(saved_checks, monkeypatch):
+    import subprocess
+    contract, args = saved_checks
+    args.check = False
+    args.refresh_checks = True
+    calls = []
+    def fail(command, **kwargs):
+        calls.append(command)
+        raise subprocess.CalledProcessError(9, command)
+    monkeypatch.setattr(launcher.subprocess, "run", fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        launcher.obtain_evidence(contract, args, None)
+    assert len(calls) == 1
+    assert "artifact-preflight" in calls[0]
+    assert "live" not in calls[0]
+
+
+def test_explicit_refresh_runs_both_nonmotion_checks(saved_checks, monkeypatch):
+    contract, args = saved_checks
+    args.check = False
+    args.refresh_checks = True
+    calls = []
+    monkeypatch.setattr(launcher.subprocess, "run", lambda command, **kw: calls.append(command))
+    launcher.obtain_evidence(contract, args, None)
+    assert [call[2] for call in calls] == ["artifact-preflight", "read-only-profile"]
+    assert all("--method" in call and "baseline" in call for call in calls)

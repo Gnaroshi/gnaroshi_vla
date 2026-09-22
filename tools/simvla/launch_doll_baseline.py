@@ -6,6 +6,7 @@ import argparse
 import copy
 from datetime import datetime, timezone
 import getpass
+import importlib.metadata
 import json
 import math
 import os
@@ -153,6 +154,93 @@ def validate_evidence(contract: DeploymentContract, artifact: dict, profile: dic
                 raise ValueError(f"점검 이후 {name} 설정이 변경됐습니다.")
     if profile.get("deployment_target_hz") != contract.runtime["control_frequency_hz"]:
         raise ValueError("실제 동작 목표 주기가 점검 당시와 다릅니다.")
+
+
+def evidence_binding(contract, args) -> dict:
+    packages = {}
+    for name in ("torch", "transformers", "numpy", "Pillow", "pyrealsense2", "ur-rtde"):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    return {
+        "hardware": contract.hardware, "policy": contract.policy,
+        "state": contract.state, "action": contract.action,
+        "deployment_id": contract.deployment_id,
+        "artifacts": {k: v.sha256 for k, v in contract.artifacts.items()},
+        "runtime_source": contract.payload["runtime_source_identity_sha256"],
+        "instructions": contract.runtime["instructions"],
+        "target_hz": args.control_hz, "camera_fps": args.camera_fps,
+        "python": str(Path(sys.executable).resolve()), "packages": packages,
+    }
+
+
+def validate_profile_cameras(contract, profile, first, args) -> None:
+    if profile["profile_target_hz"] != args.control_hz or profile["profile_camera_fps"] != args.camera_fps:
+        raise ValueError("점검 당시 목표 Hz 또는 카메라 FPS와 다릅니다.")
+    cameras = contract.hardware["cameras"]
+    for role in ("exterior", "wrist"):
+        actual = first[f"{role}_camera"]
+        expected = {"serial": cameras[role]["serial"], "width": cameras["width"],
+                    "height": cameras["height"], "fps": args.camera_fps}
+        if any(actual.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"{role} 카메라 점검 설정이 다릅니다.")
+
+
+def obtain_evidence(contract, args, preset):
+    """Reuse verified checks, not model objects or a physical readiness claim."""
+    path = contract.path.parent / "deployment_checks.json"
+    binding = evidence_binding(contract, args)
+    revision = preset.get("runtime_revision") if preset else None
+
+    def validate(model, profile, first):
+        validate_evidence(contract, model, profile, revision)
+        validate_profile_cameras(contract, profile, first, args)
+
+    def from_reports():
+        _, model = completed_report(args.log_root, "artifact-preflight_baseline", "artifact_preflight.json")
+        profile_path, profile = completed_report(args.log_root, "read-only-profile_baseline", "read_only_summary.json")
+        with (profile_path.parent / "read_only_steps.jsonl").open() as stream:
+            first = json.loads(next(stream))
+        validate(model, profile, first)
+        return model, profile, first
+
+    try:
+        if args.refresh_checks:
+            raise ValueError("사용자가 점검 갱신을 요청했습니다.")
+        if path.exists():
+            saved = json.loads(path.read_text())
+            if saved["binding"] != binding:
+                raise ValueError("모델/코드/환경/현장 설정이 마지막 점검 이후 변경됐습니다.")
+            model, profile, first = (saved[key] for key in ("model", "profile", "first_sensor_frame"))
+            validate(model, profile, first)
+        else:
+            model, profile, first = from_reports()
+        print("PREFLIGHT_REUSED: 동일 설정의 완료된 점검 재사용; 모델 이중 로드 없음.", flush=True)
+    except (ValueError, KeyError, OSError, StopIteration) as error:
+        if args.check:
+            raise ValueError(f"재사용 가능한 점검 없음: {error}. deploy_ll.sh --refresh-checks로 갱신하세요.") from error
+        print(f"PREFLIGHT_REFRESH: {error}", flush=True)
+        wrapper = str(ROOT / "architectures/simvla/wrappers/deploy_latentloop_real.sh")
+        for mode, extra in (
+            ("artifact-preflight", []),
+            ("read-only-profile", ["--steps", "15", "--profile-target-hz", str(args.control_hz),
+                                   "--profile-camera-fps", str(args.camera_fps)]),
+        ):
+            subprocess.run(["bash", wrapper, mode, "--manifest", str(contract.path),
+                            "--method", "baseline", *extra], check=True)
+        model, profile, first = from_reports()
+    # A compact validation record survives operator-requested log cleanup.
+    saved = {"binding": binding, "model": model, "profile": profile, "first_sensor_frame": first}
+    fd, filename = tempfile.mkstemp(prefix=".deployment-checks-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(saved, stream, indent=2)
+            stream.write("\n")
+        Path(filename).replace(path)
+    finally:
+        Path(filename).unlink(missing_ok=True)
+    return path, model, path, profile
 
 
 def reviewed_payload(contract: DeploymentContract, profile: dict, minimum: list[float], maximum: list[float], tracking: list[float], max_steps: int, approval: str) -> dict:
@@ -309,6 +397,7 @@ def main() -> int:
     parser.add_argument("--site-profile", choices=("reviewed_workspace", "seer_doll"), default="reviewed_workspace")
     parser.add_argument("--method", choices=("baseline", "condition_loop", "latentloop"), default="baseline")
     parser.add_argument("--check", action="store_true", help="기존 결과만 확인. 하드웨어/GUI 실행 없음.")
+    parser.add_argument("--refresh-checks", action="store_true", help="완료된 점검이 있어도 비구동 모델/센서 점검을 다시 수행.")
     parser.add_argument("--desktop-environment", action="store_true", help="GUI 연결만 확인하고 화면 환경을 출력. 로봇/카메라 접근 없음.")
     parser.add_argument("--inspect", action="store_true", help="task/방법/checkpoint 경로 선택만 검사. 모델/센서 실행 없음.")
     parser.add_argument("--expected-deployment-id")
@@ -326,21 +415,16 @@ def main() -> int:
         parser.error("Ours direct launch requires the explicitly approved seer_doll profile")
     verify_source_snapshots()
     contract = load_deployment_contract(args.manifest, verify_artifacts=True)
-    model_path, model = completed_report(args.log_root, "artifact-preflight_baseline", "artifact_preflight.json")
-    profile_path, profile = completed_report(args.log_root, "read-only-profile_baseline", "read_only_summary.json")
     preset = json.loads(SITE_PROFILE.read_text()) if args.site_profile == "seer_doll" else None
-    validate_evidence(contract, model, profile, preset["runtime_revision"] if preset else None)
-    with (profile_path.parent / "read_only_steps.jsonl").open() as stream:
-        first = json.loads(next(stream))
-    for role in ("exterior", "wrist"):
-        if first[f"{role}_camera"]["serial"] != contract.hardware["cameras"][role]["serial"]:
-            raise ValueError("점검 이후 카메라 역할/serial이 변경됐습니다.")
-    print("기존 모델·실제 입력 점검 확인 완료. 재학습/재추론 점검은 하지 않습니다.", flush=True)
+    if preset:
+        seer_site_payload(contract, preset, args.max_steps, confirmed=False)
+    model_path, model, profile_path, profile = obtain_evidence(contract, args, preset)
     if args.check:
         if preset:
             candidate_path = write_manifest(contract, apply_runtime_options(seer_site_payload(contract, preset, args.max_steps, confirmed=False), args))
             try:
-                load_deployment_contract(candidate_path, verify_artifacts=True)
+                # Only runtime options changed; the same artifact bytes were just verified above.
+                load_deployment_contract(candidate_path, verify_artifacts=False)
             finally:
                 candidate_path.unlink()
         print(f"CHECK_PASS: method={args.method}; 하드웨어/GUI/로봇 명령 없음.")

@@ -22,9 +22,11 @@ main() (
     camera_fps="${SIMVLA_DOLL_CAMERA_FPS:-$CAMERA_FPS}"
     num_rollouts="${SIMVLA_DOLL_NUM_ROLLOUTS:-$NUM_ROLLOUTS}"
     warmup_steps="${SIMVLA_DOLL_WARMUP_STEPS:-$WARMUP_STEPS}"
+    check_options=()
     while (($#)); do
         case "$1" in
             --live|--preflight|--profile|--check|--inspect|--display-check) mode=$1; shift ;;
+            --refresh-checks) check_options+=(--refresh-checks); shift ;;
             --preset|--max-steps|--control-hz|--camera-fps|--num-rollouts|--warmup-steps)
                 (($# >= 2)) || { echo "값이 필요합니다: $1"; return 2; }
                 case "$1" in
@@ -45,6 +47,7 @@ main() (
             -h|--help)
                 echo '사용: deploy_ll.sh [--preset NAME] [--live|--inspect|--check|--preflight|--profile|--display-check]'
                 echo '설정: --max-steps N --control-hz HZ --camera-fps FPS --num-rollouts N --warmup-steps N'
+                echo '동일 설정의 점검은 재사용합니다. 센서 배치를 바꿨으면 --refresh-checks로 다시 점검하세요.'
                 echo '기본값은 이 파일 상단에서 수정합니다. --inspect는 모델/로봇/카메라를 실행하지 않습니다.'
                 return 0 ;;
             *) echo "알 수 없는 인자: $1 (--help 참조)"; return 2 ;;
@@ -98,10 +101,8 @@ main() (
                 return 2
             }
             if [[ -z ${DISPLAY:-} ]]; then configure_display; fi
-            echo '[1/2] 현재 카메라/로봇 상태 수신 점검 (로봇 명령 없음)'
-            bash "$root/architectures/simvla/wrappers/deploy_latentloop_real.sh" read-only-profile --manifest "$manifest" --method baseline --steps 15
-            echo '[2/2] 배포 GUI 열기'
-            "$SIMVLA_REAL_PYTHON" -m tools.simvla.launch_doll_baseline "${options[@]}"
+            echo '완료된 점검 확인 후 GUI 열기 (모델/센서 점검은 설정 변경 시에만 갱신)'
+            "$SIMVLA_REAL_PYTHON" -m tools.simvla.launch_doll_baseline "${options[@]}" "${check_options[@]}"
             ;;
     esac
 )

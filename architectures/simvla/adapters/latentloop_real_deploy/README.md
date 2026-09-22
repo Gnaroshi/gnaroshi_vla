@@ -40,7 +40,21 @@ bash architectures/simvla/wrappers/deploy_ll.sh --display-check
 
 실제 배포 명령은 대화형 터미널에서 실행합니다. DISPLAY가 없으면 같은 사용자의
 로컬 데스크톱을 찾아 연결을 검사합니다. 여러 화면이 검색되면 임의 선택하지 않습니다.
-센서 점검이 실패하면 GUI로 넘어가지 않습니다.
+모델·코드·환경·현장 설정이 같으면 완료된 비구동 점검을 재사용하므로,
+매번 profile용 모델을 로드했다가 GUI용 모델을 다시 로드하지 않습니다.
+checkpoint 해시 검사와 실제 실행 시 센서 연결, rollout warmup, Stop 기능은 유지합니다.
+점검이 없거나 설정이 바뀌면 비구동 점검을 다시 수행하며 실패하면 GUI로 넘어가지 않습니다.
+물리적으로 카메라를 옮기는 등의 변화는 파일만으로 감지할 수 없으므로 다음 명령으로 갱신합니다.
+
+```bash
+bash architectures/simvla/wrappers/deploy_ll.sh --refresh-checks
+```
+
+검증 정보는 자산 폴더의 `deployment_checks.json`에 저장합니다. 이것은 checkpoint나
+성공률 결과가 아니라 같은 설정의 점검 재사용을 위한 작은 기록입니다.
+GUI Start 시 home 이동 → 3회 warmup → policy 초기화 → rollout 순서는 그대로입니다.
+기본 Doll home 관절각(rad)은 `[3.14, -1.57, 1.57, -1.57, -1.57, -1.57]`,
+그리퍼는 열린 상태(0)로 Seer Doll과 같습니다. 물체 위치는 사용자가 재배치해야 합니다.
 
 ## 저장 위치
 

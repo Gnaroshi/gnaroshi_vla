@@ -83,12 +83,12 @@ def test_install_rejects_mismatches(manifests, change):
 
 
 @pytest.mark.parametrize("strict,expected", [("0", 0), ("1", 9)])
-def test_sensor_failure_never_reaches_live_gui(tmp_path, strict, expected):
+def test_launcher_failure_keeps_pane_and_records_status(tmp_path, strict, expected):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     marker = tmp_path / "commands"
-    stub = bin_dir / "bash"
-    stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$MARKER"\nexit 9\n')
+    stub = bin_dir / "python"
+    stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$MARKER"\ncase "$*" in *--inspect*) exit 0;; esac\nexit 9\n')
     stub.chmod(0o755)
     manifest = selection_manifest(tmp_path)
     master, slave = pty.openpty()
@@ -98,7 +98,7 @@ def test_sensor_failure_never_reaches_live_gui(tmp_path, strict, expected):
             stdin=slave, capture_output=True, text=True,
             env={**os.environ, "PATH": str(bin_dir) + ":" + os.environ["PATH"],
                  "DISPLAY": ":test", "MARKER": str(marker), "SIMVLA_STRICT_EXIT": strict,
-                 "SIMVLA_REAL_PYTHON": os.sys.executable, "SIMVLA_DOLL_MANIFEST": str(manifest),
+                 "SIMVLA_REAL_PYTHON": str(stub), "SIMVLA_DOLL_MANIFEST": str(manifest),
                  "SIMVLA_REAL_LOG_ROOT": str(tmp_path / "logs")},
         )
     finally:
@@ -106,7 +106,8 @@ def test_sensor_failure_never_reaches_live_gui(tmp_path, strict, expected):
         os.close(slave)
     assert result.returncode == expected
     calls = marker.read_text().splitlines()
-    assert len(calls) == 1 and "read-only-profile" in calls[0]
+    assert len(calls) == 2 and "--inspect" in calls[0]
+    assert all("read-only-profile" not in call for call in calls)
     assert "SIMVLA_DEPLOY_COMMAND_FAILED rc=9" in result.stdout
     assert (tmp_path / "logs/launcher.exit_code").read_text().strip() == "9"
 
@@ -128,7 +129,7 @@ def test_interactive_launcher_recovers_missing_display_before_sensor_check(tmp_p
     bin_dir.mkdir()
     marker = tmp_path / "commands"
     python = bin_dir / "python"
-    python.write_text('#!/bin/sh\nprintf "export DISPLAY=:1\\nexport XAUTHORITY=/test/auth\\n"\n')
+    python.write_text('#!/bin/sh\ncase "$*" in\n*--desktop-environment*) printf "export DISPLAY=:1\\nexport XAUTHORITY=/test/auth\\n";;\n*--inspect*) exit 0;;\n*) printf "%s|%s|%s\\n" "$DISPLAY" "$XAUTHORITY" "$*" >> "$MARKER"; exit 9;;\nesac\n')
     python.chmod(0o755)
     bash = bin_dir / "bash"
     bash.write_text('#!/bin/sh\nprintf "%s|%s|%s\\n" "$DISPLAY" "$XAUTHORITY" "$*" >> "$MARKER"\nexit 9\n')
@@ -150,7 +151,8 @@ def test_interactive_launcher_recovers_missing_display_before_sensor_check(tmp_p
     assert "GUI_CONNECTION_PASS DISPLAY=:1" in result.stdout
     calls = marker.read_text().splitlines()
     assert len(calls) == 1 and calls[0].startswith(":1|/test/auth|")
-    assert "read-only-profile" in calls[0]
+    assert "tools.simvla.launch_doll_baseline" in calls[0]
+    assert "read-only-profile" not in calls[0]
 
 
 def test_single_repository_paths():
