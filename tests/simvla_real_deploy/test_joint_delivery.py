@@ -154,7 +154,7 @@ def test_interactive_launcher_recovers_missing_display_before_sensor_check(tmp_p
 
 
 def test_single_repository_paths():
-    for name in ("deploy_doll_baseline.sh", "deploy_doll_joint_baseline.sh", "deploy_doll_ours.sh"):
+    for name in ("deploy_doll_joint_baseline.sh",):
         text = (ROOT / "architectures/simvla/wrappers" / name).read_text()
         assert "gnaroshi_vla_runtime" not in text
         assert '/deploy_ll.sh" --preset ' in text
@@ -163,7 +163,8 @@ def test_single_repository_paths():
     assert 'ROOT / "runtime"' in (ROOT / "tools/simvla/launch_doll_baseline.py").read_text()
 
 
-@pytest.mark.parametrize("name", ["basketball", "cabinet", "stack_cups", "fruit", "unknown"])
+@pytest.mark.parametrize("name", ["basketball", "cabinet", "stack_cups", "fruit", "unknown",
+                                 "doll_legacy_baseline", "doll_legacy_ours", "doll_legacy_coupled"])
 def test_unavailable_task_stops_without_running_python(tmp_path, name):
     result = subprocess.run(["/bin/bash", str(ENTRY), "--preset", name], capture_output=True, text=True,
         env={**os.environ, "SIMVLA_STRICT_EXIT": "1", "SIMVLA_REAL_PYTHON": "/does/not/exist"})
@@ -172,7 +173,7 @@ def test_unavailable_task_stops_without_running_python(tmp_path, name):
     assert "Python을 찾을" not in result.stdout
 
 
-@pytest.mark.parametrize("name", ["deploy_doll_baseline.sh", "deploy_doll_joint_baseline.sh", "deploy_doll_ours.sh"])
+@pytest.mark.parametrize("name", ["deploy_doll_joint_baseline.sh"])
 def test_old_command_delegates_to_one_configuration(name):
     result = subprocess.run(["/bin/bash", str(ENTRY.parent / name), "--list"], capture_output=True, text=True)
     assert result.returncode == 0
@@ -192,3 +193,11 @@ def test_real_selection_rejects_wrong_teacher_before_sensors(tmp_path, preset, s
         assert '"robot_connected": false' in result.stdout
     else:
         assert "[1/2]" not in result.stdout
+
+
+def test_retired_entrypoints_and_presets_are_removed():
+    assert not (ENTRY.parent / "deploy_doll_baseline.sh").exists()
+    assert not (ENTRY.parent / "deploy_doll_ours.sh").exists()
+    result = subprocess.run(["/bin/bash", str(ENTRY), "--list"], capture_output=True, text=True)
+    assert "legacy" not in result.stdout
+    assert "doll_joint_baseline" in result.stdout

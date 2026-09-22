@@ -4,9 +4,6 @@
 # 평소에는 이 블록만 수정하세요. CLI 인자가 이 설정보다 우선합니다.
 DEPLOY_PRESET="doll_joint_baseline"
 # DEPLOY_PRESET="doll_joint_ours"       # 미준비: 새 baseline용 updater가 필요합니다.
-# DEPLOY_PRESET="doll_legacy_baseline"  # 이전 baseline.
-# DEPLOY_PRESET="doll_legacy_ours"      # 이전 baseline + 해당 Condition updater.
-# DEPLOY_PRESET="doll_legacy_coupled"   # 이전 baseline + 해당 coupled updater.
 # 다른 task는 --list에서 확인하세요. SimVLA 배포 자산이 없으면 실행하지 않습니다.
 MAX_STEPS=5000
 CONTROL_HZ=60
@@ -43,7 +40,6 @@ main() (
                 printf '%s\n' \
                     'doll_joint_baseline: 최신 Doll baseline' \
                     'doll_joint_ours: 최신 baseline용 Ours 미준비; 실행 불가' \
-                    'doll_legacy_baseline / doll_legacy_ours / doll_legacy_coupled: 이전 모델, 계약 재검사 필요' \
                     'basketball / stack_cups / cabinet / fruit: SimVLA 배포 자산 미준비; 실행 불가'
                 return 0 ;;
             -h|--help)
@@ -58,14 +54,6 @@ main() (
         doll_joint_baseline|doll_joint_ours)
             task=doll; deployment=doll_joint_v1; artifact_dir=doll_joint_v1; log_dir=doll_joint_v1
             if [[ $preset == doll_joint_baseline ]]; then method=baseline; else method=condition_loop; fi ;;
-        doll_legacy_baseline|doll_legacy_ours|doll_legacy_coupled)
-            task=doll; deployment=stackcupanddoll_simvla_real_v2_corrected
-            artifact_dir=stackcupanddoll; log_dir=real_deploy
-            case "$preset" in
-                doll_legacy_baseline) method=baseline ;;
-                doll_legacy_ours) method=condition_loop ;;
-                doll_legacy_coupled) method=latentloop ;;
-            esac ;;
         basketball|stack_cups|cabinet|fruit)
             echo "$preset: SimVLA checkpoint, 정규화, task별 현장 설정이 아직 설치되지 않았습니다. 다른 모델로 대체하지 않습니다."
             return 2 ;;

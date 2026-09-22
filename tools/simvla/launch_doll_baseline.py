@@ -260,8 +260,6 @@ def inspect_selection(args: argparse.Namespace) -> dict:
     if args.expected_deployment_id and deployment != args.expected_deployment_id:
         raise ValueError(f"선택한 preset과 checkpoint 배포 ID가 다릅니다: {deployment} != {args.expected_deployment_id}")
     task = payload.get("task_id")
-    if task is None and deployment == "stackcupanddoll_simvla_real_v2_corrected":
-        task = "stackcupanddoll"
     if args.expected_task_id and task != args.expected_task_id:
         raise ValueError(f"선택한 task와 manifest가 다릅니다: {task} != {args.expected_task_id}")
     allowed = payload.get("enabled_methods", ["baseline", "condition_loop", "latentloop"])
@@ -301,8 +299,8 @@ def inspect_selection(args: argparse.Namespace) -> dict:
 def main() -> int:
     runtime = Path(os.environ.get("SIMVLA_REAL_RUNTIME_ROOT", ROOT / "runtime"))
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=Path, default=runtime / "artifacts/stackcupanddoll/deployment_manifest.site.json")
-    parser.add_argument("--log-root", type=Path, default=Path(os.environ.get("SIMVLA_REAL_LOG_ROOT", runtime / "results/simvla/real_deploy")))
+    parser.add_argument("--manifest", type=Path, default=runtime / "artifacts/doll_joint_v1/deployment_manifest.site.json")
+    parser.add_argument("--log-root", type=Path, default=Path(os.environ.get("SIMVLA_REAL_LOG_ROOT", runtime / "results/simvla/doll_joint_v1")))
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--control-hz", type=float, default=60.0)
     parser.add_argument("--camera-fps", type=int, default=60)
