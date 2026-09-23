@@ -268,6 +268,24 @@ def stability_raw_losses(
             "joint_first_r": torch.stack(execution).mean(),
         }
     )
+    for index in range(age_count):
+        age = index + 1
+        diagnostics.update(
+            {
+                f"age{age}/recursive_reference": cond_reference[index],
+                f"age{age}/teacher_forced_condition": tf_condition_preservation[
+                    index
+                ],
+                f"age{age}/recursive_stability_condition": recurrence_condition[
+                    index
+                ],
+                f"age{age}/end_to_end_execution": execution[index],
+                f"age{age}/gripper_transition": gripper_values[index],
+                f"age{age}/tail_action": per_sequence_tail[index].mean(),
+            }
+        )
+        if index < len(parent):
+            diagnostics[f"age{age}/parent_preservation"] = parent[index]
     return raw, diagnostics
 
 
