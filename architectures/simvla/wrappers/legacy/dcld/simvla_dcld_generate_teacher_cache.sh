@@ -44,10 +44,10 @@ if [[ "${SIMVLA_DCLD_RUN:-0}" != "1" && "${IS_SMOKE}" != "1" ]]; then
 Refusing to launch full teacher-cache generation without SIMVLA_DCLD_RUN=1.
 
 Smoke examples:
-  bash architectures/simvla/wrappers/simvla_dcld_generate_teacher_cache.sh \\
+  bash architectures/simvla/wrappers/legacy/dcld/simvla_dcld_generate_teacher_cache.sh \\
     --raw-rgb-smoke-only --max-episodes 1 --max-samples 2 --report-dir <OUT>
 
-  bash architectures/simvla/wrappers/simvla_dcld_generate_teacher_cache.sh \\
+  bash architectures/simvla/wrappers/legacy/dcld/simvla_dcld_generate_teacher_cache.sh \\
     --suite libero_10 --max-episodes 1 --max-samples 3 --output <CACHE> --report-dir <OUT>
 EOF
   exit 0

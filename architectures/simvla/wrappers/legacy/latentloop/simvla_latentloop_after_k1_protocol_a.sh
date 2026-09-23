@@ -12,7 +12,7 @@ LL_TAG=20260804_chunkaware_v3
 LL_CHECKPOINT=YuankaiLuo/SimVLA-LIBERO
 LL_NORM="$ROOT/architectures/simvla/upstream/norm_stats/libero_norm.json"
 LL_RUN_ROOT="$ROOT/results/simvla/latentloop/${LL_TAG}"
-EVAL_WRAPPER="$ROOT/architectures/simvla/wrappers/simvla_latentloop_eval.sh"
+EVAL_WRAPPER="$ROOT/architectures/simvla/wrappers/legacy/latentloop/simvla_latentloop_eval.sh"
 WAIT_SECONDS=${SIMVLA_LATENTLOOP_WAIT_SECONDS:-60}
 
 R1_K1_RAW="$LL_RUN_ROOT/online/k1_parity_r1_10x10"

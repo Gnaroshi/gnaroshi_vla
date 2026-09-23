@@ -13,7 +13,7 @@ LL_CHECKPOINT=YuankaiLuo/SimVLA-LIBERO
 LL_NORM="$ROOT/architectures/simvla/upstream/norm_stats/libero_norm.json"
 LL_CACHE_ROOT=/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/latentloop/${LL_TAG}/cache
 LL_RUN_ROOT="$ROOT/results/simvla/latentloop/${LL_TAG}"
-TRAIN_WRAPPER="$ROOT/architectures/simvla/wrappers/simvla_latentloop_train.sh"
+TRAIN_WRAPPER="$ROOT/architectures/simvla/wrappers/legacy/latentloop/simvla_latentloop_train.sh"
 LOG_ROOT="$LL_RUN_ROOT/baseline_console_logs"
 
 VARIANTS=(

@@ -550,7 +550,7 @@ def write_passed_next_steps(out: Path, args: argparse.Namespace) -> None:
                 "",
                 "SIMVLA_DCLD_EVAL_RUN=1 \\",
                 "SIMVLA_DCLD_EVAL_OUTPUT=results/simvla/dcld/eval/qred20/simvla_libero_dcld_pm047m_paired_replan5 \\",
-                "bash architectures/simvla/wrappers/simvla_dcld_eval_qred20.sh \\",
+                "bash architectures/simvla/wrappers/legacy/dcld/simvla_dcld_eval_qred20.sh \\",
                 "  --run \\",
                 "  --checkpoint YuankaiLuo/SimVLA-LIBERO \\",
                 "  --dcld-checkpoint \"${PM047M_DCLD_CKPT}\" \\",
