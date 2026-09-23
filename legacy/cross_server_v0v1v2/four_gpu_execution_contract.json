@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "protocol": "seer_latentloop_sd1_teacher33_s18_four_gpu_v1",
+  "world_size": 4,
+  "allowed_lanes": {
+    "lane_a": "0,1,2,3",
+    "lane_b": "4,5,6,7"
+  },
+  "forbid_all_eight_gpus_for_one_row": true,
+  "seed": 42,
+  "tasks": 10,
+  "episodes_per_task": 20,
+  "max_steps": 600,
+  "control_hz": 20.0,
+  "renderer": "osmesa",
+  "renderer_expected_vendor": "Mesa",
+  "renderer_expected_class": "software_osmesa",
+  "temporal_ensembling": true,
+  "temporal_ensemble_temperature": 0.01,
+  "action_prediction_horizon": 3,
+  "precision": "fp32",
+  "deterministic_flags": {
+    "seed_python": 42,
+    "seed_numpy": 42,
+    "seed_torch": 42,
+    "cudnn_benchmark": false
+  }
+}

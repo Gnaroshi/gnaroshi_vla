@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "status": "LOCKED_BEFORE_TRAINING",
+  "candidates": [20, 40],
+  "independent_runs": true,
+  "same_initialization_policy_and_seed": true,
+  "seed": 42,
+  "scheduler": "cosine_per_independent_run",
+  "warmup_fraction": 0.05,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0001,
+  "world_size": 4,
+  "per_gpu_batch": 16,
+  "gradient_accumulation_steps": 8,
+  "effective_batch": 512,
+  "raw_loss_calibration": {
+    "microbatches_per_rank": 48,
+    "global_microbatches": 192,
+    "split": "transition_train_only",
+    "uses_online_sr": false
+  },
+  "no_composition_control": {
+    "kind": "matched_training_ablation",
+    "same_initialization": true,
+    "same_data_order": true,
+    "same_optimizer": true,
+    "same_learning_rate_schedule": true,
+    "only_difference": "composition loss weight is zero",
+    "trained_concurrently_with_candidate": true
+  },
+  "selection_uses_online_libero_sr": false,
+  "relative_tolerance": 0.05,
+  "metrics": [
+    "direct_latent_mse",
+    "composed_latent_mse",
+    "direct_action_l1",
+    "composed_action_l1",
+    "composition_defect"
+  ],
+  "select_smallest_passing_budget": true,
+  "forbidden_extra_budgets": [24, 32]
+}

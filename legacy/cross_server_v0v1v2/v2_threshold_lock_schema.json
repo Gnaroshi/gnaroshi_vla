@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LatentLoop V2 threshold lock",
+  "type": "object",
+  "required": ["status", "source_lock_sha256", "v1_checkpoint_sha256", "split_manifest_sha256", "selected"],
+  "properties": {
+    "status": {"const": "V2_THRESHOLD_LOCKED"},
+    "source_lock_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "v1_checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "split_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "selected": {
+      "type": "object",
+      "required": ["seq_unsafe_threshold", "direct_unsafe_threshold", "direct_advantage_margin", "max_sequential_age", "max_full_age", "effective_k"],
+      "properties": {
+        "effective_k": {"type": "number", "minimum": 3.8, "maximum": 4.2}
+      }
+    }
+  },
+  "additionalProperties": true
+}

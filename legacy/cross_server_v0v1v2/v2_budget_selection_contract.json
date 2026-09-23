@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "status": "LOCKED_BEFORE_DEFECT_FIT",
+  "uses_selected_v1_transition": true,
+  "trains_new_transition": false,
+  "target_effective_k": 4.0,
+  "feasible_effective_k_range": [3.8, 4.2],
+  "selection_split": "scheduler_calibration",
+  "selection_uses_final_200_episodes": false,
+  "tie_break_order": [
+    "lowest_mean_reference_action_error",
+    "lowest_p95_reference_action_error",
+    "effective_k_closest_to_4",
+    "fewest_direct_reanchors"
+  ],
+  "required_episode_simulation": [
+    "initial_mandatory_full_call",
+    "terminal_partial_episode",
+    "direct_reanchor",
+    "forced_max_sequential_age",
+    "forced_max_full_age",
+    "early_termination"
+  ]
+}

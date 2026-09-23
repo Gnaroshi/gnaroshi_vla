@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sd1 canonical Seer transfer manifest",
+  "type": "object",
+  "required": [
+    "schema_version", "source_identity", "artifacts", "dataset",
+    "runtime", "libero", "evaluation", "canonical_reference", "member_hash_manifest"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "source_identity": {
+      "type": "object",
+      "required": ["branch", "commit", "tracked_dirty_diff_sha256", "source_lock_sha256"]
+    },
+    "artifacts": {
+      "type": "object",
+      "required": ["teacher33", "adapter39", "vit_mae"]
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["name", "meta_sha256", "file_manifest"]
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["environment_name", "conda_explicit", "pip_freeze"]
+    },
+    "libero": {
+      "type": "object",
+      "required": ["identity", "branch", "commit", "tracked_dirty_diff_sha256", "bundle", "tracked_patch"]
+    },
+    "evaluation": {
+      "type": "object",
+      "required": ["episode_manifest_sha256", "tasks", "episodes_per_task", "seed", "precision", "temporal_ensembling"]
+    },
+    "canonical_reference": {
+      "type": "object",
+      "required": ["full_k1", "v0_k4"]
+    },
+    "member_hash_manifest": {
+      "type": "object",
+      "required": ["path", "coverage"]
+    }
+  },
+  "additionalProperties": true
+}
