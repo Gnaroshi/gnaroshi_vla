@@ -292,7 +292,97 @@ def get_parser(is_eval=False):
     parser.add_argument("--lrnode_trace", type=int, default=0)
     parser.add_argument("--lrnode_debug_artifact_interval", type=int, default=0)
     parser.add_argument("--lrnode_eval_step_log", type=int, default=0)
-    parser.add_argument("--lrnode_eval_shadow_full_forward", type=int, default=0)
+    parser.add_argument(
+        "--lrnode_eval_shadow_full_forward",
+        "--lrnode_shadow_full_forward",
+        dest="lrnode_eval_shadow_full_forward",
+        type=int,
+        default=0,
+        help=(
+            "Run a logging-only full Seer forward on LR-NODE skip steps. "
+            "The shadow path has separate counters/ensemble state and restores RNG state."
+        ),
+    )
+    parser.add_argument("--lrnode_mechanism_trace", type=int, default=0)
+    parser.add_argument("--lrnode_trace_save_latents", type=int, default=0)
+    parser.add_argument("--lrnode_trace_episode_limit", type=int, default=0)
+    parser.add_argument("--lrnode_trace_output_dir", type=str, default="")
+    parser.add_argument(
+        "--lrnode_counterfactual_mode",
+        type=str,
+        default="standard",
+        choices=[
+            "standard",
+            "full_arm_full_gripper",
+            "lr_arm_lr_gripper",
+            "lr_arm_full_gripper",
+            "full_arm_lr_gripper",
+            "latent_fusion",
+            "matched_random",
+        ],
+        help=(
+            "Diagnostic execution intervention. All non-standard modes require "
+            "shadow full-forward and are disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--lrnode_counterfactual_mix_stage",
+        type=str,
+        default="pre_ensemble",
+        choices=["pre_ensemble"],
+        help="Arm/gripper branch mixing occurs on raw action-token sequences before ensembling.",
+    )
+    parser.add_argument("--lrnode_latent_fusion_alpha", type=float, default=0.0)
+    parser.add_argument(
+        "--lrnode_latent_fusion_mode",
+        type=str,
+        default="every_step",
+        choices=["every_step", "soft_reset_only"],
+    )
+    parser.add_argument(
+        "--lrnode_every_step_filter_mode",
+        type=str,
+        default="off",
+        choices=[
+            "off",
+            "raw_full",
+            "recurrent_prior",
+            "fixed_filter",
+            "full_latent_ema",
+        ],
+        help=(
+            "Default-off mechanism experiment that runs full Seer every step and "
+            "selects the cached/executed latent with an explicit prediction-correction rule."
+        ),
+    )
+    parser.add_argument(
+        "--lrnode_every_step_filter_alpha",
+        type=float,
+        default=0.5,
+        help="Fixed-filter correction weight on the current full-Seer latent.",
+    )
+    parser.add_argument(
+        "--lrnode_every_step_filter_beta",
+        type=float,
+        default=0.5,
+        help="Full-latent EMA weight on the current full-Seer latent.",
+    )
+    parser.add_argument(
+        "--lrnode_every_step_filter_diagnostics",
+        type=int,
+        default=0,
+        help=(
+            "When 1, decode non-executed prior/full branches for action diagnostics. "
+            "RNG is restored and diagnostic latency is reported separately."
+        ),
+    )
+    parser.add_argument("--lrnode_matched_random_seed", type=int, default=20260724)
+    parser.add_argument(
+        "--lrnode_matched_random_norm_mode",
+        type=str,
+        default="per_token",
+        choices=["per_token", "global"],
+    )
     parser.add_argument(
         "--lrnode_eval_profile_full_action_head",
         type=int,
@@ -311,6 +401,41 @@ def get_parser(is_eval=False):
             "Eval-only intervention ablation for skipped LR-NODE steps. 'stepwise' is the existing "
             "delta-conditioned fixed-Euler latent update path."
         ),
+    )
+    parser.add_argument(
+        "--latentloop_segment_grid_enable",
+        type=int,
+        default=0,
+        help=(
+            "Default-off segment-length/feedback-density protocol. When enabled, "
+            "lrnode_query_interval is the segment length L and only the current-"
+            "observation feature is controlled by latentloop_feedback_schedule."
+        ),
+    )
+    parser.add_argument(
+        "--latentloop_feedback_schedule",
+        type=str,
+        default="dense",
+        choices=["dense", "alternate", "none"],
+        help=(
+            "Predeclared intermediate-step feedback mask. The updater and shared "
+            "Seer action head still run at every intermediate step."
+        ),
+    )
+    parser.add_argument(
+        "--latentloop_same_input_stochasticity_repeats",
+        type=int,
+        default=0,
+        help=(
+            "Default-off diagnostic: repeat one fixed preprocessed full-Seer input "
+            "and record maximum latent/raw/executed-action differences."
+        ),
+    )
+    parser.add_argument(
+        "--latentloop_same_input_stochasticity_output",
+        type=str,
+        default="",
+        help="Optional JSON path for the same-input stochasticity diagnostic.",
     )
     parser.add_argument(
         "--lrnode_no_delta_mode",
@@ -346,6 +471,184 @@ def get_parser(is_eval=False):
         default=1,
         help="Episode-level full-Seer query budget for first_only/fixed_budget LR-NODE eval policies.",
     )
+
+    # LatentLoop cross-query plan-continuation study. Every option is inert by
+    # default so the established Seer/LatentLoop protocol remains unchanged.
+    parser.add_argument("--latentloop_plan_trace", type=int, default=0)
+    parser.add_argument("--latentloop_plan_trace_save_latents", type=int, default=0)
+    parser.add_argument("--latentloop_plan_trace_output_dir", type=str, default="")
+    parser.add_argument("--latentloop_plan_trace_row_id", type=str, default="")
+    parser.add_argument("--latentloop_plan_trace_paired_group", type=str, default="")
+    parser.add_argument(
+        "--latentloop_feedback_source",
+        type=str,
+        default="current",
+        choices=["current", "time_shifted"],
+        help=(
+            "Feature consumed by skipped-step latent updates. 'time_shifted' "
+            "uses the previous intermediate step's feature while still encoding "
+            "and staging the current observation for the next step."
+        ),
+    )
+    parser.add_argument(
+        "--latentloop_plan_adapter_mode",
+        type=str,
+        default="off",
+        choices=["off", "action_correction", "anchor_bridge"],
+    )
+    parser.add_argument("--latentloop_plan_adapter_hidden_dim", type=int, default=0)
+    parser.add_argument(
+        "--latentloop_plan_parameter_match_tolerance", type=float, default=0.05
+    )
+    parser.add_argument("--latentloop_plan_arm_weight", type=float, default=1.0)
+    parser.add_argument("--latentloop_plan_gripper_weight", type=float, default=1.0)
+    parser.add_argument("--latentloop_plan_latent_weight", type=float, default=1.0)
+    # Source-locked Q1/Q2 comparison protocol. The master switch is off by
+    # default; these options cannot alter canonical Seer/LatentLoop runs.
+    parser.add_argument("--latentloop_comparison_protocol", type=int, default=0)
+    parser.add_argument(
+        "--latentloop_comparison_offset_schedule",
+        type=str,
+        default="adjacent",
+        choices=["adjacent", "cyclic_k4"],
+    )
+    parser.add_argument(
+        "--latentloop_comparison_split_role",
+        type=str,
+        default="full",
+        choices=["full", "train", "validation"],
+    )
+    parser.add_argument(
+        "--latentloop_comparison_validation_fraction", type=float, default=0.05
+    )
+    parser.add_argument(
+        "--latentloop_comparison_validation_seed", type=int, default=20260805
+    )
+    parser.add_argument(
+        "--latentloop_comparison_target_microbatches",
+        type=int,
+        default=0,
+        help="Optional exact global dataloader-microbatch budget; zero disables it.",
+    )
+    parser.add_argument(
+        "--latentloop_comparison_warmup_microbatches", type=int, default=0
+    )
+    parser.add_argument(
+        "--latentloop_comparison_checkpoint_microbatches", type=int, default=0
+    )
+    parser.add_argument("--latentloop_action_arm_weight", type=float, default=0.0)
+    parser.add_argument("--latentloop_action_gripper_weight", type=float, default=0.0)
+    parser.add_argument("--latentloop_action_exec_weight", type=float, default=0.0)
+    parser.add_argument("--latentloop_action_reg_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--latentloop_nonrecurrent_latent_weight", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--latentloop_nonrecurrent_action_weight", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--latentloop_nonrecurrent_smooth_weight", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--latentloop_comparison_selection_metric",
+        type=str,
+        default="validation_total_loss",
+        choices=["validation_total_loss"],
+    )
+    parser.add_argument(
+        "--lrnode_init_adapter_ckpt",
+        type=str,
+        default=None,
+        help=(
+            "Optional model-only LatentLoop adapter initialization. Unlike resume, "
+            "optimizer/scheduler state is never loaded."
+        ),
+    )
+    parser.add_argument("--latentloop_cqpc_weight", type=float, default=0.0)
+    parser.add_argument("--latentloop_cqpc_gamma", type=float, default=0.0)
+    parser.add_argument("--latentloop_cqpc_arm_weight", type=float, default=1.0)
+    parser.add_argument("--latentloop_cqpc_gripper_weight", type=float, default=1.0)
+    parser.add_argument("--latentloop_cqpc_log_teacher_disagreement", type=int, default=0)
+
+    # Joint Latent-Anchored Action Surrogate. Every option is inert unless the
+    # explicit mode is joint or wide.
+    parser.add_argument(
+        "--joint_latent_action_surrogate_mode",
+        type=str,
+        default="off",
+        choices=["off", "joint", "wide"],
+    )
+    parser.add_argument(
+        "--joint_latent_action_surrogate_stage",
+        type=str,
+        default="off",
+        choices=["off", "stage_a", "stage_b"],
+    )
+    parser.add_argument(
+        "--joint_latent_action_surrogate_hidden_dim", type=int, default=192
+    )
+    parser.add_argument(
+        "--joint_latent_action_surrogate_parameter_match_tolerance",
+        type=float,
+        default=0.02,
+    )
+    parser.add_argument(
+        "--joint_latent_action_surrogate_pretrained_lr_scale",
+        type=float,
+        default=0.0,
+        help="Required in (0,1) for Stage B; ignored in Stage A.",
+    )
+    parser.add_argument(
+        "--joint_latent_action_surrogate_init_ckpt", type=str, default=None
+    )
+    parser.add_argument(
+        "--joint_latent_action_surrogate_calibration_only", type=int, default=0
+    )
+    parser.add_argument(
+        "--joint_latent_action_surrogate_target_microbatches", type=int, default=0
+    )
+    parser.add_argument(
+        "--joint_latent_action_surrogate_warmup_microbatches", type=int, default=0
+    )
+    parser.add_argument(
+        "--joint_latent_action_surrogate_checkpoint_microbatches", type=int, default=0
+    )
+    parser.add_argument("--joint_latent_weight", type=float, default=0.0)
+    parser.add_argument("--joint_latent_action_weight", type=float, default=0.0)
+    parser.add_argument("--joint_surrogate_weight", type=float, default=0.0)
+    parser.add_argument("--joint_executed_token_weight", type=float, default=0.0)
+    parser.add_argument("--joint_tail_weight", type=float, default=0.0)
+    parser.add_argument("--joint_gripper_weight", type=float, default=0.0)
+    parser.add_argument("--joint_residual_weight", type=float, default=0.0)
+    parser.add_argument("--joint_error_trace", type=int, default=0)
+    parser.add_argument("--joint_error_trace_output_dir", type=str, default="")
+    parser.add_argument("--joint_force_exact_action_head", type=int, default=0)
+
+    # Default-off Seer horizon-provenance-aware hierarchical correction.
+    parser.add_argument(
+        "--latentloop_hierarchical_mode",
+        type=str,
+        default="off",
+        choices=[
+            "off",
+            "full_seer",
+            "pure_latentloop",
+            "pure_action_correction",
+            "hybrid",
+        ],
+    )
+    parser.add_argument("--latentloop_hierarchical_full_interval", type=int, default=8)
+    parser.add_argument(
+        "--latentloop_hierarchical_regeneration_interval", type=int, default=3
+    )
+    parser.add_argument(
+        "--latentloop_hierarchical_action_checkpoint", type=str, default=""
+    )
+    parser.add_argument("--latentloop_hierarchical_trace", type=int, default=0)
+    parser.add_argument(
+        "--latentloop_hierarchical_trace_output_dir", type=str, default=""
+    )
+    parser.add_argument("--latentloop_hierarchical_assert_invariants", type=int, default=1)
     
     # calvin
     parser.add_argument("--except_lang", default=False, action="store_true")

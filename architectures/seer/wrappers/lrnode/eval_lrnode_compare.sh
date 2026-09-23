@@ -20,7 +20,11 @@ set -euo pipefail
 #   OURS_NAME="lrnode_v3" \
 #   bash scripts/LIBERO_LONG/Seer/eval_lrnode_compare.sh
 
-export PYTHONPATH="/home/mingyujung/private/LIBERO:${PYTHONPATH:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+UPSTREAM_DIR="${REPO_ROOT}/architectures/seer/upstream"
+libero_path="${LIBERO_PATH:-$(dirname "${REPO_ROOT}")/LIBERO}"
+export PYTHONPATH="${libero_path}:${PYTHONPATH:-}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 
@@ -43,10 +47,9 @@ safe_tag() {
 
 which_server="${WHICH_SERVER:-sd1}"
 dataset="${DATASET:-libero_10_converted}"
-libero_path="${LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
-vit_checkpoint_path="${VIT_CHECKPOINT_PATH:-checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
+vit_checkpoint_path="${VIT_CHECKPOINT_PATH:-${UPSTREAM_DIR}/checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
 save_checkpoint_path="${SAVE_CHECKPOINT_PATH:-checkpoints/}"
-protocol_root="${LRNODE_PROTOCOL_ROOT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616}"
+protocol_root="${LRNODE_PROTOCOL_ROOT:-${REPO_ROOT}/results/seer/lrnode/default}"
 latest_baseline="${BASELINE_ENV:-${protocol_root}/train/_latest/scratch.env}"
 latest_ours="${OURS_ENV:-${protocol_root}/train/_latest/scratch_node.env}"
 
@@ -190,6 +193,8 @@ common_eval_args=(
     --eval_libero_ensembling
     --multi_step_action 1
 )
+
+cd "${UPSTREAM_DIR}"
 
 run_eval() {
     local label="$1"

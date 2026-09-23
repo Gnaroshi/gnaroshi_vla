@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Apply predeclared offline gates to held-out raw-loss records."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+
+
+def values(rows, key):
+    return np.asarray(
+        [float(row[key]) for row in rows if key in row and math.isfinite(float(row[key]))],
+        dtype=np.float64,
+    )
+
+
+def nested(payload, dotted_key):
+    value = payload
+    for key in dotted_key.split("."):
+        value = value[key]
+    return value
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--raw-jsonl", type=Path, required=True)
+    parser.add_argument("--parameter-audit", type=Path, required=True)
+    parser.add_argument("--recursive-reference-artifact", type=Path, required=True)
+    parser.add_argument(
+        "--recursive-executed-error-key",
+        default="metrics.first_token_l1.mean",
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    if args.output.exists():
+        raise FileExistsError(args.output)
+    rows = [json.loads(line) for line in args.raw_jsonl.read_text().splitlines() if line.strip()]
+    audit = json.loads(args.parameter_audit.read_text())
+    recursive_reference = json.loads(args.recursive_reference_artifact.read_text())
+    recursive_executed_error = float(
+        nested(recursive_reference, args.recursive_executed_error_key)
+    )
+    surrogate_exec = values(rows, "train/joint/age1/executed_token_l1")
+    hold_exec = values(
+        rows, "train/joint/age1/hold_anchor_executed_token_l1"
+    )
+    tail1 = values(rows, "train/joint/age1/tail_l1")
+    tail2 = values(rows, "train/joint/age2/tail_l1")
+    gripper = values(rows, "train/joint/loss_gripper_raw")
+    gripper_std = values(rows, "train/joint/gripper_probability_std")
+    gripper_min = values(rows, "train/joint/gripper_probability_min")
+    gripper_max = values(rows, "train/joint/gripper_probability_max")
+    calls = values(rows, "train/joint/shared_encoder_calls")
+    finite = all(array.size and np.isfinite(array).all() for array in [surrogate_exec, hold_exec, tail1, tail2, gripper, calls])
+    checks = {
+        "finite": bool(finite),
+        "gripper_noncollapsed": bool(
+            gripper.size
+            and gripper_std.size
+            and gripper_min.size
+            and gripper_max.size
+            and float(np.median(gripper_std)) > 1e-4
+            and float(np.max(gripper_max) - np.min(gripper_min)) > 0.05
+        ),
+        "better_than_hold_anchor": bool(
+            surrogate_exec.size and hold_exec.size and np.median(surrogate_exec) < np.median(hold_exec)
+        ),
+        "better_than_recursive_reference": bool(
+            surrogate_exec.size and np.median(surrogate_exec) < recursive_executed_error
+        ),
+        "tail_p99_not_catastrophic": bool(
+            tail1.size and tail2.size and np.quantile(tail2, 0.99) <= 3.0 * max(np.quantile(tail1, 0.99), 1e-12)
+        ),
+        "exact_regeneration_resets_error": bool(
+            max(values(rows, "train/joint/exact_regeneration_error"), default=np.inf) == 0.0
+        ),
+        "shared_encoder_once_per_lightweight_step": bool(
+            calls.size and np.all(calls == 2.0)
+        ),
+        "parameter_budget": bool(
+            audit["parameters"]["joint_ratio"] <= 1.25
+            and audit["parameters"]["wide_vs_joint_relative_error"] <= 0.02
+        ),
+    }
+    payload = {
+        "schema_version": 1,
+        "pass": all(checks.values()),
+        "checks": checks,
+        "summary": {
+            "surrogate_exec_median": float(np.median(surrogate_exec)) if surrogate_exec.size else None,
+            "hold_exec_median": float(np.median(hold_exec)) if hold_exec.size else None,
+            "recursive_exec_reference": recursive_executed_error,
+            "recursive_reference_artifact": str(args.recursive_reference_artifact),
+            "recursive_reference_sha256": sha256(args.recursive_reference_artifact),
+            "recursive_reference_metric_key": args.recursive_executed_error_key,
+            "gripper_probability_std_median": (
+                float(np.median(gripper_std)) if gripper_std.size else None
+            ),
+            "gripper_probability_observed_range": (
+                float(np.max(gripper_max) - np.min(gripper_min))
+                if gripper_min.size and gripper_max.size
+                else None
+            ),
+            "tail_age1_p99": float(np.quantile(tail1, 0.99)) if tail1.size else None,
+            "tail_age2_p99": float(np.quantile(tail2, 0.99)) if tail2.size else None,
+            "tail_age2_to_age1_p99_limit": 3.0,
+        },
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(payload, indent=2) + "\n")
+    print(args.output)
+
+
+if __name__ == "__main__":
+    main()

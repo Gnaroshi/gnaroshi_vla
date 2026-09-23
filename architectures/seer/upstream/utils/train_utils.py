@@ -1,8 +1,13 @@
 import time
 import os
 import json
+import sys
 from contextlib import suppress, contextmanager
 from pathlib import Path
+
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
+if str(_WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_WORKSPACE_ROOT))
 
 import torch
 from torch import nn
@@ -14,6 +19,22 @@ from pdb import set_trace
 import numpy as np
 import torch.distributed as dist
 from PIL import Image
+
+from methods.latentloop_plan_continuation.cqpc_loss import (
+    cqpc_is_enabled,
+    cross_query_plan_consistency_loss,
+)
+from methods.latentloop_comparison.nonrecurrent_latent import cyclic_k4_offset
+from methods.latentloop_comparison.training_losses import (
+    ActionCorrectionLossWeights,
+    NonRecurrentLossWeights,
+    action_correction_loss,
+    nonrecurrent_latent_loss,
+)
+from methods.joint_latent_action_surrogate.losses import (
+    JointLossWeights,
+    joint_surrogate_loss,
+)
 
 
 def get_cast_dtype(precision: str):
@@ -246,6 +267,112 @@ def _save_lrnode_debug_artifacts(args, global_step, tensors):
     except Exception:
         pass
 
+
+def _save_comparison_checkpoint(
+    args,
+    model,
+    optimizer,
+    lr_scheduler,
+    *,
+    epoch: int,
+    completed_microbatches: int,
+) -> None:
+    """Save a baseline checkpoint at an exact, predeclared data budget."""
+
+    interval = int(
+        getattr(args, "latentloop_comparison_checkpoint_microbatches", 0)
+    )
+    if (
+        not bool(getattr(args, "latentloop_comparison_protocol", 0))
+        or interval <= 0
+        or completed_microbatches % interval != 0
+    ):
+        return
+    if completed_microbatches % int(args.gradient_accumulation_steps) != 0:
+        raise RuntimeError(
+            "Comparison checkpoint interval must land on an optimizer boundary"
+        )
+    if getattr(args, "rank", 0) == 0:
+        checkpoint_dir = Path(args.save_checkpoint_path) / args.run_name
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        path = checkpoint_dir / f"microstep_{completed_microbatches:06d}.pth"
+        if path.exists():
+            raise FileExistsError(f"Refusing to overwrite comparison checkpoint: {path}")
+        full_state = model.state_dict()
+        trainable_names = {
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        }
+        adapter_state = {
+            name: full_state[name] for name in sorted(trainable_names)
+        }
+        if set(adapter_state) != trainable_names:
+            raise RuntimeError("Comparison checkpoint parameter extraction failed")
+        torch.save(
+            {
+                "epoch": int(epoch),
+                "global_microbatches": int(completed_microbatches),
+                "optimizer_steps": int(
+                    completed_microbatches // args.gradient_accumulation_steps
+                ),
+                "model_state_dict": adapter_state,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+            },
+            path,
+        )
+        print(f"[COMPARISON CHECKPOINT] {path}")
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _save_joint_checkpoint(
+    args,
+    model,
+    optimizer,
+    lr_scheduler,
+    *,
+    epoch: int,
+    completed_microbatches: int,
+) -> None:
+    if str(getattr(args, "joint_latent_action_surrogate_mode", "off")) == "off":
+        return
+    interval = int(
+        getattr(args, "joint_latent_action_surrogate_checkpoint_microbatches", 0)
+    )
+    if interval <= 0 or completed_microbatches % interval != 0:
+        return
+    if completed_microbatches % int(args.gradient_accumulation_steps) != 0:
+        raise RuntimeError("Joint checkpoint interval must land on an optimizer boundary")
+    if getattr(args, "rank", 0) == 0:
+        checkpoint_dir = Path(args.save_checkpoint_path) / args.run_name
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        path = checkpoint_dir / f"microstep_{completed_microbatches:06d}.pth"
+        if path.exists():
+            raise FileExistsError(f"Refusing to overwrite joint checkpoint: {path}")
+        full_state = model.state_dict()
+        trainable_names = {
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        }
+        adapter_state = {name: full_state[name] for name in sorted(trainable_names)}
+        torch.save(
+            {
+                "epoch": int(epoch),
+                "global_microbatches": int(completed_microbatches),
+                "optimizer_steps": int(
+                    completed_microbatches // args.gradient_accumulation_steps
+                ),
+                "joint_mode": str(args.joint_latent_action_surrogate_mode),
+                "joint_stage": str(args.joint_latent_action_surrogate_stage),
+                "model_state_dict": adapter_state,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+            },
+            path,
+        )
+        print(f"[JOINT CHECKPOINT] {path}")
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
 def train_one_epoch_calvin(
     args,
     model,
@@ -292,10 +419,29 @@ def train_one_epoch_calvin(
     )
     t.set_description(f"epoch {epoch+1}/{args.num_epochs}")
     mv_avg_loss = []
+    joint_mode = str(getattr(args, "joint_latent_action_surrogate_mode", "off"))
+    joint_stage = str(getattr(args, "joint_latent_action_surrogate_stage", "off"))
+    joint_protocol_enabled = joint_mode != "off"
+    target_microbatches = int(
+        getattr(args, "joint_latent_action_surrogate_target_microbatches", 0)
+        if joint_protocol_enabled
+        else getattr(args, "latentloop_comparison_target_microbatches", 0)
+    )
+    if target_microbatches < 0:
+        raise ValueError("latentloop_comparison_target_microbatches cannot be negative")
+    comparison_protocol_enabled = bool(
+        getattr(args, "latentloop_comparison_protocol", 0)
+    )
+    budget_protocol_enabled = comparison_protocol_enabled or joint_protocol_enabled
     
     for num_steps, batch_calvin in t:
         data_time_m.update(time.time() - end)
         global_step = num_steps + epoch * num_batches_per_epoch
+        comparison_microbatch_index = int(
+            getattr(args, "latentloop_comparison_completed_microbatches", 0)
+        )
+        if target_microbatches and comparison_microbatch_index >= target_microbatches:
+            return True
 
         # images
         images_primary = batch_calvin[0].to(device_id, dtype=cast_dtype, non_blocking=True)
@@ -327,6 +473,47 @@ def train_one_epoch_calvin(
         label_actions = torch.cat([actions[:, j:args.sequence_length-args.atten_goal+j, :].unsqueeze(-2) for j in range(args.action_pred_steps)], dim=-2) 
 
         train_lrnode = bool(args.use_lrnode_latent_update and args.lrnode_train_latent_distill)
+        train_joint = joint_protocol_enabled
+        latentloop_plan_adapter_mode = str(
+            getattr(args, "latentloop_plan_adapter_mode", "off")
+        )
+        train_plan_baseline = latentloop_plan_adapter_mode != "off"
+        comparison_protocol = comparison_protocol_enabled
+        if comparison_protocol and not train_plan_baseline:
+            raise RuntimeError(
+                "latentloop_comparison_protocol=1 requires a comparison adapter mode"
+            )
+        if train_joint:
+            if train_lrnode or train_plan_baseline:
+                raise RuntimeError(
+                    "Joint surrogate protocol is separate from canonical LR distillation "
+                    "and legacy plan-adapter training"
+                )
+        offset_schedule = str(
+            getattr(args, "latentloop_comparison_offset_schedule", "adjacent")
+        )
+        if comparison_protocol:
+            expected_schedule = (
+                "adjacent"
+                if latentloop_plan_adapter_mode == "action_correction"
+                else "cyclic_k4"
+            )
+            if offset_schedule != expected_schedule:
+                raise RuntimeError(
+                    f"{latentloop_plan_adapter_mode} requires "
+                    f"offset_schedule={expected_schedule}, got {offset_schedule}"
+                )
+        plan_offset = (
+            cyclic_k4_offset(comparison_microbatch_index)
+            if comparison_protocol
+            and latentloop_plan_adapter_mode == "anchor_bridge"
+            and offset_schedule == "cyclic_k4"
+            else 1
+        )
+        train_cqpc = train_lrnode and cqpc_is_enabled(
+            getattr(args, "latentloop_cqpc_weight", 0.0)
+        )
+        latentloop_plan_output = None
         train_seer_distill = (
             seer_distill_teacher_model is not None
             and (
@@ -339,6 +526,11 @@ def train_one_epoch_calvin(
                 "LR-NODE distillation and Seer-only distillation controls are intentionally "
                 "mutually exclusive. Run distill_node.sh and distill_seer.sh as separate controls."
             )
+        if train_plan_baseline and (train_lrnode or train_seer_distill):
+            raise RuntimeError(
+                "Matched plan baselines are separate controls; disable LR-NODE and "
+                "Seer-only distillation losses for this run"
+            )
         lrnode_teacher_target_mode = getattr(args, "lrnode_teacher_target_mode", "shifted_context")
         if lrnode_teacher_target_mode not in {"shifted_context", "adjacent_sequence"}:
             raise RuntimeError(
@@ -346,39 +538,55 @@ def train_one_epoch_calvin(
                 "Expected 'shifted_context' or 'adjacent_sequence'."
             )
         base_model = model.module if hasattr(model, "module") else model
+        if train_joint and not hasattr(base_model, "joint_latent_action_surrogate"):
+            raise RuntimeError("Joint surrogate module was not attached")
         if train_lrnode and not getattr(base_model, "use_lrnode_latent_update", False):
             raise RuntimeError("lrnode_train_latent_distill=1 requires use_lrnode_latent_update=1")
 
         with autocast():  # image_primary, image_wrist, state, language_instruction
-            use_shifted_context_target = train_lrnode and lrnode_teacher_target_mode == "shifted_context"
+            use_shifted_context_target = (
+                (train_lrnode and lrnode_teacher_target_mode == "shifted_context")
+                or train_plan_baseline
+                or train_joint
+            )
+            if train_plan_baseline and lrnode_teacher_target_mode != "shifted_context":
+                raise RuntimeError(
+                    "Matched plan baselines require lrnode_teacher_target_mode=shifted_context"
+                )
             lrnode_z_teacher_next_external = None
             lrnode_selected_step = None
             seer_teacher_outputs = None
             input_image_primary_next = None
             input_image_wrist_next = None
             input_state_next = None
+            joint_teacher_latents = None
+            joint_primary_steps = None
+            joint_wrist_steps = None
+            joint_state_steps = None
             if use_shifted_context_target:
                 if bool(args.lrnode_multistep_train):
                     raise RuntimeError(
                         "lrnode_multistep_train=1 is only implemented for "
                         "lrnode_teacher_target_mode=adjacent_sequence."
                     )
-                if images_primary.shape[1] < args.sequence_length + 1:
+                required_window = args.sequence_length + (2 if train_joint else plan_offset)
+                if images_primary.shape[1] < required_window:
                     raise RuntimeError(
-                        "LR-NODE shifted_context target requires one extra frame beyond "
-                        f"sequence_length={args.sequence_length}, got image window length {images_primary.shape[1]}"
+                        "Shifted-context target requires sequence_length + offset frames: "
+                        f"required={required_window}, got={images_primary.shape[1]}"
                     )
-                if input_states.shape[1] < args.sequence_length + 1:
+                if input_states.shape[1] < required_window:
                     raise RuntimeError(
-                        "LR-NODE shifted_context target requires one extra state beyond "
-                        f"sequence_length={args.sequence_length}, got state window length {input_states.shape[1]}"
+                        "Shifted-context target requires sequence_length + offset states: "
+                        f"required={required_window}, got={input_states.shape[1]}"
                     )
 
-                input_image_primary_next = images_primary[:, 1:args.sequence_length + 1, :]
-                input_image_wrist_next = images_wrist[:, 1:args.sequence_length + 1, :]
-                input_text_token_next = text_tokens[:, 1:args.sequence_length + 1, :]
-                input_state_next = input_states[:, 1:args.sequence_length + 1, :]
-                action_next = actions[:, 1:args.sequence_length + 1, :]
+                next_end = plan_offset + args.sequence_length
+                input_image_primary_next = images_primary[:, plan_offset:next_end, :]
+                input_image_wrist_next = images_wrist[:, plan_offset:next_end, :]
+                input_text_token_next = text_tokens[:, plan_offset:next_end, :]
+                input_state_next = input_states[:, plan_offset:next_end, :]
+                action_next = actions[:, plan_offset:next_end, :]
                 if input_text_token_next.shape[1] != args.sequence_length:
                     raise RuntimeError(
                         "LR-NODE shifted_context target requires text context length "
@@ -396,7 +604,8 @@ def train_one_epoch_calvin(
 
                 with _preserve_torch_rng(device_id):
                     with torch.no_grad():
-                        teacher_outputs_next = model(
+                        teacher_forward_model = base_model if train_joint else model
+                        teacher_outputs_next = teacher_forward_model(
                             image_primary=input_image_primary_next,
                             image_wrist=input_image_wrist_next,
                             state=input_state_next,
@@ -412,6 +621,58 @@ def train_one_epoch_calvin(
                         f"{None if teacher_outputs_next['action_latent'] is None else tuple(teacher_outputs_next['action_latent'].shape)}"
                     )
                 lrnode_z_teacher_next_external = teacher_outputs_next["action_latent"][:, lrnode_selected_step]
+                if train_joint:
+                    input_image_primary_age2 = images_primary[
+                        :, 2:2 + args.sequence_length, :
+                    ]
+                    input_image_wrist_age2 = images_wrist[
+                        :, 2:2 + args.sequence_length, :
+                    ]
+                    input_text_token_age2 = text_tokens[:, 2:2 + args.sequence_length, :]
+                    input_state_age2 = input_states[:, 2:2 + args.sequence_length, :]
+                    action_age2 = actions[:, 2:2 + args.sequence_length, :]
+                    with _preserve_torch_rng(device_id):
+                        with torch.no_grad():
+                            teacher_outputs_age2 = base_model(
+                                image_primary=input_image_primary_age2,
+                                image_wrist=input_image_wrist_age2,
+                                state=input_state_age2,
+                                text_token=input_text_token_age2,
+                                action=action_age2,
+                                return_action_latent=True,
+                                lrnode_compute_loss=False,
+                            )
+                    joint_teacher_latents = torch.stack(
+                        [
+                            lrnode_z_teacher_next_external,
+                            teacher_outputs_age2["action_latent"][:, lrnode_selected_step],
+                        ],
+                        dim=1,
+                    ).detach()
+                    joint_primary_steps = torch.stack(
+                        [
+                            input_image_primary[:, lrnode_selected_step],
+                            input_image_primary_next[:, lrnode_selected_step],
+                            input_image_primary_age2[:, lrnode_selected_step],
+                        ],
+                        dim=1,
+                    )
+                    joint_wrist_steps = torch.stack(
+                        [
+                            input_image_wrist[:, lrnode_selected_step],
+                            input_image_wrist_next[:, lrnode_selected_step],
+                            input_image_wrist_age2[:, lrnode_selected_step],
+                        ],
+                        dim=1,
+                    )
+                    joint_state_steps = torch.stack(
+                        [
+                            input_state[:, lrnode_selected_step],
+                            input_state_next[:, lrnode_selected_step],
+                            input_state_age2[:, lrnode_selected_step],
+                        ],
+                        dim=1,
+                    )
 
             if train_seer_distill:
                 if bool(getattr(args, "seer_distill_teacher_eval_mode", 1)):
@@ -436,7 +697,9 @@ def train_one_epoch_calvin(
                 state=input_state,
                 text_token=input_text_token,
                 action=actions[:, :args.sequence_length, :],
-                return_action_latent=(train_lrnode or train_seer_distill),
+                return_action_latent=(
+                    train_lrnode or train_seer_distill or train_plan_baseline or train_joint
+                ),
                 lrnode_compute_loss=train_lrnode,
                 lrnode_key_image_primary=(
                     input_image_primary[:, lrnode_selected_step]
@@ -475,6 +738,39 @@ def train_one_epoch_calvin(
                 lrnode_train_max_horizon=int(args.lrnode_train_max_horizon),
                 lrnode_z_teacher_next_external=lrnode_z_teacher_next_external,
                 lrnode_selected_step=lrnode_selected_step,
+                latentloop_plan_compute=train_plan_baseline,
+                latentloop_plan_key_image_primary=(
+                    input_image_primary[:, lrnode_selected_step]
+                    if train_plan_baseline else None
+                ),
+                latentloop_plan_key_image_wrist=(
+                    input_image_wrist[:, lrnode_selected_step]
+                    if train_plan_baseline else None
+                ),
+                latentloop_plan_cur_image_primary=(
+                    input_image_primary_next[:, lrnode_selected_step]
+                    if train_plan_baseline else None
+                ),
+                latentloop_plan_cur_image_wrist=(
+                    input_image_wrist_next[:, lrnode_selected_step]
+                    if train_plan_baseline else None
+                ),
+                latentloop_plan_q_key=(
+                    input_state[:, lrnode_selected_step]
+                    if train_plan_baseline else None
+                ),
+                latentloop_plan_q_cur=(
+                    input_state_next[:, lrnode_selected_step]
+                    if train_plan_baseline else None
+                ),
+                latentloop_plan_selected_step=lrnode_selected_step,
+                latentloop_plan_offset=plan_offset,
+                joint_surrogate_compute=train_joint,
+                joint_surrogate_image_primary_steps=joint_primary_steps,
+                joint_surrogate_image_wrist_steps=joint_wrist_steps,
+                joint_surrogate_state_steps=joint_state_steps,
+                joint_surrogate_teacher_latents=joint_teacher_latents,
+                joint_surrogate_selected_step=lrnode_selected_step,
             )
             if train_lrnode:
                 arm_pred_action = model_outputs["arm_pred_action"]
@@ -495,7 +791,7 @@ def train_one_epoch_calvin(
                 lrnode_u_delta = model_outputs.get("lrnode_u_delta")
                 lrnode_dz = model_outputs.get("lrnode_dz")
                 lrnode_update = model_outputs.get("lrnode_update")
-            elif train_seer_distill:
+            elif train_seer_distill or train_plan_baseline or train_joint:
                 arm_pred_action = model_outputs["arm_pred_action"]
                 gripper_pred_action = model_outputs["gripper_pred_action"]
                 image_pred = model_outputs["image_pred"]
@@ -506,11 +802,15 @@ def train_one_epoch_calvin(
                 lrnode_u_delta = None
                 lrnode_dz = None
                 lrnode_update = None
+                latentloop_plan_output = model_outputs.get("latentloop_plan_output")
+                joint_surrogate_output = model_outputs.get("joint_surrogate_output")
             else:
                 arm_pred_action, gripper_pred_action, image_pred, arm_pred_state, gripper_pred_state, loss_arm_action = model_outputs
                 lrnode_u_delta = None
                 lrnode_dz = None
                 lrnode_update = None
+                latentloop_plan_output = None
+                joint_surrogate_output = None
         # loss_action
         if args.loss_action and args.action_pred_steps:
             loss_arm_action = torch.nn.functional.smooth_l1_loss(
@@ -549,8 +849,33 @@ def train_one_epoch_calvin(
         loss_lrnode_bc = torch.tensor([0.0]).to(device_id)
         loss_lrnode_hold_latent = torch.tensor([0.0]).to(device_id)
         loss_lrnode_hold_action = torch.tensor([0.0]).to(device_id)
+        loss_plan_arm = torch.tensor([0.0]).to(device_id)
+        loss_plan_gripper = torch.tensor([0.0]).to(device_id)
+        loss_plan_latent = torch.tensor([0.0]).to(device_id)
+        loss_plan_exec = torch.tensor([0.0]).to(device_id)
+        loss_plan_regularization = torch.tensor([0.0]).to(device_id)
+        loss_plan_total_comparison = torch.tensor([0.0]).to(device_id)
+        loss_cqpc = torch.tensor([0.0]).to(device_id)
+        loss_cqpc_arm_raw = torch.tensor([0.0]).to(device_id)
+        loss_cqpc_gripper_raw = torch.tensor([0.0]).to(device_id)
+        loss_cqpc_arm_weighted = torch.tensor([0.0]).to(device_id)
+        loss_cqpc_gripper_weighted = torch.tensor([0.0]).to(device_id)
+        cqpc_teacher_disagreement_mean = torch.tensor([0.0]).to(device_id)
+        cqpc_teacher_weight_mean = torch.tensor([0.0]).to(device_id)
+        cqpc_teacher_disagreement_p50 = torch.tensor([0.0]).to(device_id)
+        cqpc_teacher_disagreement_p90 = torch.tensor([0.0]).to(device_id)
+        cqpc_teacher_disagreement_p95 = torch.tensor([0.0]).to(device_id)
+        cqpc_teacher_disagreement_p99 = torch.tensor([0.0]).to(device_id)
         loss_seer_distill_action = torch.tensor([0.0]).to(device_id)
         loss_seer_distill_latent = torch.tensor([0.0]).to(device_id)
+        loss_joint_latent = torch.tensor([0.0]).to(device_id)
+        loss_joint_latent_action = torch.tensor([0.0]).to(device_id)
+        loss_joint_surrogate = torch.tensor([0.0]).to(device_id)
+        loss_joint_exec = torch.tensor([0.0]).to(device_id)
+        loss_joint_tail = torch.tensor([0.0]).to(device_id)
+        loss_joint_gripper = torch.tensor([0.0]).to(device_id)
+        loss_joint_residual = torch.tensor([0.0]).to(device_id)
+        loss_joint_total = torch.tensor([0.0]).to(device_id)
         lrnode_z_prev_mean = torch.tensor([0.0]).to(device_id)
         lrnode_z_prev_std = torch.tensor([0.0]).to(device_id)
         lrnode_z_teacher_mean = torch.tensor([0.0]).to(device_id)
@@ -638,6 +963,366 @@ def train_one_epoch_calvin(
                         )
                         loss_lrnode_bc = loss_lrnode_bc_arm + loss_lrnode_bc_gripper
 
+                if train_cqpc:
+                    if bool(args.lrnode_multistep_train):
+                        raise RuntimeError(
+                            "CQPC MVP supports rollout length 1 only; set lrnode_multistep_train=0"
+                        )
+                    if float(args.latentloop_cqpc_gamma) <= 0.0:
+                        raise RuntimeError(
+                            "latentloop_cqpc_gamma must be calibrated and > 0 when CQPC is enabled"
+                        )
+                    action_head_parameters = [
+                        parameter
+                        for module in base_model.get_action_head_modules()
+                        for parameter in module.parameters()
+                    ]
+                    if any(parameter.requires_grad for parameter in action_head_parameters):
+                        raise RuntimeError(
+                            "CQPC requires the shared Seer action head to be frozen"
+                        )
+                    predicted_diag = base_model.decode_action_diagnostics_from_latent(
+                        z_pred_next
+                    )
+                    with torch.no_grad():
+                        previous_diag = base_model.decode_action_diagnostics_from_latent(
+                            z_prev.detach()
+                        )
+                        teacher_diag = base_model.decode_action_diagnostics_from_latent(
+                            z_teacher_next.detach()
+                        )
+                    cqpc = cross_query_plan_consistency_loss(
+                        predicted_diag["arm"],
+                        predicted_diag["gripper_logit"],
+                        previous_diag["arm"],
+                        previous_diag["gripper_logit"],
+                        teacher_diag["arm"],
+                        teacher_diag["gripper_logit"],
+                        gamma=float(args.latentloop_cqpc_gamma),
+                        lambda_arm=float(args.latentloop_cqpc_arm_weight),
+                        lambda_gripper=float(args.latentloop_cqpc_gripper_weight),
+                    )
+                    loss_cqpc = cqpc.total
+                    loss_cqpc_arm_raw = cqpc.arm_raw
+                    loss_cqpc_gripper_raw = cqpc.gripper_raw
+                    loss_cqpc_arm_weighted = cqpc.arm_weighted
+                    loss_cqpc_gripper_weighted = cqpc.gripper_weighted
+                    cqpc_teacher_disagreement_mean = (
+                        cqpc.teacher_disagreement.detach().float().mean()
+                    )
+                    cqpc_teacher_weight_mean = (
+                        cqpc.teacher_weight.detach().float().mean()
+                    )
+                    if bool(args.latentloop_cqpc_log_teacher_disagreement):
+                        disagreement = cqpc.teacher_disagreement.detach().float().reshape(-1)
+                        quantiles = torch.quantile(
+                            disagreement,
+                            torch.tensor(
+                                [0.50, 0.90, 0.95, 0.99],
+                                device=disagreement.device,
+                                dtype=disagreement.dtype,
+                            ),
+                        )
+                        (
+                            cqpc_teacher_disagreement_p50,
+                            cqpc_teacher_disagreement_p90,
+                            cqpc_teacher_disagreement_p95,
+                            cqpc_teacher_disagreement_p99,
+                        ) = quantiles.unbind()
+
+        if train_plan_baseline:
+            if latentloop_plan_output is None:
+                raise RuntimeError("Plan baseline forward did not return its output")
+            if lrnode_z_teacher_next_external is None:
+                raise RuntimeError("Plan baseline requires shifted-context teacher latent")
+            with torch.no_grad():
+                plan_teacher = base_model.decode_action_diagnostics_from_latent(
+                    lrnode_z_teacher_next_external.detach()
+                )
+            if comparison_protocol and latentloop_plan_adapter_mode == "action_correction":
+                action_weights = ActionCorrectionLossWeights(
+                    arm=float(getattr(args, "latentloop_action_arm_weight", 0.0)),
+                    gripper=float(
+                        getattr(args, "latentloop_action_gripper_weight", 0.0)
+                    ),
+                    executed_token=float(
+                        getattr(args, "latentloop_action_exec_weight", 0.0)
+                    ),
+                    residual_regularization=float(
+                        getattr(args, "latentloop_action_reg_weight", 0.0)
+                    ),
+                )
+                if action_weights.arm <= 0.0 or action_weights.gripper <= 0.0:
+                    raise RuntimeError(
+                        "Action-correction arm/gripper weights must be supplied by the "
+                        "predeclared raw-loss calibration"
+                    )
+                bundle = action_correction_loss(
+                    predicted_arm=latentloop_plan_output["arm"],
+                    predicted_gripper_logit=latentloop_plan_output["gripper_logit"],
+                    teacher_arm=plan_teacher["arm"],
+                    teacher_gripper_logit=plan_teacher["gripper_logit"],
+                    arm_residual=latentloop_plan_output["arm_residual"],
+                    gripper_logit_residual=latentloop_plan_output[
+                        "gripper_logit_residual"
+                    ],
+                    weights=action_weights,
+                )
+                loss_plan_arm = bundle.raw["arm"]
+                loss_plan_gripper = bundle.raw["gripper"]
+                loss_plan_exec = bundle.raw["executed_token"]
+                loss_plan_regularization = bundle.raw["residual_regularization"]
+                loss_plan_total_comparison = bundle.total
+            elif comparison_protocol and latentloop_plan_adapter_mode == "anchor_bridge":
+                predicted_latent = latentloop_plan_output.get("latent")
+                anchor_latent = latentloop_plan_output.get("anchor_latent")
+                if predicted_latent is None or anchor_latent is None:
+                    raise RuntimeError("Nonrecurrent baseline did not produce anchor/current latents")
+                nonrecurrent_weights = NonRecurrentLossWeights(
+                    latent=float(
+                        getattr(args, "latentloop_nonrecurrent_latent_weight", 0.0)
+                    ),
+                    action=float(
+                        getattr(args, "latentloop_nonrecurrent_action_weight", 0.0)
+                    ),
+                    smooth=float(
+                        getattr(args, "latentloop_nonrecurrent_smooth_weight", 0.0)
+                    ),
+                )
+                if nonrecurrent_weights.latent <= 0.0 or nonrecurrent_weights.action <= 0.0:
+                    raise RuntimeError(
+                        "Nonrecurrent latent/action weights must be explicitly supplied"
+                    )
+                bundle = nonrecurrent_latent_loss(
+                    predicted_latent=predicted_latent,
+                    anchor_latent=anchor_latent,
+                    teacher_latent=lrnode_z_teacher_next_external.detach(),
+                    predicted_arm=latentloop_plan_output["arm"],
+                    predicted_gripper_probability=latentloop_plan_output[
+                        "gripper_probability"
+                    ],
+                    teacher_arm=plan_teacher["arm"],
+                    teacher_gripper_probability=plan_teacher[
+                        "gripper_probability"
+                    ],
+                    weights=nonrecurrent_weights,
+                )
+                loss_plan_latent = bundle.raw["latent"]
+                loss_plan_arm = bundle.raw["action"]
+                loss_plan_regularization = bundle.raw["smooth"]
+                loss_plan_total_comparison = bundle.total
+            else:
+                loss_plan_arm = torch.nn.functional.smooth_l1_loss(
+                    latentloop_plan_output["arm"], plan_teacher["arm"]
+                )
+                loss_plan_gripper = torch.nn.functional.smooth_l1_loss(
+                    latentloop_plan_output["gripper_logit"],
+                    plan_teacher["gripper_logit"],
+                )
+                if latentloop_plan_adapter_mode == "anchor_bridge":
+                    predicted_latent = latentloop_plan_output.get("latent")
+                    if predicted_latent is None:
+                        raise RuntimeError("Anchor bridge did not produce a latent")
+                    loss_plan_latent = torch.nn.functional.mse_loss(
+                        predicted_latent, lrnode_z_teacher_next_external.detach()
+                    )
+
+        if train_joint:
+            if joint_surrogate_output is None:
+                raise RuntimeError("Joint forward did not return training outputs")
+            z_joint = joint_surrogate_output["z_pred"]
+            z_teacher_joint = joint_surrogate_output["z_teacher"].detach()
+            loss_joint_latent = F.mse_loss(z_joint, z_teacher_joint)
+            exact_action = torch.cat(
+                [
+                    joint_surrogate_output["exact_arm"],
+                    torch.sigmoid(joint_surrogate_output["exact_gripper_logit"]),
+                ],
+                dim=-1,
+            )
+            teacher_action = torch.cat(
+                [
+                    joint_surrogate_output["teacher_arm"],
+                    torch.sigmoid(joint_surrogate_output["teacher_gripper_logit"]),
+                ],
+                dim=-1,
+            ).detach()
+            loss_joint_latent_action = F.l1_loss(exact_action, teacher_action)
+            if joint_mode == "joint":
+                weights = JointLossWeights(
+                    latent=float(args.joint_latent_weight),
+                    latent_action=float(args.joint_latent_action_weight),
+                    surrogate=float(args.joint_surrogate_weight),
+                    executed_token=float(args.joint_executed_token_weight),
+                    tail=float(args.joint_tail_weight),
+                    gripper=float(args.joint_gripper_weight),
+                    residual=float(args.joint_residual_weight),
+                )
+                if not bool(args.joint_latent_action_surrogate_calibration_only):
+                    weights.validate(stage=joint_stage)
+                joint_bundle = joint_surrogate_loss(
+                    predicted_arm=joint_surrogate_output["surrogate_arm"],
+                    predicted_gripper_logit=joint_surrogate_output[
+                        "surrogate_gripper_logit"
+                    ],
+                    exact_arm=joint_surrogate_output["exact_arm"],
+                    exact_gripper_logit=joint_surrogate_output[
+                        "exact_gripper_logit"
+                    ],
+                    valid_mask=joint_surrogate_output["surrogate_valid_mask"],
+                    residual=joint_surrogate_output["surrogate_residual"],
+                    weights=weights,
+                    latent_loss=loss_joint_latent,
+                    latent_action_loss=loss_joint_latent_action,
+                )
+                loss_joint_total = joint_bundle.total
+                loss_joint_surrogate = joint_bundle.raw["surrogate"]
+                loss_joint_exec = joint_bundle.raw["executed_token"]
+                loss_joint_tail = joint_bundle.raw["tail"]
+                loss_joint_gripper = joint_bundle.raw["gripper"]
+                loss_joint_residual = joint_bundle.raw["residual"]
+            else:
+                if (
+                    not bool(args.joint_latent_action_surrogate_calibration_only)
+                    and (
+                        float(args.joint_latent_weight) <= 0.0
+                        or float(args.joint_latent_action_weight) <= 0.0
+                    )
+                ):
+                    raise RuntimeError(
+                        "Wide control requires predeclared latent and latent-action weights"
+                    )
+                loss_joint_total = (
+                    float(args.joint_latent_weight) * loss_joint_latent
+                    + float(args.joint_latent_action_weight)
+                    * loss_joint_latent_action
+                )
+            train_log_metrics.update(
+                {
+                    "train/joint/loss_latent_raw": loss_joint_latent,
+                    "train/joint/loss_latent_action_raw": loss_joint_latent_action,
+                    "train/joint/loss_surrogate_raw": loss_joint_surrogate,
+                    "train/joint/loss_executed_token_raw": loss_joint_exec,
+                    "train/joint/loss_tail_raw": loss_joint_tail,
+                    "train/joint/loss_gripper_raw": loss_joint_gripper,
+                    "train/joint/loss_residual_raw": loss_joint_residual,
+                    "train/joint/shared_encoder_calls": torch.tensor(
+                        float(joint_surrogate_output["shared_encoder_calls"]),
+                        device=device_id,
+                    ),
+                    "train/joint/exact_regeneration_error": joint_surrogate_output[
+                        "exact_regeneration_error"
+                    ],
+                    "train/joint/loss_total_weighted": loss_joint_total,
+                }
+            )
+            if joint_mode == "joint":
+                exact_continuous = torch.cat(
+                    [
+                        joint_surrogate_output["exact_arm"],
+                        joint_surrogate_output["exact_gripper_logit"],
+                    ],
+                    dim=-1,
+                ).detach()
+                aligned_anchor = joint_surrogate_output[
+                    "surrogate_aligned_anchor"
+                ].detach()
+                surrogate_continuous = torch.cat(
+                    [
+                        joint_surrogate_output["surrogate_arm"],
+                        joint_surrogate_output["surrogate_gripper_logit"],
+                    ],
+                    dim=-1,
+                )
+                surrogate_gripper_probability = torch.sigmoid(
+                    joint_surrogate_output["surrogate_gripper_logit"]
+                )
+                train_log_metrics.update(
+                    {
+                        "train/joint/gripper_probability_mean": (
+                            surrogate_gripper_probability.mean()
+                        ),
+                        "train/joint/gripper_probability_std": (
+                            surrogate_gripper_probability.std(unbiased=False)
+                        ),
+                        "train/joint/gripper_probability_min": (
+                            surrogate_gripper_probability.amin()
+                        ),
+                        "train/joint/gripper_probability_max": (
+                            surrogate_gripper_probability.amax()
+                        ),
+                    }
+                )
+                for age_index in range(2):
+                    age = age_index + 1
+                    valid = joint_surrogate_output["surrogate_valid_mask"][
+                        :, age_index
+                    ].bool()
+                    invalid = (~valid).expand_as(
+                        surrogate_continuous[:, age_index]
+                    )
+                    train_log_metrics[
+                        f"train/joint/age{age}/surrogate_l1"
+                    ] = F.l1_loss(
+                        surrogate_continuous[:, age_index],
+                        exact_continuous[:, age_index],
+                    )
+                    train_log_metrics[
+                        f"train/joint/age{age}/hold_anchor_l1"
+                    ] = F.l1_loss(
+                        aligned_anchor[:, age_index], exact_continuous[:, age_index]
+                    )
+                    train_log_metrics[
+                        f"train/joint/age{age}/hold_anchor_executed_token_l1"
+                    ] = F.l1_loss(
+                        aligned_anchor[:, age_index, 0],
+                        exact_continuous[:, age_index, 0],
+                    )
+                    train_log_metrics[
+                        f"train/joint/age{age}/executed_token_l1"
+                    ] = F.l1_loss(
+                        surrogate_continuous[:, age_index, 0],
+                        exact_continuous[:, age_index, 0],
+                    )
+                    train_log_metrics[
+                        f"train/joint/age{age}/tail_l1"
+                    ] = F.l1_loss(
+                        surrogate_continuous[:, age_index][invalid],
+                        exact_continuous[:, age_index][invalid],
+                    )
+
+            if bool(args.joint_latent_action_surrogate_calibration_only):
+                calibration_metrics = _all_reduce_scalar_dict(
+                    {
+                        key: value
+                        for key, value in train_log_metrics.items()
+                        if key.startswith("train/joint/")
+                    },
+                    device_id,
+                )
+                if args.rank == 0:
+                    calibration_dir = (
+                        Path(args.save_checkpoint_path) / args.run_name / "analysis"
+                    )
+                    calibration_dir.mkdir(parents=True, exist_ok=True)
+                    with open(
+                        calibration_dir / "joint_raw_losses.jsonl",
+                        "a",
+                        encoding="utf-8",
+                    ) as handle:
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "global_microbatch": int(
+                                        comparison_microbatch_index + 1
+                                    ),
+                                    **calibration_metrics,
+                                },
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
+
         if train_seer_distill:
             if seer_teacher_outputs is None:
                 raise RuntimeError("train_seer_distill=True but teacher outputs are missing")
@@ -676,7 +1361,7 @@ def train_one_epoch_calvin(
             args.loss_arm_action_ratio * loss_arm_action
             + args.loss_gripper_action_ratio * loss_gripper_action
             + 0.1 * loss_image
-        )
+        ) if not train_joint else loss_joint_total * 0.0
         lrnode_loss_weighted = (
             args.lrnode_latent_weight * loss_lrnode_latent
             + args.lrnode_action_distill_weight * loss_lrnode_action_distill
@@ -687,7 +1372,29 @@ def train_one_epoch_calvin(
             float(getattr(args, "seer_distill_action_weight", 0.0)) * loss_seer_distill_action
             + float(getattr(args, "seer_distill_latent_weight", 0.0)) * loss_seer_distill_latent
         )
-        loss_calvin = base_loss_weighted + lrnode_loss_weighted + seer_distill_loss_weighted
+        plan_baseline_loss_weighted = (
+            loss_plan_total_comparison
+            if comparison_protocol
+            else (
+                float(getattr(args, "latentloop_plan_arm_weight", 1.0))
+                * loss_plan_arm
+                + float(getattr(args, "latentloop_plan_gripper_weight", 1.0))
+                * loss_plan_gripper
+                + float(getattr(args, "latentloop_plan_latent_weight", 1.0))
+                * loss_plan_latent
+            )
+        )
+        cqpc_loss_weighted = float(
+            getattr(args, "latentloop_cqpc_weight", 0.0)
+        ) * loss_cqpc
+        loss_calvin = (
+            base_loss_weighted
+            + lrnode_loss_weighted
+            + seer_distill_loss_weighted
+            + plan_baseline_loss_weighted
+            + cqpc_loss_weighted
+            + loss_joint_total
+        )
 
         train_log_metrics.update(
             {
@@ -695,6 +1402,31 @@ def train_one_epoch_calvin(
                 "train/base_total_loss_without_lrnode": base_loss_weighted,
                 "train/lrnode_total_loss_weighted": lrnode_loss_weighted,
                 "train/seer_distill_total_loss_weighted": seer_distill_loss_weighted,
+                "train/plan_baseline/enabled": torch.tensor(
+                    float(train_plan_baseline), device=device_id
+                ),
+                "train/plan_baseline/loss_arm_raw": loss_plan_arm,
+                "train/plan_baseline/loss_gripper_logit_raw": loss_plan_gripper,
+                "train/plan_baseline/loss_latent_raw": loss_plan_latent,
+                "train/plan_baseline/loss_executed_token_raw": loss_plan_exec,
+                "train/plan_baseline/loss_regularization_raw": loss_plan_regularization,
+                "train/plan_baseline/loss_total_weighted": plan_baseline_loss_weighted,
+                "train/plan_baseline/offset": torch.tensor(
+                    float(plan_offset), device=device_id
+                ),
+                "train/cqpc/enabled": torch.tensor(float(train_cqpc), device=device_id),
+                "train/cqpc/loss_raw": loss_cqpc,
+                "train/cqpc/loss_weighted": cqpc_loss_weighted,
+                "train/cqpc/arm_raw": loss_cqpc_arm_raw,
+                "train/cqpc/gripper_raw": loss_cqpc_gripper_raw,
+                "train/cqpc/arm_disagreement_weighted": loss_cqpc_arm_weighted,
+                "train/cqpc/gripper_disagreement_weighted": loss_cqpc_gripper_weighted,
+                "train/cqpc/teacher_disagreement_mean": cqpc_teacher_disagreement_mean,
+                "train/cqpc/teacher_weight_mean": cqpc_teacher_weight_mean,
+                "train/cqpc/teacher_disagreement_p50": cqpc_teacher_disagreement_p50,
+                "train/cqpc/teacher_disagreement_p90": cqpc_teacher_disagreement_p90,
+                "train/cqpc/teacher_disagreement_p95": cqpc_teacher_disagreement_p95,
+                "train/cqpc/teacher_disagreement_p99": cqpc_teacher_disagreement_p99,
                 "train/base/loss_arm_action_raw": loss_arm_action,
                 "train/base/loss_arm_action_weighted": args.loss_arm_action_ratio * loss_arm_action,
                 "train/base/loss_gripper_action_raw": loss_gripper_action,
@@ -925,6 +1657,21 @@ def train_one_epoch_calvin(
         loss_lrnode_bc = loss_lrnode_bc / args.gradient_accumulation_steps
         loss_seer_distill_action = loss_seer_distill_action / args.gradient_accumulation_steps
         loss_seer_distill_latent = loss_seer_distill_latent / args.gradient_accumulation_steps
+        loss_plan_arm = loss_plan_arm / args.gradient_accumulation_steps
+        loss_plan_gripper = loss_plan_gripper / args.gradient_accumulation_steps
+        loss_plan_latent = loss_plan_latent / args.gradient_accumulation_steps
+        loss_plan_exec = loss_plan_exec / args.gradient_accumulation_steps
+        loss_plan_regularization = (
+            loss_plan_regularization / args.gradient_accumulation_steps
+        )
+        loss_joint_latent = loss_joint_latent / args.gradient_accumulation_steps
+        loss_joint_latent_action = loss_joint_latent_action / args.gradient_accumulation_steps
+        loss_joint_surrogate = loss_joint_surrogate / args.gradient_accumulation_steps
+        loss_joint_exec = loss_joint_exec / args.gradient_accumulation_steps
+        loss_joint_tail = loss_joint_tail / args.gradient_accumulation_steps
+        loss_joint_gripper = loss_joint_gripper / args.gradient_accumulation_steps
+        loss_joint_residual = loss_joint_residual / args.gradient_accumulation_steps
+        loss_cqpc = loss_cqpc / args.gradient_accumulation_steps
         mv_avg_loss.append(loss.item())
 
         ### backward pass ###
@@ -992,9 +1739,16 @@ def train_one_epoch_calvin(
         )
 
         # step optimizer and log
-        if (((num_steps + 1) % args.gradient_accumulation_steps) == 0) or (
-            num_steps == num_batches_per_epoch - 1
-        ):
+        completed_comparison_microbatches = comparison_microbatch_index + 1
+        should_optimizer_step = (
+            completed_comparison_microbatches % args.gradient_accumulation_steps == 0
+            if budget_protocol_enabled
+            else (
+                ((num_steps + 1) % args.gradient_accumulation_steps) == 0
+                or num_steps == num_batches_per_epoch - 1
+            )
+        )
+        if should_optimizer_step:
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
@@ -1040,6 +1794,13 @@ def train_one_epoch_calvin(
                         "loss_lrnode_bc": loss_lrnode_bc.item() * args.gradient_accumulation_steps,
                         "loss_seer_distill_action": loss_seer_distill_action.item() * args.gradient_accumulation_steps,
                         "loss_seer_distill_latent": loss_seer_distill_latent.item() * args.gradient_accumulation_steps,
+                        "loss_plan_arm": loss_plan_arm.item() * args.gradient_accumulation_steps,
+                        "loss_plan_gripper": loss_plan_gripper.item() * args.gradient_accumulation_steps,
+                        "loss_plan_latent": loss_plan_latent.item() * args.gradient_accumulation_steps,
+                        "loss_plan_exec": loss_plan_exec.item() * args.gradient_accumulation_steps,
+                        "loss_plan_regularization": loss_plan_regularization.item() * args.gradient_accumulation_steps,
+                        "latentloop_comparison_offset": plan_offset,
+                        "loss_cqpc": loss_cqpc.item() * args.gradient_accumulation_steps,
                         "global_step": global_step,
                     },
                 )
@@ -1071,8 +1832,38 @@ def train_one_epoch_calvin(
                         },
                     )
 
+            args.latentloop_comparison_completed_microbatches = (
+                completed_comparison_microbatches
+            )
+            _save_comparison_checkpoint(
+                args,
+                model,
+                optimizer,
+                lr_scheduler,
+                epoch=epoch,
+                completed_microbatches=completed_comparison_microbatches,
+            )
+            _save_joint_checkpoint(
+                args,
+                model,
+                optimizer,
+                lr_scheduler,
+                epoch=epoch,
+                completed_microbatches=completed_comparison_microbatches,
+            )
+        elif budget_protocol_enabled:
+            args.latentloop_comparison_completed_microbatches = (
+                completed_comparison_microbatches
+            )
+
         avg_horizon = min(100, len(mv_avg_loss))
-        t.set_postfix({"avg loss": sum(mv_avg_loss[-avg_horizon:]) / avg_horizon, "loss": loss_calvin.item(), "loss_image": loss_image.item(), "loss_arm_action": loss_arm_action.item(), "loss_gripper_action": loss_gripper_action.item(), "loss_lrnode_latent": loss_lrnode_latent.item(), "loss_lrnode_action_distill": loss_lrnode_action_distill.item(), "loss_seer_distill_action": loss_seer_distill_action.item()})
+        t.set_postfix({"avg loss": sum(mv_avg_loss[-avg_horizon:]) / avg_horizon, "loss": loss_calvin.item(), "loss_image": loss_image.item(), "loss_arm_action": loss_arm_action.item(), "loss_gripper_action": loss_gripper_action.item(), "loss_lrnode_latent": loss_lrnode_latent.item(), "loss_lrnode_action_distill": loss_lrnode_action_distill.item(), "loss_seer_distill_action": loss_seer_distill_action.item(), "loss_plan": (loss_plan_arm + loss_plan_gripper + loss_plan_latent).item(), "loss_cqpc": loss_cqpc.item()})
+
+        if (
+            target_microbatches
+            and completed_comparison_microbatches >= target_microbatches
+        ):
+            return True
 
         # if args.save_every_iter != -1 and args.save_checkpoint and global_step % args.save_every_iter == 0 and global_step > 0:
                 
@@ -1095,6 +1886,8 @@ def train_one_epoch_calvin(
         #         if args.delete_previous_checkpoint:
         #             if epoch > 0:
         #                 os.remove(ckpt_path)
+
+    return False
 
 def get_checkpoint(model):
     state_dict = model.state_dict()

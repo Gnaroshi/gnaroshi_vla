@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Audit source provenance, checkpoint identities, and exact parameter counts."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+from architectures.seer.upstream.models.lrnode_modules import (
+    ControlledLatentNODE,
+    FastVisualDeltaEncoder,
+)
+from methods.joint_latent_action_surrogate.modules import (
+    JointLatentAnchoredActionSurrogate,
+    WideLatentCapacityControl,
+)
+
+
+EXPECTED_SHA256 = {
+    "teacher": "a999bf839acfb6f77beb8b86576933254f1981d2bacd1f0d269da093d7205cc5",
+    "canonical_adapter": "badc74e135003fee91ccc69c76fe4f225aece856f487236ca7f626424504f132",
+    "action_correction": "00ec3fdd4b5455628523334ae6dbaaed16ab03e723ac06c40e231cbc719952ca",
+    "episode_manifest": "416240713370c0d91d3af21a45d261bfb7dd7cf2e2a3832b5fabb52c3a6fa408",
+    "vit_checkpoint": "aec5f0b68e5f3193a00b07bc65a37440db549c15b36b8bea242606cc40c4bc5d",
+}
+
+
+SOURCE_PATHS = [
+    "methods/joint_latent_action_surrogate/__init__.py",
+    "methods/joint_latent_action_surrogate/alignment.py",
+    "methods/joint_latent_action_surrogate/modules.py",
+    "methods/joint_latent_action_surrogate/losses.py",
+    "methods/joint_latent_action_surrogate/metrics.py",
+    "methods/joint_latent_action_surrogate/schedule.py",
+    "methods/joint_latent_action_surrogate/decisions.py",
+    "architectures/seer/adapters/joint_latent_action_surrogate/__init__.py",
+    "architectures/seer/adapters/joint_latent_action_surrogate/factory.py",
+    "architectures/seer/adapters/joint_latent_action_surrogate/seer_joint.py",
+    "architectures/seer/upstream/models/lrnode_modules.py",
+    "architectures/seer/upstream/models/seer_model.py",
+    "architectures/seer/upstream/train.py",
+    "architectures/seer/upstream/eval_libero.py",
+    "architectures/seer/upstream/utils/arguments_utils.py",
+    "architectures/seer/upstream/utils/data_utils.py",
+    "architectures/seer/upstream/utils/lrnode_logging_utils.py",
+    "architectures/seer/upstream/utils/lrnode_mechanism_utils.py",
+    "architectures/seer/upstream/utils/train_utils.py",
+    "architectures/seer/upstream/utils/eval_utils_libero.py",
+    "architectures/seer/upstream/data_info/libero_10_converted.json",
+    "methods/latentloop_horizon_regeneration/__init__.py",
+    "methods/latentloop_horizon_regeneration/provenance.py",
+    "methods/latentloop_horizon_regeneration/schedule.py",
+    "methods/latentloop_plan_continuation/__init__.py",
+    "methods/latentloop_plan_continuation/action_correction.py",
+    "methods/latentloop_plan_continuation/feedback_source.py",
+    "architectures/seer/adapters/latentloop_horizon_regeneration/__init__.py",
+    "architectures/seer/adapters/latentloop_horizon_regeneration/trace.py",
+    "architectures/seer/adapters/latentloop_plan_continuation/__init__.py",
+    "architectures/seer/adapters/latentloop_plan_continuation/factory.py",
+    "architectures/seer/adapters/latentloop_plan_continuation/seer_action_correction.py",
+    "architectures/seer/adapters/latentloop_plan_continuation/token_alignment.py",
+    "architectures/seer/upstream/scripts/LIBERO_LONG/Seer/eval_lrnode_compare.sh",
+    "architectures/seer/wrappers/lrnode/distill_node.sh",
+    "architectures/seer/wrappers/lrnode/audit_joint_latent_action_surrogate.sh",
+    "architectures/seer/wrappers/lrnode/train_joint_latent_action_surrogate.sh",
+    "architectures/seer/wrappers/lrnode/eval_joint_latent_action_surrogate.sh",
+    "architectures/seer/wrappers/lrnode/analyze_joint_latent_action_surrogate.sh",
+    "architectures/seer/wrappers/lrnode/run_joint_latent_action_surrogate_sequential.sh",
+    "tools/seer/audit_joint_latent_action_surrogate.py",
+    "tools/seer/verify_joint_latent_action_surrogate_source_lock.py",
+    "tools/seer/calibrate_joint_surrogate_losses.py",
+    "tools/seer/freeze_joint_surrogate_loss_weights.py",
+    "tools/seer/emit_joint_surrogate_loss_weights.py",
+    "tools/seer/select_joint_surrogate_checkpoint.py",
+    "tools/seer/apply_joint_surrogate_offline_gates.py",
+    "tools/seer/compare_joint_surrogate_offline.py",
+    "tools/seer/check_joint_endpoint_parity.py",
+    "tools/seer/aggregate_joint_latent_action_surrogate.py",
+    "tools/seer/apply_joint_surrogate_verdict.py",
+]
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def count(module) -> int:
+    return sum(parameter.numel() for parameter in module.parameters())
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo-root", type=Path, required=True)
+    parser.add_argument("--teacher", type=Path, required=True)
+    parser.add_argument("--canonical-adapter", type=Path, required=True)
+    parser.add_argument("--action-correction", type=Path, required=True)
+    parser.add_argument("--vit-checkpoint", type=Path, required=True)
+    parser.add_argument("--historical-source-lock", type=Path, required=True)
+    parser.add_argument("--episode-manifest", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    for path in (
+        args.teacher,
+        args.canonical_adapter,
+        args.action_correction,
+        args.vit_checkpoint,
+        args.historical_source_lock,
+        args.episode_manifest,
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    if args.output.exists():
+        raise FileExistsError(args.output)
+
+    encoder = FastVisualDeltaEncoder(motion_dim=128, proprio_dim=8)
+    updater = ControlledLatentNODE(
+        latent_dim=384,
+        motion_dim=128,
+        hidden_dim=256,
+        gate_init_bias=-4.0,
+        action_pred_steps=3,
+        use_post_layernorm=0,
+    )
+    surrogate = JointLatentAnchoredActionSurrogate()
+    wide = WideLatentCapacityControl()
+    canonical = count(encoder) + count(updater)
+    joint = canonical + count(surrogate)
+    wide_total = canonical + count(wide)
+    if joint > canonical * 1.25:
+        raise RuntimeError("Joint model exceeds the frozen 1.25x parameter budget")
+    if abs(wide_total - joint) / joint > 0.02:
+        raise RuntimeError("Wide control is not within 2% of joint trainable count")
+
+    sources = {}
+    for relative in SOURCE_PATHS:
+        path = args.repo_root / relative
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        sources[relative] = sha256(path)
+
+    identities = {
+        "teacher": sha256(args.teacher),
+        "canonical_adapter": sha256(args.canonical_adapter),
+        "action_correction": sha256(args.action_correction),
+        "episode_manifest": sha256(args.episode_manifest),
+        "vit_checkpoint": sha256(args.vit_checkpoint),
+    }
+    mismatches = {
+        name: {"expected": EXPECTED_SHA256[name], "actual": actual}
+        for name, actual in identities.items()
+        if actual != EXPECTED_SHA256[name]
+    }
+    if mismatches:
+        raise RuntimeError(f"Source-lock identity mismatch: {mismatches}")
+    git_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=args.repo_root, text=True
+    ).strip()
+    git_status = subprocess.check_output(
+        ["git", "status", "--short"], cwd=args.repo_root, text=True
+    ).splitlines()
+    payload = {
+        "schema_version": 1,
+        "status": "PASS",
+        "protocol": "joint_latent_action_surrogate_v1",
+        "scientific_name": "joint_latent_anchored_action_surrogate",
+        "repo_root": str(args.repo_root.resolve()),
+        "git_head": git_head,
+        "git_dirty": bool(git_status),
+        "git_status": git_status,
+        "checkpoints": {
+            "teacher": {"path": str(args.teacher), "sha256": sha256(args.teacher)},
+            "canonical_adapter": {
+                "path": str(args.canonical_adapter),
+                "sha256": identities["canonical_adapter"],
+            },
+            "matched_action_correction": {
+                "path": str(args.action_correction),
+                "sha256": identities["action_correction"],
+            },
+            "vit_checkpoint": {
+                "path": str(args.vit_checkpoint),
+                "sha256": identities["vit_checkpoint"],
+            },
+        },
+        "episode_manifest": {
+            "path": str(args.episode_manifest),
+            "sha256": identities["episode_manifest"],
+            "episodes": 200,
+            "tasks": 10,
+            "episodes_per_task": 20,
+        },
+        "historical_source_lock": {
+            "path": str(args.historical_source_lock),
+            "sha256": sha256(args.historical_source_lock),
+        },
+        "source_sha256": sources,
+        "parameters": {
+            "canonical_encoder": count(encoder),
+            "canonical_updater": count(updater),
+            "canonical_total": canonical,
+            "joint_surrogate_added": count(surrogate),
+            "joint_total": joint,
+            "joint_ratio": joint / canonical,
+            "wide_added": count(wide),
+            "wide_total": wide_total,
+            "wide_vs_joint_relative_error": abs(wide_total - joint) / joint,
+        },
+        "fixed_protocol": {
+            "renderer": "osmesa",
+            "control_hz": 20.0,
+            "action_pred_steps": 3,
+            "temporal_ensemble": True,
+            "ensembling_temperature": 0.01,
+            "primary_full_interval": 8,
+            "primary_action_regeneration_interval": 3,
+            "evaluation_tasks": 10,
+            "episodes_per_task": 20,
+        },
+        "fixed_historical_results": {
+            "full_seer_k1_sr": 0.83,
+            "canonical_latentloop_k4_sr": 0.91,
+            "canonical_latentloop_k8_sr": 0.875,
+            "matched_action_correction_k4_sr": 0.845,
+            "matched_action_correction_k8_q1q2_sr": 0.245,
+            "matched_action_correction_k8_horizon_campaign_sr": 0.275,
+            "nonrecurrent_latent_k8_sr": 0.84,
+            "naive_hybrid_kf8_kg2_sr": 0.815,
+            "naive_hybrid_kf8_kg3_sr": 0.85,
+            "naive_hybrid_kf8_kg4_sr": 0.845,
+            "inconsistent_action_k8_rows_must_not_be_merged": True,
+        },
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(payload, indent=2) + "\n")
+    print(args.output)
+
+
+if __name__ == "__main__":
+    main()

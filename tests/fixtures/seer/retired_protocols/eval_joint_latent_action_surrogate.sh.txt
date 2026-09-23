@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+COMPARE="${REPO_ROOT}/architectures/seer/upstream/scripts/LIBERO_LONG/Seer/eval_lrnode_compare.sh"
+VERIFY="${REPO_ROOT}/tools/seer/verify_joint_latent_action_surrogate_source_lock.py"
+
+STAGE="${STAGE:?Set STAGE to parity_smoke, scientific_k8, or secondary_k4}"
+CAMPAIGN_TAG="${CAMPAIGN_TAG:?Set CAMPAIGN_TAG}"
+CAMPAIGN_ROOT="${CAMPAIGN_ROOT:-${REPO_ROOT}/results/seer/joint_latent_action_surrogate/${CAMPAIGN_TAG}}"
+SOURCE_LOCK_MANIFEST="${SOURCE_LOCK_MANIFEST:-${CAMPAIGN_ROOT}/source_lock/source_lock_manifest.json}"
+RESULT_ROOT="${RESULT_ROOT:-${CAMPAIGN_ROOT}/eval}"
+MASTER_PORT_BASE="${MASTER_PORT_BASE:-14700}"
+
+TEACHER_CKPT="${TEACHER_CKPT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/33.pth}"
+CANONICAL_ADAPTER_CKPT="${CANONICAL_ADAPTER_CKPT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/distill_node/sd1_distill_node_lrnode_distill_from_scratch_baseline_ckpt33_lronly_v1_lw05_aw01_g4_20260620_202533/39.pth}"
+ACTION_CORRECTION_CKPT="${ACTION_CORRECTION_CKPT:-${REPO_ROOT}/results/seer/latentloop/comparison/q1q2_all_20260809_fix2/train/action_full/checkpoints/sd1_distill_node_matched_action_space_correction_teacher33_full_v1_q1q2_all_20260809_fix2_action_full/microstep_041600.pth}"
+VIT_CHECKPOINT_PATH="${VIT_CHECKPOINT_PATH:-${REPO_ROOT}/architectures/seer/upstream/checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
+LIBERO_PATH="${LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
+EPISODE_MANIFEST="${EPISODE_MANIFEST:-${REPO_ROOT}/codex_outputs/seer_horizon_regeneration_intervention_20260814_022442/implementation_source_lock/canonical_episode_manifest.csv}"
+
+selected_checkpoint() {
+    local selection="$1"
+    [[ -f "${selection}" ]] || { echo "[ERROR] missing selection: ${selection}" >&2; exit 1; }
+    python -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected"]["checkpoint"])' "${selection}"
+}
+
+require_pass() {
+    local artifact="$1" label="$2"
+    [[ -f "${artifact}" ]] || { echo "[ERROR] missing ${label}: ${artifact}" >&2; exit 1; }
+    python -c 'import json,sys; p=json.load(open(sys.argv[1])); raise SystemExit(0 if p.get("pass") is True else 1)' \
+        "${artifact}" || { echo "[ERROR] ${label} is not PASS: ${artifact}" >&2; exit 1; }
+}
+
+STAGE_A_CKPT="${STAGE_A_CKPT:-$(selected_checkpoint "${CAMPAIGN_ROOT}/selection/stage_a_selection.json")}"
+JOINT_CKPT="${JOINT_CKPT:-$(selected_checkpoint "${CAMPAIGN_ROOT}/selection/stage_b_selection.json")}"
+WIDE_CKPT="${WIDE_CKPT:-$(selected_checkpoint "${CAMPAIGN_ROOT}/selection/wide_selection.json")}"
+
+for path in "${COMPARE}" "${TEACHER_CKPT}" "${CANONICAL_ADAPTER_CKPT}" \
+    "${ACTION_CORRECTION_CKPT}" "${STAGE_A_CKPT}" "${JOINT_CKPT}" \
+    "${WIDE_CKPT}" "${VIT_CHECKPOINT_PATH}" "${EPISODE_MANIFEST}"; do
+    [[ -f "${path}" ]] || { echo "[ERROR] missing file: ${path}" >&2; exit 1; }
+done
+[[ -d "${LIBERO_PATH}" ]] || { echo "[ERROR] missing LIBERO_PATH=${LIBERO_PATH}" >&2; exit 1; }
+PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python "${VERIFY}" --manifest "${SOURCE_LOCK_MANIFEST}"
+
+export LIBERO_GL_BACKEND=osmesa
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+export LIBERO_GL_REQUIRE_ACTUAL=1
+export SAVE_VIDEO="${SAVE_VIDEO:-0}"
+export LRNODE_EVAL_STEP_LOG=1
+export LRNODE_EVAL_PROFILE_FULL_ACTION_HEAD=1
+export LRNODE_EVAL_SHADOW_FULL_FORWARD=0
+export LRNODE_MECHANISM_TRACE=0
+export LRNODE_TRAIN_PROTOCOL=adapter
+export LRNODE_EVAL_BASE_CKPT="${TEACHER_CKPT}"
+export EVAL_LIBERO_ENSEMBLING=1
+export LATENTLOOP_HIERARCHICAL_TRACE=1
+export LATENTLOOP_HIERARCHICAL_ASSERT_INVARIANTS=1
+export LATENTLOOP_HIERARCHICAL_FULL_INTERVAL=8
+export LATENTLOOP_HIERARCHICAL_REGENERATION_INTERVAL=3
+export LATENTLOOP_HIERARCHICAL_ACTION_CHECKPOINT="${ACTION_CORRECTION_CKPT}"
+export VIT_CHECKPOINT_PATH LIBERO_PATH
+
+if [[ "${STAGE}" == "parity_smoke" ]]; then
+    export EVAL_NUM_EPISODES_PER_TASK="${EPISODES_PER_TASK:-4}"
+    export EVAL_NUM_TASKS="${NUM_TASKS:-1}"
+    export NODE_NUM="${NODE_NUM:-4}"
+else
+    export EVAL_NUM_EPISODES_PER_TASK="${EPISODES_PER_TASK:-20}"
+    export EVAL_NUM_TASKS="${NUM_TASKS:-10}"
+    export NODE_NUM="${NODE_NUM:-4}"
+fi
+
+run_row() {
+    local row_id="$1" ckpt="$2" joint_mode="$3" hierarchy="$4" plan_mode="$5"
+    local comparison="$6" canonical_init="$7" force_exact="$8" error_trace="$9"
+    local run_baseline="${10}" run_full="${11}" interval="${12}" port_offset="${13}"
+    local root="${RESULT_ROOT}/${STAGE}/${row_id}"
+    local completed=0
+    if [[ -d "${root}" ]]; then
+        completed=$(find "${root}" -name eval_summary.json -type f | wc -l)
+    fi
+    if [[ "${completed}" -eq 1 ]]; then
+        echo "[SKIP] complete row: ${row_id}"
+        return
+    fi
+    [[ ! -e "${root}" ]] || {
+        echo "[ERROR] partial/ambiguous row exists: ${root}" >&2
+        exit 1
+    }
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}" \
+    RESULT_ROOT="${root}" EXPERIMENT_NAME="${row_id}" EXPERIMENT_TAG="${CAMPAIGN_TAG}" \
+    BASELINE_CKPT="${TEACHER_CKPT}" BASELINE_CKPT_ID=33 BASELINE_NAME=local_teacher33 \
+    OURS_CKPT="${ckpt}" OURS_CKPT_ID="$(basename "${ckpt}" .pth)" OURS_NAME="${row_id}" \
+    RUN_BASELINE="${run_baseline}" RUN_OURS_FULL="${run_full}" \
+    LRNODE_QUERY_INTERVALS_STR="${interval}" \
+    LRNODE_INIT_ADAPTER_CKPT="${canonical_init}" \
+    JOINT_LATENT_ACTION_SURROGATE_MODE="${joint_mode}" \
+    JOINT_FORCE_EXACT_ACTION_HEAD="${force_exact}" JOINT_ERROR_TRACE="${error_trace}" \
+    LATENTLOOP_HIERARCHICAL_MODE="${hierarchy}" \
+    LATENTLOOP_HIERARCHICAL_FULL_INTERVAL="${interval:-8}" \
+    LATENTLOOP_PLAN_ADAPTER_MODE="${plan_mode}" \
+    LATENTLOOP_COMPARISON_PROTOCOL="${comparison}" \
+    MASTER_PORT="$((MASTER_PORT_BASE + port_offset))" \
+    bash "${COMPARE}"
+}
+
+case "${STAGE}" in
+    parity_smoke)
+        run_row k1_baseline "${CANONICAL_ADAPTER_CKPT}" off off off 0 "" 0 0 1 0 "" 0
+        run_row k1_joint_load "${JOINT_CKPT}" joint off off 0 "" 0 0 0 1 "" 10
+        run_row canonical_k8 "${CANONICAL_ADAPTER_CKPT}" off off off 0 "" 0 0 0 0 8 20
+        run_row stagea_exact_k8 "${STAGE_A_CKPT}" joint off off 0 "${CANONICAL_ADAPTER_CKPT}" 1 0 0 0 8 30
+        run_row joint_k8_diagnostics_off "${JOINT_CKPT}" joint off off 0 "" 0 0 0 0 8 40
+        run_row joint_k8_diagnostics_on "${JOINT_CKPT}" joint off off 0 "" 0 1 0 0 8 50
+        ;;
+    scientific_k8)
+        require_pass "${CAMPAIGN_ROOT}/eval/parity_smoke/k1_endpoint_parity.json" "K1/endpoint parity"
+        require_pass "${CAMPAIGN_ROOT}/offline/stage_a_gates.json" "Stage-A offline gate"
+        require_pass "${CAMPAIGN_ROOT}/offline/joint_vs_wide.json" "offline joint/wide comparison"
+        run_row full_seer_k1 "${CANONICAL_ADAPTER_CKPT}" off off off 0 "" 0 0 1 0 "" 100
+        run_row canonical_latentloop_k8 "${CANONICAL_ADAPTER_CKPT}" off off off 0 "" 0 0 0 0 8 110
+        run_row recursive_action_correction_k8 "${ACTION_CORRECTION_CKPT}" off pure_action_correction action_correction 1 "" 0 0 0 0 8 120
+        run_row naive_hybrid_kf8_kg3 "${CANONICAL_ADAPTER_CKPT}" off hybrid action_correction 1 "" 0 0 0 0 8 130
+        run_row parameter_matched_wide_k8 "${WIDE_CKPT}" wide off off 0 "" 0 1 0 0 8 140
+        run_row joint_anchor_surrogate_kf8_kg3 "${JOINT_CKPT}" joint off off 0 "" 0 1 0 0 8 150
+        ;;
+    secondary_k4)
+        [[ "${ENABLE_SECONDARY_K4:-0}" == "1" ]] || {
+            echo "[ERROR] K4 is disabled until the frozen K8 decision is complete; set ENABLE_SECONDARY_K4=1 explicitly." >&2
+            exit 1
+        }
+        [[ -f "${CAMPAIGN_ROOT}/eval/scientific_k8/aggregate/final_verdict.json" ]] || {
+            echo "[ERROR] Complete the frozen K8 aggregate before secondary K4." >&2
+            exit 1
+        }
+        run_row full_seer_k1 "${CANONICAL_ADAPTER_CKPT}" off off off 0 "" 0 0 1 0 "" 200
+        run_row canonical_latentloop_k4 "${CANONICAL_ADAPTER_CKPT}" off off off 0 "" 0 0 0 0 4 210
+        run_row matched_action_correction_k4 "${ACTION_CORRECTION_CKPT}" off pure_action_correction action_correction 1 "" 0 0 0 0 4 220
+        run_row parameter_matched_wide_k4 "${WIDE_CKPT}" wide off off 0 "" 0 1 0 0 4 230
+        run_row joint_anchor_surrogate_kf4_kg3 "${JOINT_CKPT}" joint off off 0 "" 0 1 0 0 4 240
+        ;;
+    *)
+        echo "[ERROR] unknown STAGE=${STAGE}" >&2
+        exit 1
+        ;;
+esac
+
+echo "[DONE] joint evaluation stage=${STAGE} root=${RESULT_ROOT}/${STAGE}"

@@ -404,6 +404,27 @@ class SeerAgent(nn.Module):
         gripper_pred_action = self.gripper_action_decoder(action_pred_feature)
         return arm_pred_action, gripper_pred_action
 
+    def decode_action_diagnostics_from_latent(self, action_latent):
+        """Decode actions while exposing the pre-sigmoid gripper logit."""
+        if self.action_pred_steps <= 0:
+            raise ValueError("decode_action_diagnostics_from_latent requires action_pred_steps > 0")
+        if action_latent.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                f"Expected action latent last dim {self.hidden_dim}, got {tuple(action_latent.shape)}"
+            )
+        decoder_param = next(self.action_decoder.parameters())
+        if action_latent.dtype != decoder_param.dtype or action_latent.device != decoder_param.device:
+            action_latent = action_latent.to(device=decoder_param.device, dtype=decoder_param.dtype)
+        action_pred_feature = self.action_decoder(action_latent)
+        arm_pred_action = self.arm_action_decoder(action_pred_feature)
+        gripper_logit = self.gripper_action_decoder[0](action_pred_feature)
+        gripper_probability = torch.sigmoid(gripper_logit)
+        return {
+            "arm": arm_pred_action,
+            "gripper_logit": gripper_logit,
+            "gripper_probability": gripper_probability,
+        }
+
     def get_action_head_modules(self):
         return [self.action_decoder, self.arm_action_decoder, self.gripper_action_decoder]
 
@@ -503,6 +524,21 @@ class SeerAgent(nn.Module):
         lrnode_selected_step=None,
         lrnode_dt=1.0,
         lrnode_age=1.0,
+        latentloop_plan_compute=False,
+        latentloop_plan_key_image_primary=None,
+        latentloop_plan_key_image_wrist=None,
+        latentloop_plan_cur_image_primary=None,
+        latentloop_plan_cur_image_wrist=None,
+        latentloop_plan_q_key=None,
+        latentloop_plan_q_cur=None,
+        latentloop_plan_selected_step=None,
+        latentloop_plan_offset=1,
+        joint_surrogate_compute=False,
+        joint_surrogate_image_primary_steps=None,
+        joint_surrogate_image_wrist_steps=None,
+        joint_surrogate_state_steps=None,
+        joint_surrogate_teacher_latents=None,
+        joint_surrogate_selected_step=None,
     ):  
         if self.training and self.phase == "pretrain":
             if self.obs_pred:
@@ -537,6 +573,8 @@ class SeerAgent(nn.Module):
         lrnode_teacher_action = None
         lrnode_hold_action = None
         lrnode_gate = None
+        latentloop_plan_output = None
+        joint_surrogate_output = None
         state_sequence = state
         
         # text embedding
@@ -629,7 +667,18 @@ class SeerAgent(nn.Module):
             if getattr(self, "profile_full_action_head", False) and torch.cuda.is_available():
                 torch.cuda.synchronize()
             full_action_head_t0 = time.perf_counter() if getattr(self, "profile_full_action_head", False) else None
-            arm_pred_action, gripper_pred_action = self.decode_action_from_latent(action_latent_full)
+            action_gripper_logit = None
+            if return_action_latent:
+                action_diagnostics = self.decode_action_diagnostics_from_latent(
+                    action_latent_full
+                )
+                arm_pred_action = action_diagnostics["arm"]
+                gripper_pred_action = action_diagnostics["gripper_probability"]
+                action_gripper_logit = action_diagnostics["gripper_logit"]
+            else:
+                arm_pred_action, gripper_pred_action = self.decode_action_from_latent(
+                    action_latent_full
+                )
             if full_action_head_t0 is not None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -638,6 +687,7 @@ class SeerAgent(nn.Module):
                 self.last_full_action_head_ms = 0.0
         else:
             action_latent_full = None
+            action_gripper_logit = None
             self.last_full_action_head_ms = 0.0
 
         if lrnode_compute_loss:
@@ -805,6 +855,243 @@ class SeerAgent(nn.Module):
                     lrnode_teacher_action = torch.cat([teacher_arm_action, teacher_gripper_action], dim=-1)
                     lrnode_hold_action = torch.cat([hold_arm_action, hold_gripper_action], dim=-1)
 
+        if joint_surrogate_compute:
+            if not hasattr(self, "joint_latent_action_surrogate"):
+                raise RuntimeError(
+                    "joint_surrogate_compute=True requires an attached joint adapter"
+                )
+            if action_latent_full is None:
+                raise RuntimeError("Joint surrogate training requires action latents")
+            required = {
+                "primary_steps": joint_surrogate_image_primary_steps,
+                "wrist_steps": joint_surrogate_image_wrist_steps,
+                "state_steps": joint_surrogate_state_steps,
+                "teacher_latents": joint_surrogate_teacher_latents,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise RuntimeError(f"Joint surrogate forward is missing inputs: {missing}")
+            if joint_surrogate_image_primary_steps.shape[1] != 3:
+                raise RuntimeError("Joint surrogate unroll requires exactly three observations")
+            selected_step = int(
+                action_latent_full.shape[1] - 1
+                if joint_surrogate_selected_step is None
+                else joint_surrogate_selected_step
+            )
+            if selected_step < 0:
+                selected_step += action_latent_full.shape[1]
+            if not 0 <= selected_step < action_latent_full.shape[1]:
+                raise RuntimeError("Joint surrogate selected step is outside the context")
+            z_anchor = action_latent_full[:, selected_step].detach()
+            if joint_surrogate_teacher_latents.shape != (
+                z_anchor.shape[0], 2, z_anchor.shape[-2], z_anchor.shape[-1]
+            ):
+                raise RuntimeError(
+                    "Joint teacher latent shape must be [B,2,P,D], got "
+                    f"{tuple(joint_surrogate_teacher_latents.shape)}"
+                )
+            with torch.no_grad():
+                anchor_diagnostics = self.decode_action_diagnostics_from_latent(z_anchor)
+            adapter = self.joint_latent_action_surrogate
+            z_current = z_anchor
+            predicted_latents = []
+            shared_features = []
+            exact_arm = []
+            exact_gripper_logit = []
+            teacher_arm = []
+            teacher_gripper_logit = []
+            surrogate_outputs = []
+            for index in range(2):
+                age = index + 1
+                shared_feature = self.lrnode_encode_delta(
+                    key_image_primary=joint_surrogate_image_primary_steps[:, index],
+                    key_image_wrist=joint_surrogate_image_wrist_steps[:, index],
+                    cur_image_primary=joint_surrogate_image_primary_steps[:, index + 1],
+                    cur_image_wrist=joint_surrogate_image_wrist_steps[:, index + 1],
+                    q_key=joint_surrogate_state_steps[:, index],
+                    q_cur=joint_surrogate_state_steps[:, index + 1],
+                )
+                z_current = self.lrnode_apply_dynamics(
+                    z_prev=z_current,
+                    u_delta=shared_feature,
+                    dt=1.0,
+                    age=float(age),
+                )
+                z_current = adapter.apply_wide_capacity(
+                    z_current, shared_feature, age=float(age)
+                )
+                exact = self.decode_action_diagnostics_from_latent(z_current)
+                with torch.no_grad():
+                    teacher = self.decode_action_diagnostics_from_latent(
+                        joint_surrogate_teacher_latents[:, index].detach()
+                    )
+                predicted_latents.append(z_current)
+                shared_features.append(shared_feature)
+                exact_arm.append(exact["arm"])
+                exact_gripper_logit.append(exact["gripper_logit"])
+                teacher_arm.append(teacher["arm"])
+                teacher_gripper_logit.append(teacher["gripper_logit"])
+                if str(adapter.mode) == "joint":
+                    surrogate_outputs.append(
+                        adapter.surrogate_forward(
+                            anchor_arm=anchor_diagnostics["arm"].detach(),
+                            anchor_gripper_logit=anchor_diagnostics[
+                                "gripper_logit"
+                            ].detach(),
+                            anchor_latent=z_anchor,
+                            current_latent=z_current,
+                            shared_feature=shared_feature,
+                            elapsed=age,
+                        )
+                    )
+            joint_surrogate_output = {
+                "mode": str(adapter.mode),
+                "z_anchor": z_anchor,
+                "z_pred": torch.stack(predicted_latents, dim=1),
+                "z_teacher": joint_surrogate_teacher_latents.detach(),
+                "shared_feature": torch.stack(shared_features, dim=1),
+                "exact_arm": torch.stack(exact_arm, dim=1),
+                "exact_gripper_logit": torch.stack(exact_gripper_logit, dim=1),
+                "teacher_arm": torch.stack(teacher_arm, dim=1),
+                "teacher_gripper_logit": torch.stack(teacher_gripper_logit, dim=1),
+                "surrogate_arm": (
+                    None
+                    if not surrogate_outputs
+                    else torch.stack([output.arm for output in surrogate_outputs], dim=1)
+                ),
+                "surrogate_gripper_logit": (
+                    None
+                    if not surrogate_outputs
+                    else torch.stack(
+                        [output.gripper_logit for output in surrogate_outputs], dim=1
+                    )
+                ),
+                "surrogate_residual": (
+                    None
+                    if not surrogate_outputs
+                    else torch.stack([output.residual for output in surrogate_outputs], dim=1)
+                ),
+                "surrogate_valid_mask": (
+                    None
+                    if not surrogate_outputs
+                    else torch.stack([output.valid_mask for output in surrogate_outputs], dim=1)
+                ),
+                "surrogate_aligned_anchor": (
+                    None
+                    if not surrogate_outputs
+                    else torch.stack(
+                        [output.aligned_anchor for output in surrogate_outputs], dim=1
+                    )
+                ),
+                "shared_encoder_calls": 2,
+                "exact_regeneration_error": torch.zeros(
+                    (), device=z_anchor.device, dtype=z_anchor.dtype
+                ),
+            }
+
+        if latentloop_plan_compute:
+            if not hasattr(self, "latentloop_plan_adapter"):
+                raise RuntimeError(
+                    "latentloop_plan_compute=True requires an attached plan adapter"
+                )
+            if action_latent_full is None:
+                raise RuntimeError("Plan baselines require action_pred_steps > 0")
+            required = {
+                "key_primary": latentloop_plan_key_image_primary,
+                "key_wrist": latentloop_plan_key_image_wrist,
+                "cur_primary": latentloop_plan_cur_image_primary,
+                "cur_wrist": latentloop_plan_cur_image_wrist,
+                "q_key": latentloop_plan_q_key,
+                "q_cur": latentloop_plan_q_cur,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise RuntimeError(f"Plan baseline forward is missing inputs: {missing}")
+            selected_step = int(
+                action_latent_full.shape[1] - 1
+                if latentloop_plan_selected_step is None
+                else latentloop_plan_selected_step
+            )
+            if selected_step < 0:
+                selected_step += action_latent_full.shape[1]
+            if not 0 <= selected_step < action_latent_full.shape[1]:
+                raise RuntimeError(
+                    f"Plan selected step {selected_step} is outside "
+                    f"[0,{action_latent_full.shape[1] - 1}]"
+                )
+            z_anchor = action_latent_full[:, selected_step].detach()
+            adapter = self.latentloop_plan_adapter
+            mode = str(getattr(adapter, "mode", ""))
+            plan_offset = int(latentloop_plan_offset)
+            if plan_offset < 1:
+                raise RuntimeError(
+                    f"latentloop_plan_offset must be positive, got {plan_offset}"
+                )
+            if mode == "action_correction":
+                if plan_offset != 1:
+                    raise RuntimeError(
+                        "Matched action correction uses the verified one-query token shift; "
+                        f"got offset={plan_offset}"
+                    )
+                with torch.no_grad():
+                    previous = self.decode_action_diagnostics_from_latent(z_anchor)
+                feature = adapter.encode_delta(
+                    latentloop_plan_key_image_primary,
+                    latentloop_plan_key_image_wrist,
+                    latentloop_plan_cur_image_primary,
+                    latentloop_plan_cur_image_wrist,
+                    latentloop_plan_q_key,
+                    latentloop_plan_q_cur,
+                )
+                prediction = adapter.forward_from_feature(
+                    previous["arm"].detach(),
+                    previous["gripper_logit"].detach(),
+                    feature,
+                    age=float(plan_offset),
+                )
+                latentloop_plan_output = {
+                    "mode": mode,
+                    "feature": feature,
+                    "arm": prediction.arm,
+                    "gripper_logit": prediction.gripper_logit,
+                    "gripper_probability": prediction.gripper_probability,
+                    "arm_residual": prediction.arm_residual,
+                    "gripper_logit_residual": prediction.gripper_logit_residual,
+                    "shifted_overlap_mask": prediction.shifted_overlap_mask,
+                    "offset": plan_offset,
+                    "latent": None,
+                    "anchor_latent": z_anchor,
+                }
+            elif mode == "anchor_bridge":
+                feature = adapter.encode_anchor_to_current(
+                    latentloop_plan_key_image_primary,
+                    latentloop_plan_key_image_wrist,
+                    latentloop_plan_cur_image_primary,
+                    latentloop_plan_cur_image_wrist,
+                    latentloop_plan_q_key,
+                    latentloop_plan_q_cur,
+                )
+                prediction = adapter.forward_from_feature(
+                    z_anchor, feature, age=float(plan_offset)
+                )
+                diagnostics = self.decode_action_diagnostics_from_latent(prediction.latent)
+                latentloop_plan_output = {
+                    "mode": mode,
+                    "feature": feature,
+                    "arm": diagnostics["arm"],
+                    "gripper_logit": diagnostics["gripper_logit"],
+                    "gripper_probability": diagnostics["gripper_probability"],
+                    "arm_residual": None,
+                    "gripper_logit_residual": None,
+                    "latent": prediction.latent,
+                    "latent_residual": prediction.residual,
+                    "gate": prediction.gate,
+                    "offset": plan_offset,
+                    "anchor_latent": z_anchor,
+                }
+            else:
+                raise RuntimeError(f"Unknown attached plan adapter mode={mode!r}")
+
         if return_action_latent:
             return {
                 "arm_pred_action": arm_pred_action,
@@ -814,6 +1101,7 @@ class SeerAgent(nn.Module):
                 "gripper_pred_state": gripper_pred_state,
                 "loss_arm_action": loss_arm_action,
                 "action_latent": action_latent_full,
+                "action_gripper_logit": action_gripper_logit,
                 "lrnode_z_prev": lrnode_z_prev,
                 "lrnode_z_teacher_next": lrnode_z_teacher_next,
                 "lrnode_z_pred_next": lrnode_z_pred_next,
@@ -828,6 +1116,8 @@ class SeerAgent(nn.Module):
                 if self.use_lrnode_latent_update else None,
                 "lrnode_update": getattr(self.lrnode_dynamics, "last_update", None)
                 if self.use_lrnode_latent_update else None,
+                "latentloop_plan_output": latentloop_plan_output,
+                "joint_surrogate_output": joint_surrogate_output,
             }
         
         return arm_pred_action, gripper_pred_action, image_pred, arm_pred_state, gripper_pred_state, loss_arm_action

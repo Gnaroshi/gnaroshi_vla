@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+AUDIT="${REPO_ROOT}/architectures/seer/wrappers/lrnode/audit_joint_latent_action_surrogate.sh"
+TRAIN="${REPO_ROOT}/architectures/seer/wrappers/lrnode/train_joint_latent_action_surrogate.sh"
+EVAL="${REPO_ROOT}/architectures/seer/wrappers/lrnode/eval_joint_latent_action_surrogate.sh"
+ANALYZE="${REPO_ROOT}/architectures/seer/wrappers/lrnode/analyze_joint_latent_action_surrogate.sh"
+CALIBRATE="${REPO_ROOT}/tools/seer/calibrate_joint_surrogate_losses.py"
+FREEZE="${REPO_ROOT}/tools/seer/freeze_joint_surrogate_loss_weights.py"
+VERIFY="${REPO_ROOT}/tools/seer/verify_joint_latent_action_surrogate_source_lock.py"
+
+cd "${REPO_ROOT}"
+
+CAMPAIGN_TAG="${CAMPAIGN_TAG:-joint_latent_action_surrogate_$(date +%Y%m%d_%H%M%S)}"
+CAMPAIGN_ROOT="${CAMPAIGN_ROOT:-${REPO_ROOT}/results/seer/joint_latent_action_surrogate/${CAMPAIGN_TAG}}"
+SOURCE_LOCK_MANIFEST="${SOURCE_LOCK_MANIFEST:-${CAMPAIGN_ROOT}/source_lock/source_lock_manifest.json}"
+MASTER_PORT_BASE="${MASTER_PORT_BASE:-15000}"
+RUN_SECONDARY_K4="${RUN_SECONDARY_K4:-0}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+REVIEWER="${REVIEWER:-${USER:-unknown}}"
+
+export CAMPAIGN_TAG CAMPAIGN_ROOT SOURCE_LOCK_MANIFEST
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+export NODE_NUM="${NODE_NUM:-4}"
+export REPORT_TO_WANDB="${REPORT_TO_WANDB:-1}"
+export SAVE_VIDEO="${SAVE_VIDEO:-0}"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="${TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD:-1}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+export TEACHER_CKPT="${TEACHER_CKPT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/33.pth}"
+export CANONICAL_ADAPTER_CKPT="${CANONICAL_ADAPTER_CKPT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/distill_node/sd1_distill_node_lrnode_distill_from_scratch_baseline_ckpt33_lronly_v1_lw05_aw01_g4_20260620_202533/39.pth}"
+export ACTION_CORRECTION_CKPT="${ACTION_CORRECTION_CKPT:-${REPO_ROOT}/results/seer/latentloop/comparison/q1q2_all_20260809_fix2/train/action_full/checkpoints/sd1_distill_node_matched_action_space_correction_teacher33_full_v1_q1q2_all_20260809_fix2_action_full/microstep_041600.pth}"
+export VIT_CHECKPOINT_PATH="${VIT_CHECKPOINT_PATH:-${REPO_ROOT}/architectures/seer/upstream/checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
+JOINT_DATASET_ROOT="${JOINT_DATASET_ROOT:-${REPO_ROOT}/architectures/seer/upstream/LIBERO_DATASETS/libero_10_converted}"
+if [[ -n "${ROOT_DIR:-}" && "${ROOT_DIR}" != "${JOINT_DATASET_ROOT}" ]]; then
+    echo "[CONFIG] ignoring ambient ROOT_DIR=${ROOT_DIR}"
+fi
+export ROOT_DIR="${JOINT_DATASET_ROOT}"
+export DATASET="${DATASET:-libero_10_converted}"
+export LIBERO_PATH="${LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
+export EPISODE_MANIFEST="${EPISODE_MANIFEST:-${REPO_ROOT}/codex_outputs/seer_horizon_regeneration_intervention_20260814_022442/implementation_source_lock/canonical_episode_manifest.csv}"
+export HISTORICAL_SOURCE_LOCK="${HISTORICAL_SOURCE_LOCK:-${REPO_ROOT}/codex_outputs/seer_horizon_regeneration_intervention_20260814_022442/implementation_source_lock/source_lock_manifest.json}"
+
+port() {
+    local offset="$1"
+    printf '%d\n' "$((MASTER_PORT_BASE + offset))"
+}
+
+require_file() {
+    local path="$1" label="$2"
+    [[ -f "${path}" ]] || { echo "[ERROR] missing ${label}: ${path}" >&2; exit 1; }
+}
+
+require_dir() {
+    local path="$1" label="$2"
+    [[ -d "${path}" ]] || { echo "[ERROR] missing ${label}: ${path}" >&2; exit 1; }
+}
+
+require_json_pass() {
+    local path="$1" label="$2"
+    require_file "${path}" "${label}"
+    python -c 'import json,sys; x=json.load(open(sys.argv[1])); raise SystemExit(0 if x.get("pass") is True else 1)' \
+        "${path}" || { echo "[ERROR] ${label} is not PASS: ${path}" >&2; exit 1; }
+}
+
+run_train_if_missing() {
+    local marker="$1" stage="$2" offset="$3"
+    shift 3
+    if [[ -s "${marker}" ]]; then
+        echo "[SKIP] completed training stage=${stage}: ${marker}"
+        return
+    fi
+    echo "[RUN] training stage=${stage}"
+    env STAGE="${stage}" MASTER_PORT="$(port "${offset}")" "$@" bash "${TRAIN}"
+    require_file "${marker}" "training completion marker for ${stage}"
+}
+
+run_analysis_if_missing() {
+    local marker="$1" stage="$2"
+    if [[ -s "${marker}" ]]; then
+        echo "[SKIP] completed analysis stage=${stage}: ${marker}"
+        return
+    fi
+    echo "[RUN] analysis stage=${stage}"
+    env STAGE="${stage}" bash "${ANALYZE}"
+    require_file "${marker}" "analysis artifact for ${stage}"
+}
+
+make_candidate_if_missing() {
+    local stage="$1" raw="$2" candidate="$3"
+    if [[ -s "${candidate}" ]]; then
+        echo "[SKIP] existing calibration candidate: ${candidate}"
+        return
+    fi
+    require_file "${raw}" "${stage} raw-loss JSONL"
+    python "${CALIBRATE}" \
+        --raw-jsonl "${raw}" --source-lock "${SOURCE_LOCK_MANIFEST}" \
+        --stage "${stage}" --output "${candidate}"
+}
+
+review_and_freeze() {
+    local stage="$1" candidate="$2" frozen="$3"
+    if [[ -s "${frozen}" ]]; then
+        echo "[SKIP] existing frozen loss contract: ${frozen}"
+        return
+    fi
+    require_file "${candidate}" "${stage} calibration candidate"
+    echo
+    echo "[REVIEW] ${stage} raw-loss calibration candidate"
+    python -m json.tool "${candidate}"
+    echo
+    if [[ ! -t 0 ]]; then
+        echo "[ERROR] interactive loss review requires a foreground terminal/tmux pane" >&2
+        exit 1
+    fi
+    local answer
+    read -r -p "Type 'FREEZE ${stage}' to predeclare these weights: " answer
+    [[ "${answer}" == "FREEZE ${stage}" ]] || {
+        echo "[STOP] ${stage} weights were not approved; no subsequent stage was launched."
+        exit 2
+    }
+    python "${FREEZE}" \
+        --candidate "${candidate}" --output "${frozen}" --reviewer "${REVIEWER}"
+}
+
+for file in "${AUDIT}" "${TRAIN}" "${EVAL}" "${ANALYZE}" "${CALIBRATE}" \
+    "${FREEZE}" "${VERIFY}" "${TEACHER_CKPT}" "${CANONICAL_ADAPTER_CKPT}" \
+    "${ACTION_CORRECTION_CKPT}" "${VIT_CHECKPOINT_PATH}" "${EPISODE_MANIFEST}" \
+    "${HISTORICAL_SOURCE_LOCK}"; do
+    require_file "${file}" "required input"
+done
+require_dir "${ROOT_DIR}/${DATASET}" "training dataset"
+require_file "${ROOT_DIR}/${DATASET}/meta_info.h5" "converted dataset metadata"
+require_file "${REPO_ROOT}/architectures/seer/upstream/data_info/${DATASET}.json" \
+    "Seer dataset index"
+require_dir "${LIBERO_PATH}" "LIBERO repository"
+[[ "${CONDA_DEFAULT_ENV:-}" == "seer_libero" ]] || {
+    echo "[ERROR] activate the seer_libero conda environment before running" >&2
+    exit 1
+}
+command -v torchrun >/dev/null || {
+    echo "[ERROR] torchrun is unavailable in the active environment" >&2
+    exit 1
+}
+
+IFS=',' read -r -a visible_gpus <<< "${CUDA_VISIBLE_DEVICES}"
+[[ "${#visible_gpus[@]}" -eq "${NODE_NUM}" ]] || {
+    echo "[ERROR] CUDA_VISIBLE_DEVICES exposes ${#visible_gpus[@]} GPUs but NODE_NUM=${NODE_NUM}" >&2
+    exit 1
+}
+[[ "$((20 % NODE_NUM))" -eq 0 && "$((4 % NODE_NUM))" -eq 0 ]] || {
+    echo "[ERROR] fixed episode counts 20 and 4 must be divisible by NODE_NUM=${NODE_NUM}" >&2
+    exit 1
+}
+[[ "${MASTER_PORT_BASE}" -ge 1024 && "$((MASTER_PORT_BASE + 740))" -le 65535 ]] || {
+    echo "[ERROR] MASTER_PORT_BASE=${MASTER_PORT_BASE} leaves an invalid port range" >&2
+    exit 1
+}
+[[ "${RUN_SECONDARY_K4}" == "0" || "${RUN_SECONDARY_K4}" == "1" ]] || {
+    echo "[ERROR] RUN_SECONDARY_K4 must be 0 or 1" >&2
+    exit 1
+}
+
+echo "[CONFIG] campaign=${CAMPAIGN_TAG}"
+echo "[CONFIG] root=${CAMPAIGN_ROOT}"
+echo "[CONFIG] GPUs=${CUDA_VISIBLE_DEVICES} NODE_NUM=${NODE_NUM}"
+echo "[CONFIG] primary=K_F8/K_G3, secondary_K4=${RUN_SECONDARY_K4}"
+echo "[CONFIG] three reviewed loss freezes are required in this foreground terminal"
+
+if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+    echo "[PREFLIGHT][OK] environment, files, dataset layout, GPU count, and port bounds are valid"
+    exit 0
+fi
+
+mkdir -p "${CAMPAIGN_ROOT}"
+
+if [[ -s "${SOURCE_LOCK_MANIFEST}" ]]; then
+    python "${VERIFY}" --manifest "${SOURCE_LOCK_MANIFEST}"
+else
+    bash "${AUDIT}"
+fi
+
+STAGE_A_RUN="${CAMPAIGN_ROOT}/train/calibration_a/checkpoints/calibration_a_${CAMPAIGN_TAG}"
+run_train_if_missing \
+    "${STAGE_A_RUN}/analysis/training_budget_complete.json" calibration_a 0
+STAGE_A_CANDIDATE="${CAMPAIGN_ROOT}/loss_contracts/stage_a_candidate.json"
+STAGE_A_FROZEN="${CAMPAIGN_ROOT}/loss_contracts/stage_a_frozen.json"
+make_candidate_if_missing stage_a \
+    "${STAGE_A_RUN}/analysis/joint_raw_losses.jsonl" "${STAGE_A_CANDIDATE}"
+review_and_freeze stage_a "${STAGE_A_CANDIDATE}" "${STAGE_A_FROZEN}"
+export STAGE_A_WEIGHTS="${STAGE_A_FROZEN}"
+
+STAGE_A_SMOKE="${CAMPAIGN_ROOT}/train/stage_a_smoke/checkpoints/stage_a_smoke_${CAMPAIGN_TAG}"
+STAGE_A_FULL="${CAMPAIGN_ROOT}/train/stage_a_full/checkpoints/stage_a_full_${CAMPAIGN_TAG}"
+run_train_if_missing \
+    "${STAGE_A_SMOKE}/analysis/training_budget_complete.json" stage_a_smoke 10 \
+    STAGE_A_WEIGHTS="${STAGE_A_WEIGHTS}"
+run_train_if_missing \
+    "${STAGE_A_FULL}/analysis/training_budget_complete.json" stage_a_full 20 \
+    STAGE_A_WEIGHTS="${STAGE_A_WEIGHTS}"
+if [[ ! -s "${CAMPAIGN_ROOT}/selection/stage_a_selection.json" ]]; then
+    env STAGE=stage_a_validate MASTER_PORT="$(port 30)" \
+        STAGE_A_WEIGHTS="${STAGE_A_WEIGHTS}" \
+        STAGE_A_CHECKPOINT_DIR="${STAGE_A_FULL}" bash "${TRAIN}"
+fi
+run_analysis_if_missing "${CAMPAIGN_ROOT}/offline/stage_a_gates.json" stage_a_gate
+require_json_pass "${CAMPAIGN_ROOT}/offline/stage_a_gates.json" "Stage-A offline gate"
+
+STAGE_B_CAL="${CAMPAIGN_ROOT}/train/calibration_b/checkpoints/calibration_b_${CAMPAIGN_TAG}"
+run_train_if_missing \
+    "${STAGE_B_CAL}/analysis/training_budget_complete.json" calibration_b 40
+STAGE_B_CANDIDATE="${CAMPAIGN_ROOT}/loss_contracts/stage_b_candidate.json"
+STAGE_B_FROZEN="${CAMPAIGN_ROOT}/loss_contracts/stage_b_frozen.json"
+make_candidate_if_missing stage_b \
+    "${STAGE_B_CAL}/analysis/joint_raw_losses.jsonl" "${STAGE_B_CANDIDATE}"
+review_and_freeze stage_b "${STAGE_B_CANDIDATE}" "${STAGE_B_FROZEN}"
+export STAGE_B_WEIGHTS="${STAGE_B_FROZEN}"
+
+WIDE_CAL="${CAMPAIGN_ROOT}/train/calibration_wide/checkpoints/calibration_wide_${CAMPAIGN_TAG}"
+run_train_if_missing \
+    "${WIDE_CAL}/analysis/training_budget_complete.json" calibration_wide 50
+WIDE_CANDIDATE="${CAMPAIGN_ROOT}/loss_contracts/wide_candidate.json"
+WIDE_FROZEN="${CAMPAIGN_ROOT}/loss_contracts/wide_frozen.json"
+make_candidate_if_missing wide \
+    "${WIDE_CAL}/analysis/joint_raw_losses.jsonl" "${WIDE_CANDIDATE}"
+review_and_freeze wide "${WIDE_CANDIDATE}" "${WIDE_FROZEN}"
+export WIDE_WEIGHTS="${WIDE_FROZEN}"
+
+STAGE_B_SMOKE="${CAMPAIGN_ROOT}/train/stage_b_smoke/checkpoints/stage_b_smoke_${CAMPAIGN_TAG}"
+STAGE_B_FULL="${CAMPAIGN_ROOT}/train/stage_b_full/checkpoints/stage_b_full_${CAMPAIGN_TAG}"
+run_train_if_missing \
+    "${STAGE_B_SMOKE}/analysis/training_budget_complete.json" stage_b_smoke 60 \
+    STAGE_B_WEIGHTS="${STAGE_B_WEIGHTS}" PRETRAINED_LR_SCALE=0.1
+run_train_if_missing \
+    "${STAGE_B_FULL}/analysis/training_budget_complete.json" stage_b_full 70 \
+    STAGE_B_WEIGHTS="${STAGE_B_WEIGHTS}" PRETRAINED_LR_SCALE=0.1
+if [[ ! -s "${CAMPAIGN_ROOT}/selection/stage_b_selection.json" ]]; then
+    env STAGE=stage_b_validate MASTER_PORT="$(port 80)" \
+        STAGE_B_WEIGHTS="${STAGE_B_WEIGHTS}" STAGE_B_CHECKPOINT_DIR="${STAGE_B_FULL}" \
+        bash "${TRAIN}"
+fi
+
+WIDE_SMOKE="${CAMPAIGN_ROOT}/train/wide_smoke/checkpoints/wide_smoke_${CAMPAIGN_TAG}"
+WIDE_FULL="${CAMPAIGN_ROOT}/train/wide_full/checkpoints/wide_full_${CAMPAIGN_TAG}"
+run_train_if_missing \
+    "${WIDE_SMOKE}/analysis/training_budget_complete.json" wide_smoke 90 \
+    WIDE_WEIGHTS="${WIDE_WEIGHTS}" PRETRAINED_LR_SCALE=0.1
+run_train_if_missing \
+    "${WIDE_FULL}/analysis/training_budget_complete.json" wide_full 100 \
+    WIDE_WEIGHTS="${WIDE_WEIGHTS}" PRETRAINED_LR_SCALE=0.1
+if [[ ! -s "${CAMPAIGN_ROOT}/selection/wide_selection.json" ]]; then
+    env STAGE=wide_validate MASTER_PORT="$(port 110)" \
+        WIDE_WEIGHTS="${WIDE_WEIGHTS}" WIDE_CHECKPOINT_DIR="${WIDE_FULL}" \
+        bash "${TRAIN}"
+fi
+
+run_analysis_if_missing "${CAMPAIGN_ROOT}/offline/joint_vs_wide.json" offline_compare
+require_json_pass "${CAMPAIGN_ROOT}/offline/joint_vs_wide.json" "offline joint/wide comparison"
+
+PARITY_ARTIFACT="${CAMPAIGN_ROOT}/eval/parity_smoke/k1_endpoint_parity.json"
+if [[ ! -s "${PARITY_ARTIFACT}" ]]; then
+    env STAGE=parity_smoke MASTER_PORT_BASE="$(port 200)" \
+        EPISODES_PER_TASK=4 NUM_TASKS=1 NODE_NUM="${NODE_NUM}" SAVE_VIDEO=0 \
+        bash "${EVAL}"
+    env STAGE=parity bash "${ANALYZE}"
+fi
+require_json_pass "${PARITY_ARTIFACT}" "K1/endpoint parity"
+
+FINAL_VERDICT="${CAMPAIGN_ROOT}/eval/scientific_k8/aggregate/final_verdict.json"
+if [[ ! -s "${FINAL_VERDICT}" ]]; then
+    env STAGE=scientific_k8 MASTER_PORT_BASE="$(port 300)" \
+        EPISODES_PER_TASK=20 NUM_TASKS=10 NODE_NUM="${NODE_NUM}" \
+        SAVE_VIDEO="${SAVE_VIDEO}" bash "${EVAL}"
+    if [[ -e "${CAMPAIGN_ROOT}/eval/scientific_k8/aggregate" ]]; then
+        echo "[ERROR] partial aggregate exists without final verdict; audit it before resuming" >&2
+        exit 1
+    fi
+    env STAGE=aggregate_k8 BOOTSTRAP_ITERATIONS=10000 BOOTSTRAP_SEED=20260816 \
+        bash "${ANALYZE}"
+fi
+require_file "${FINAL_VERDICT}" "frozen K8 verdict"
+
+if [[ "${RUN_SECONDARY_K4}" == "1" ]]; then
+    env ENABLE_SECONDARY_K4=1 STAGE=secondary_k4 MASTER_PORT_BASE="$(port 500)" \
+        EPISODES_PER_TASK=20 NUM_TASKS=10 NODE_NUM="${NODE_NUM}" \
+        SAVE_VIDEO="${SAVE_VIDEO}" bash "${EVAL}"
+fi
+
+date --iso-8601=seconds > "${CAMPAIGN_ROOT}/sequential_run_complete.txt"
+echo "[DONE] Joint Latent-Anchored Action Surrogate campaign"
+echo "[DONE] verdict=${FINAL_VERDICT}"
+echo "[DONE] root=${CAMPAIGN_ROOT}"

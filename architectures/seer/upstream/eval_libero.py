@@ -1,5 +1,6 @@
 import os
 import json
+import sys
 from pathlib import Path
 import random
 
@@ -12,14 +13,48 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from models.seer_model import SeerAgent
 from utils.arguments_utils import get_parser
 from utils.distributed_utils import init_distributed_device, world_info_from_env
-from utils.eval_utils_libero import eval_one_epoch_libero_ddp
+from utils.eval_utils_libero import (
+    eval_one_epoch_libero_ddp,
+    get_renderer_backend_metadata,
+)
 from utils.lrnode_logging_utils import save_lrnode_run_snapshots
+
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+if str(_WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_WORKSPACE_ROOT))
+from architectures.seer.adapters.latentloop_comparison import attach_comparison_adapter
+from architectures.seer.adapters.joint_latent_action_surrogate import (
+    attach_joint_latent_action_surrogate,
+)
+from architectures.seer.adapters.latentloop_plan_continuation import attach_plan_adapter
 
 
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
     np.random.seed(seed + rank)
     random.seed(seed + rank)
+
+
+def _attach_configured_plan_adapter(model, args):
+    """Preserve legacy plan adapters unless the Q1/Q2 protocol is explicit."""
+
+    joint_mode = str(getattr(args, "joint_latent_action_surrogate_mode", "off"))
+    if joint_mode != "off":
+        if str(getattr(args, "latentloop_plan_adapter_mode", "off")) != "off":
+            raise ValueError("Joint evaluation cannot use a legacy plan adapter")
+        if str(getattr(args, "latentloop_hierarchical_mode", "off")) != "off":
+            raise ValueError("Joint evaluation owns its hierarchy; legacy mode must be off")
+        return attach_joint_latent_action_surrogate(model, args)
+    hierarchical_mode = str(getattr(args, "latentloop_hierarchical_mode", "off"))
+    if hierarchical_mode in {"pure_action_correction", "hybrid"}:
+        if str(getattr(args, "latentloop_plan_adapter_mode", "off")) != "action_correction":
+            raise ValueError(
+                f"{hierarchical_mode} requires latentloop_plan_adapter_mode=action_correction"
+            )
+        return attach_comparison_adapter(model, args)
+    if bool(getattr(args, "latentloop_comparison_protocol", 0)):
+        return attach_comparison_adapter(model, args)
+    return attach_plan_adapter(model, args)
 
 
 def _save_eval_args_snapshot(args):
@@ -34,7 +69,10 @@ def _save_eval_args_snapshot(args):
         out_dir = os.path.join(ckpt_dir, "analysis")
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    payload = {k: v for k, v in vars(args).items()}
+    payload = {
+        **{k: v for k, v in vars(args).items()},
+        "renderer_backend": get_renderer_backend_metadata(),
+    }
     out_path = os.path.join(out_dir, "args_snapshot.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, default=str)
@@ -57,7 +95,13 @@ def _is_lrnode_adapter_only_state_dict(state_dict):
     keys = list(state_dict.keys())
     if not keys:
         return False
-    has_lrnode = any("lrnode_" in key or ".lrnode" in key for key in keys)
+    has_lrnode = any(
+        "lrnode_" in key
+        or ".lrnode" in key
+        or "latentloop_plan_adapter" in key
+        or "joint_latent_action_surrogate" in key
+        for key in keys
+    )
     has_core_seer = any(
         marker in key
         for key in keys
@@ -74,14 +118,49 @@ def _is_lrnode_adapter_only_state_dict(state_dict):
 
 
 def _is_lrnode_state_key(key):
-    return key.startswith("module.lrnode_delta_encoder.") or key.startswith("module.lrnode_dynamics.")
+    return (
+        key.startswith("module.lrnode_delta_encoder.")
+        or key.startswith("module.lrnode_dynamics.")
+        or key.startswith("module.latentloop_plan_adapter.")
+        or key.startswith("module.joint_latent_action_surrogate.")
+    )
 
 
 def _expected_checkpoint_keys(ddp_model, checkpoint_kind):
-    if checkpoint_kind == "adapter":
+    if checkpoint_kind == "joint_surrogate_only":
+        return {
+            name
+            for name, _ in ddp_model.named_parameters()
+            if name.startswith("module.joint_latent_action_surrogate.")
+        }
+    if checkpoint_kind == "joint_adapter":
+        return {
+            name
+            for name, _ in ddp_model.named_parameters()
+            if name.startswith("module.lrnode_delta_encoder.")
+            or name.startswith("module.lrnode_dynamics.")
+            or name.startswith("module.joint_latent_action_surrogate.")
+        }
+    if checkpoint_kind in {"adapter", "latent_adapter", "plan_adapter"}:
+        has_plan_adapter = hasattr(ddp_model.module, "latentloop_plan_adapter")
+        if checkpoint_kind == "latent_adapter":
+            select_plan_adapter = False
+        elif checkpoint_kind == "plan_adapter":
+            if not has_plan_adapter:
+                raise RuntimeError("plan_adapter checkpoint requested without an attached adapter")
+            select_plan_adapter = True
+        else:
+            select_plan_adapter = has_plan_adapter
         return {
             name for name, _ in ddp_model.named_parameters()
-            if _is_lrnode_state_key(name)
+            if (
+                name.startswith("module.latentloop_plan_adapter.")
+                if select_plan_adapter
+                else (
+                    name.startswith("module.lrnode_delta_encoder.")
+                    or name.startswith("module.lrnode_dynamics.")
+                )
+            )
         }
     if checkpoint_kind == "base":
         return {
@@ -146,6 +225,26 @@ def _load_checkpoint_into_model(ddp_model, checkpoint_path, label, rank, checkpo
 def main():
     parser = get_parser(is_eval=True)
     args = parser.parse_args()
+    hierarchical_mode = str(args.latentloop_hierarchical_mode)
+    joint_mode = str(args.joint_latent_action_surrogate_mode)
+    if joint_mode != "off":
+        if hierarchical_mode != "off":
+            raise ValueError("Joint evaluation requires latentloop_hierarchical_mode=off")
+        if not bool(args.use_lrnode_latent_update):
+            raise ValueError("Joint evaluation requires use_lrnode_latent_update=1")
+        if int(args.action_pred_steps) != 3:
+            raise ValueError("Joint Seer evaluation requires P=3")
+    if hierarchical_mode != "off":
+        if not bool(args.use_lrnode_latent_update):
+            raise ValueError("Hierarchical execution requires use_lrnode_latent_update=1")
+        if not bool(args.lrnode_eval_skip_full_forward) and hierarchical_mode != "full_seer":
+            raise ValueError(
+                "Hierarchical skip modes require lrnode_eval_skip_full_forward=1"
+            )
+        if args.lrnode_eval_refresh_policy != "periodic":
+            raise ValueError("Hierarchical execution requires the periodic refresh policy")
+        if int(args.action_pred_steps) != 3:
+            raise ValueError("The source-locked Seer intervention requires action_pred_steps=3")
     if args.offline:
         os.environ["WANDB_MODE"] = "offline"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -157,6 +256,14 @@ def main():
         print(f"[EVAL ARGS] use_lrnode_latent_update={bool(args.use_lrnode_latent_update)}")
         print(f"[EVAL ARGS] lrnode_eval_skip_full_forward={bool(args.lrnode_eval_skip_full_forward)}")
         print(f"[EVAL ARGS] lrnode_query_interval={args.lrnode_query_interval}")
+        print(
+            "[EVAL ARGS] "
+            f"latentloop_segment_grid_enable={bool(args.latentloop_segment_grid_enable)}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"latentloop_feedback_schedule={args.latentloop_feedback_schedule}"
+        )
         print(f"[EVAL ARGS] lrnode_eval_ablation_mode={args.lrnode_eval_ablation_mode}")
         print(f"[EVAL ARGS] lrnode_no_delta_mode={args.lrnode_no_delta_mode}")
         print(f"[EVAL ARGS] lrnode_chunk_token_policy={args.lrnode_chunk_token_policy}")
@@ -178,6 +285,29 @@ def main():
         print(f"[EVAL ARGS] lrnode_multistep_train={bool(args.lrnode_multistep_train)}")
         print(f"[EVAL ARGS] lrnode_train_max_horizon={args.lrnode_train_max_horizon}")
         print(f"[EVAL ARGS] lrnode_gate_init_bias={args.lrnode_gate_init_bias}")
+        print(
+            "[EVAL ARGS] "
+            f"latentloop_hierarchical_mode={args.latentloop_hierarchical_mode}, "
+            f"K_F={args.latentloop_hierarchical_full_interval}, "
+            f"K_G={args.latentloop_hierarchical_regeneration_interval}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"lrnode_every_step_filter_mode={args.lrnode_every_step_filter_mode}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"lrnode_every_step_filter_alpha={args.lrnode_every_step_filter_alpha}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"lrnode_every_step_filter_beta={args.lrnode_every_step_filter_beta}"
+        )
+        print(
+            "[EVAL ARGS] "
+            "lrnode_every_step_filter_diagnostics="
+            f"{bool(args.lrnode_every_step_filter_diagnostics)}"
+        )
     _save_eval_args_snapshot(args)
     random_seed(args.seed)
 
@@ -216,6 +346,9 @@ def main():
         lrnode_gate_init_bias=args.lrnode_gate_init_bias,
         lrnode_trace=args.lrnode_trace,
     )
+    plan_adapter_status = _attach_configured_plan_adapter(model, args)
+    if args.rank == 0:
+        print(f"[LATENTLOOP PLAN ADAPTER] {plan_adapter_status}")
 
     random_seed(args.seed, args.rank)
     print(f"Start running LIBERO evaluation on rank {args.rank}.")
@@ -266,13 +399,36 @@ def main():
             checkpoint_kind="base" if args.lrnode_train_protocol == "adapter" else None,
         )
 
+    if args.lrnode_init_adapter_ckpt is not None:
+        _load_checkpoint_into_model(
+            ddp_model,
+            args.lrnode_init_adapter_ckpt,
+            "canonical_latentloop_init",
+            args.rank,
+            checkpoint_kind="latent_adapter",
+        )
+
     if args.resume_from_checkpoint is not None:
         resume_checkpoint_kind = None
         if args.lrnode_train_protocol == "adapter":
-            _, resume_state_dict = _checkpoint_state_dict(args.resume_from_checkpoint)
-            resume_checkpoint_kind = (
-                "adapter" if _is_lrnode_adapter_only_state_dict(resume_state_dict) else "base"
+            resume_checkpoint, resume_state_dict = _checkpoint_state_dict(
+                args.resume_from_checkpoint
             )
+            if _is_lrnode_adapter_only_state_dict(resume_state_dict):
+                if joint_mode != "off":
+                    resume_checkpoint_kind = (
+                        "joint_surrogate_only"
+                        if str(resume_checkpoint.get("joint_stage", "")) == "stage_a"
+                        else "joint_adapter"
+                    )
+                elif hierarchical_mode in {"hybrid", "pure_latentloop"}:
+                    resume_checkpoint_kind = "latent_adapter"
+                elif hierarchical_mode == "pure_action_correction":
+                    resume_checkpoint_kind = "plan_adapter"
+                else:
+                    resume_checkpoint_kind = "adapter"
+            else:
+                resume_checkpoint_kind = "base"
         _load_checkpoint_into_model(
             ddp_model,
             args.resume_from_checkpoint,
@@ -294,6 +450,20 @@ def main():
             print(f"[EVAL MODEL] lrnode_gate_init_bias={getattr(m, 'lrnode_gate_init_bias', None)}")
             print(f"[EVAL MODEL] action_pred_steps={getattr(m, 'action_pred_steps', None)}")
 
+    if hierarchical_mode == "hybrid":
+        action_checkpoint = str(args.latentloop_hierarchical_action_checkpoint).strip()
+        if not action_checkpoint:
+            raise ValueError(
+                "hybrid requires --latentloop_hierarchical_action_checkpoint"
+            )
+        _load_checkpoint_into_model(
+            ddp_model,
+            action_checkpoint,
+            "hierarchical_action_correction",
+            args.rank,
+            checkpoint_kind="plan_adapter",
+        )
+
     if args.rank == 0:
         log_dir = os.environ.get("LOG_DIR")
         if log_dir:
@@ -302,7 +472,13 @@ def main():
             ckpt = getattr(args, "resume_from_checkpoint", "")
             ckpt_dir = os.path.dirname(ckpt) if ckpt else os.path.join(os.getcwd(), "eval_analysis", args.run_name)
             analysis_dir = os.path.join(ckpt_dir, "analysis")
-        save_lrnode_run_snapshots(args, ddp_model, analysis_dir, repo_dir=os.getcwd())
+        save_lrnode_run_snapshots(
+            args,
+            ddp_model,
+            analysis_dir,
+            repo_dir=os.getcwd(),
+            extra_metadata={"renderer_backend": get_renderer_backend_metadata()},
+        )
 
     ddp_model.eval()
     if args.finetune_type == "libero_10":
@@ -312,6 +488,15 @@ def main():
             image_processor=model.image_processor,
             tokenizer=clip,
         )
+        if args.rank == 0:
+            _save_eval_args_snapshot(args)
+            save_lrnode_run_snapshots(
+                args,
+                ddp_model,
+                analysis_dir,
+                repo_dir=os.getcwd(),
+                extra_metadata={"renderer_backend": get_renderer_backend_metadata()},
+            )
     else:
         raise NotImplementedError
 

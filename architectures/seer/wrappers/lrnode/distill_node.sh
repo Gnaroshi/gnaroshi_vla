@@ -91,13 +91,14 @@ fi
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+export PYTHONPATH="${REPO_ROOT}:${UPSTREAM_DIR}:${libero_path}:${PYTHONPATH:-}"
 master_port="${MASTER_PORT:-12423}"
 node=1
 node_num="${NODE_NUM:-4}"
 
 LRNODE_EXTRA_ARGS=(
     --use_lrnode_latent_update 1
-    --lrnode_train_latent_distill 1
+    --lrnode_train_latent_distill "${LRNODE_TRAIN_LATENT_DISTILL:-1}"
     --lrnode_teacher_target_mode "${LRNODE_TEACHER_TARGET_MODE:-shifted_context}"
     --lrnode_context_selected_step "${LRNODE_CONTEXT_SELECTED_STEP:--1}"
     --lrnode_train_protocol adapter
@@ -120,8 +121,67 @@ LRNODE_EXTRA_ARGS=(
     --lrnode_gate_init_bias "${LRNODE_GATE_INIT_BIAS:--4.0}"
     --lrnode_trace "${LRNODE_TRACE:-0}"
     --lrnode_debug_artifact_interval "${LRNODE_DEBUG_ARTIFACT_INTERVAL:-1000}"
+    --latentloop_plan_adapter_mode "${LATENTLOOP_PLAN_ADAPTER_MODE:-off}"
+    --latentloop_plan_adapter_hidden_dim "${LATENTLOOP_PLAN_ADAPTER_HIDDEN_DIM:-0}"
+    --latentloop_plan_parameter_match_tolerance "${LATENTLOOP_PLAN_PARAMETER_MATCH_TOLERANCE:-0.05}"
+    --latentloop_plan_arm_weight "${LATENTLOOP_PLAN_ARM_WEIGHT:-1.0}"
+    --latentloop_plan_gripper_weight "${LATENTLOOP_PLAN_GRIPPER_WEIGHT:-1.0}"
+    --latentloop_plan_latent_weight "${LATENTLOOP_PLAN_LATENT_WEIGHT:-1.0}"
+    --latentloop_comparison_protocol "${LATENTLOOP_COMPARISON_PROTOCOL:-0}"
+    --latentloop_comparison_offset_schedule "${LATENTLOOP_COMPARISON_OFFSET_SCHEDULE:-adjacent}"
+    --latentloop_comparison_split_role "${LATENTLOOP_COMPARISON_SPLIT_ROLE:-full}"
+    --latentloop_comparison_validation_fraction "${LATENTLOOP_COMPARISON_VALIDATION_FRACTION:-0.05}"
+    --latentloop_comparison_validation_seed "${LATENTLOOP_COMPARISON_VALIDATION_SEED:-20260805}"
+    --latentloop_comparison_target_microbatches "${LATENTLOOP_COMPARISON_TARGET_MICROBATCHES:-0}"
+    --latentloop_comparison_warmup_microbatches "${LATENTLOOP_COMPARISON_WARMUP_MICROBATCHES:-0}"
+    --latentloop_comparison_checkpoint_microbatches "${LATENTLOOP_COMPARISON_CHECKPOINT_MICROBATCHES:-0}"
+    --latentloop_action_arm_weight "${LATENTLOOP_ACTION_ARM_WEIGHT:-0.0}"
+    --latentloop_action_gripper_weight "${LATENTLOOP_ACTION_GRIPPER_WEIGHT:-0.0}"
+    --latentloop_action_exec_weight "${LATENTLOOP_ACTION_EXEC_WEIGHT:-0.0}"
+    --latentloop_action_reg_weight "${LATENTLOOP_ACTION_REG_WEIGHT:-0.0}"
+    --latentloop_nonrecurrent_latent_weight "${LATENTLOOP_NONRECURRENT_LATENT_WEIGHT:-0.0}"
+    --latentloop_nonrecurrent_action_weight "${LATENTLOOP_NONRECURRENT_ACTION_WEIGHT:-0.0}"
+    --latentloop_nonrecurrent_smooth_weight "${LATENTLOOP_NONRECURRENT_SMOOTH_WEIGHT:-0.0}"
+    --latentloop_comparison_selection_metric "${LATENTLOOP_COMPARISON_SELECTION_METRIC:-validation_total_loss}"
+    --latentloop_cqpc_weight "${LATENTLOOP_CQPC_WEIGHT:-0.0}"
+    --latentloop_cqpc_gamma "${LATENTLOOP_CQPC_GAMMA:-0.0}"
+    --latentloop_cqpc_arm_weight "${LATENTLOOP_CQPC_ARM_WEIGHT:-1.0}"
+    --latentloop_cqpc_gripper_weight "${LATENTLOOP_CQPC_GRIPPER_WEIGHT:-1.0}"
+    --latentloop_cqpc_log_teacher_disagreement "${LATENTLOOP_CQPC_LOG_TEACHER_DISAGREEMENT:-0}"
+    --joint_latent_action_surrogate_mode "${JOINT_LATENT_ACTION_SURROGATE_MODE:-off}"
+    --joint_latent_action_surrogate_stage "${JOINT_LATENT_ACTION_SURROGATE_STAGE:-off}"
+    --joint_latent_action_surrogate_hidden_dim "${JOINT_LATENT_ACTION_SURROGATE_HIDDEN_DIM:-192}"
+    --joint_latent_action_surrogate_parameter_match_tolerance "${JOINT_LATENT_ACTION_SURROGATE_PARAMETER_MATCH_TOLERANCE:-0.02}"
+    --joint_latent_action_surrogate_pretrained_lr_scale "${JOINT_LATENT_ACTION_SURROGATE_PRETRAINED_LR_SCALE:-0.0}"
+    --joint_latent_action_surrogate_calibration_only "${JOINT_LATENT_ACTION_SURROGATE_CALIBRATION_ONLY:-0}"
+    --joint_latent_action_surrogate_target_microbatches "${JOINT_LATENT_ACTION_SURROGATE_TARGET_MICROBATCHES:-0}"
+    --joint_latent_action_surrogate_warmup_microbatches "${JOINT_LATENT_ACTION_SURROGATE_WARMUP_MICROBATCHES:-0}"
+    --joint_latent_action_surrogate_checkpoint_microbatches "${JOINT_LATENT_ACTION_SURROGATE_CHECKPOINT_MICROBATCHES:-0}"
+    --joint_latent_weight "${JOINT_LATENT_WEIGHT:-0.0}"
+    --joint_latent_action_weight "${JOINT_LATENT_ACTION_WEIGHT:-0.0}"
+    --joint_surrogate_weight "${JOINT_SURROGATE_WEIGHT:-0.0}"
+    --joint_executed_token_weight "${JOINT_EXECUTED_TOKEN_WEIGHT:-0.0}"
+    --joint_tail_weight "${JOINT_TAIL_WEIGHT:-0.0}"
+    --joint_gripper_weight "${JOINT_GRIPPER_WEIGHT:-0.0}"
+    --joint_residual_weight "${JOINT_RESIDUAL_WEIGHT:-0.0}"
 )
 
+if [[ -n "${LRNODE_INIT_ADAPTER_CKPT:-}" ]]; then
+    LRNODE_EXTRA_ARGS+=(--lrnode_init_adapter_ckpt "${LRNODE_INIT_ADAPTER_CKPT}")
+fi
+if [[ -n "${JOINT_LATENT_ACTION_SURROGATE_INIT_CKPT:-}" ]]; then
+    LRNODE_EXTRA_ARGS+=(
+        --joint_latent_action_surrogate_init_ckpt
+        "${JOINT_LATENT_ACTION_SURROGATE_INIT_CKPT}"
+    )
+fi
+
+WANDB_ARGS=()
+if [[ "${REPORT_TO_WANDB:-1}" == "1" ]]; then
+    WANDB_ARGS+=(--report_to_wandb)
+fi
+
+cd "${UPSTREAM_DIR}"
 torchrun --nnodes=${node} --nproc_per_node=${node_num} --master_port=${master_port} train.py \
     --traj_cons \
     --rgb_pad 10 \
@@ -159,8 +219,8 @@ torchrun --nnodes=${node} --nproc_per_node=${node_num} --master_port=${master_po
     --gripper_width \
     --warmup_epochs "${WARMUP_EPOCHS:-2}" \
     --libero_path "${libero_path}" \
-    --report_to_wandb \
     --multi_step_action 1 \
+    "${WANDB_ARGS[@]}" \
     "${LRNODE_EXTRA_ARGS[@]}"
 
 mkdir -p "${latest_dir}"

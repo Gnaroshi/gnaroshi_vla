@@ -1,0 +1,511 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+TEACHER="${LOCAL_TEACHER_CKPT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/scratch/sd1_scratch_baseline_seer_scratch_baseline_v1_20260616_141040/33.pth}"
+LATENTLOOP="${LOCAL_LATENTLOOP_ADAPTER:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616/train/distill_node/sd1_distill_node_lrnode_distill_from_scratch_baseline_ckpt33_lronly_v1_lw05_aw01_g4_20260620_202533/39.pth}"
+CANONICAL_ROW="${CANONICAL_ROW:-${REPO_ROOT}/results/seer/latentloop/local_best91/local_best91_segment_grid_legacy_parity_20260731_v2/stage_a_ckpt33/ckpt33_L4_dense/segment_grid_row.json}"
+DATASET_ROOT="${ROOT_DIR:-${REPO_ROOT}/architectures/seer/upstream/LIBERO_DATASETS/libero_10_converted}"
+VIT_CHECKPOINT="${VIT_CHECKPOINT_PATH:-${REPO_ROOT}/architectures/seer/upstream/checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
+LIBERO_ROOT="${LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
+GPU_LIST="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+OFFLINE_GPU="${OFFLINE_GPU:-${GPU_LIST%%,*}}"
+CAMPAIGN_TAG="${CAMPAIGN_TAG:-q1q2_$(date +%Y%m%d_%H%M%S)}"
+CAMPAIGN="${CAMPAIGN_ROOT:-${REPO_ROOT}/results/seer/latentloop/comparison/${CAMPAIGN_TAG}}"
+MASTER_PORT_BASE="${MASTER_PORT_BASE:-14200}"
+RUN_K2_K8="${RUN_K2_K8:-1}"
+VALIDATION_BATCHES="${VALIDATION_BATCHES:-120}"
+CALIBRATION_BATCHES="${CALIBRATION_BATCHES:-60}"
+RESUME_EVAL_FROM_SELECTED="${RESUME_EVAL_FROM_SELECTED:-0}"
+
+LOCK_TOOL="${REPO_ROOT}/tools/seer/lock_latentloop_comparison_source.py"
+ALIGN_TOOL="${REPO_ROOT}/tools/seer/audit_action_token_alignment.py"
+OFFLINE_TOOL="${REPO_ROOT}/tools/seer/evaluate_latentloop_comparison_offline.py"
+CALIBRATE_TOOL="${REPO_ROOT}/tools/seer/calibrate_latentloop_comparison_losses.py"
+SELECT_TOOL="${REPO_ROOT}/tools/seer/select_latentloop_comparison_checkpoint.py"
+PARITY_TOOL="${REPO_ROOT}/tools/seer/check_latentloop_comparison_k1_parity.py"
+AGGREGATE_TOOL="${REPO_ROOT}/tools/seer/aggregate_latentloop_comparison.py"
+DECISION_TOOL="${REPO_ROOT}/tools/seer/apply_seer_comparison_decisions.py"
+ACTION_TRAIN="${SCRIPT_DIR}/train_action_correction_baseline.sh"
+NONRECURRENT_TRAIN="${SCRIPT_DIR}/train_nonrecurrent_latent_baseline.sh"
+EVAL_WRAPPER="${SCRIPT_DIR}/eval_latentloop_comparison.sh"
+
+fail() {
+    echo "[ERROR] $*" >&2
+    exit 1
+}
+
+require_file() {
+    [[ -f "$1" ]] || fail "missing file: $1"
+}
+
+require_json_true() {
+    python - "$1" "$2" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+for key in sys.argv[2].split("."):
+    value = value[key]
+assert bool(value), f"{sys.argv[2]} is not true in {sys.argv[1]}"
+PY
+}
+
+if [[ "${RESUME_EVAL_FROM_SELECTED}" == "1" ]]; then
+    RESUME_CONTRACT="${CAMPAIGN}/sequential_contract.env"
+    require_file "${RESUME_CONTRACT}"
+    mapfile -t LOCKED_DATASET_ROOTS < <(
+        sed -n 's/^DATASET_ROOT=//p' "${RESUME_CONTRACT}"
+    )
+    [[ "${#LOCKED_DATASET_ROOTS[@]}" -eq 1 && -n "${LOCKED_DATASET_ROOTS[0]}" ]] \
+        || fail "resume contract must contain exactly one non-empty DATASET_ROOT"
+    if [[ -n "${ROOT_DIR:-}" && "${ROOT_DIR}" != "${LOCKED_DATASET_ROOTS[0]}" ]]; then
+        echo "[RESUME] Ignoring ambient ROOT_DIR=${ROOT_DIR}" >&2
+        echo "[RESUME] Using source-locked DATASET_ROOT=${LOCKED_DATASET_ROOTS[0]}" >&2
+    fi
+    DATASET_ROOT="${LOCKED_DATASET_ROOTS[0]}"
+fi
+
+for path in \
+    "${TEACHER}" "${LATENTLOOP}" "${CANONICAL_ROW}" \
+    "${VIT_CHECKPOINT}" "${LOCK_TOOL}" "${ALIGN_TOOL}" \
+    "${OFFLINE_TOOL}" "${CALIBRATE_TOOL}" "${SELECT_TOOL}" \
+    "${PARITY_TOOL}" "${AGGREGATE_TOOL}" "${DECISION_TOOL}" \
+    "${ACTION_TRAIN}" "${NONRECURRENT_TRAIN}" "${EVAL_WRAPPER}"; do
+    require_file "${path}"
+done
+[[ -d "${DATASET_ROOT}" ]] || fail "missing dataset root: ${DATASET_ROOT}"
+[[ -d "${DATASET_ROOT}/libero_10_converted/episodes" ]] \
+    || fail "invalid ROOT_DIR; expected ${DATASET_ROOT}/libero_10_converted/episodes"
+[[ -f "${DATASET_ROOT}/libero_10_converted/meta_info.h5" ]] \
+    || fail "invalid ROOT_DIR; expected ${DATASET_ROOT}/libero_10_converted/meta_info.h5"
+[[ -d "${LIBERO_ROOT}" ]] || fail "missing LIBERO root: ${LIBERO_ROOT}"
+[[ "${RUN_K2_K8}" == "0" || "${RUN_K2_K8}" == "1" ]] || fail "RUN_K2_K8 must be 0 or 1"
+[[ "${RESUME_EVAL_FROM_SELECTED}" == "0" || "${RESUME_EVAL_FROM_SELECTED}" == "1" ]] \
+    || fail "RESUME_EVAL_FROM_SELECTED must be 0 or 1"
+[[ "${MASTER_PORT_BASE}" =~ ^[0-9]+$ ]] || fail "MASTER_PORT_BASE must be an integer"
+(( MASTER_PORT_BASE >= 1024 && MASTER_PORT_BASE <= 65000 )) || fail "MASTER_PORT_BASE must be in [1024,65000]"
+[[ "${VALIDATION_BATCHES}" == "120" ]] || fail "VALIDATION_BATCHES is source-locked to 120"
+[[ "${CALIBRATION_BATCHES}" == "60" ]] || fail "CALIBRATION_BATCHES is source-locked to 60"
+[[ "$(basename "${CONDA_PREFIX:-missing}")" == "seer_libero" ]] || fail "activate conda environment seer_libero first"
+if [[ "${RESUME_EVAL_FROM_SELECTED}" == "1" ]]; then
+    [[ -d "${CAMPAIGN}" ]] || fail "resume campaign does not exist: ${CAMPAIGN}"
+    require_file "${CAMPAIGN}/sequential_run_failed.env"
+else
+    [[ ! -e "${CAMPAIGN}" ]] || fail "campaign output already exists: ${CAMPAIGN}"
+fi
+
+mkdir -p "${CAMPAIGN}"
+exec > >(tee -a "${CAMPAIGN}/sequential_run.log") 2>&1
+STARTED_AT="$(date --iso-8601=seconds)"
+trap 'code=$?; printf "status=FAILED\nexit_code=%s\ntime=%s\n" "${code}" "$(date --iso-8601=seconds)" > "${CAMPAIGN}/sequential_run_failed.env"; exit "${code}"' ERR INT TERM
+
+if [[ "${RESUME_EVAL_FROM_SELECTED}" == "0" ]]; then
+cat > "${CAMPAIGN}/sequential_contract.env" <<EOF
+PROTOCOL=seer_latentloop_q1_q2_sequential_v1
+CAMPAIGN_TAG=${CAMPAIGN_TAG}
+STARTED_AT=${STARTED_AT}
+GPU_LIST=${GPU_LIST}
+OFFLINE_GPU=${OFFLINE_GPU}
+MASTER_PORT_BASE=${MASTER_PORT_BASE}
+RUN_K2_K8=${RUN_K2_K8}
+CALIBRATION_BATCHES=${CALIBRATION_BATCHES}
+VALIDATION_BATCHES=${VALIDATION_BATCHES}
+LOCAL_TEACHER=${TEACHER}
+LOCAL_LATENTLOOP=${LATENTLOOP}
+DATASET_ROOT=${DATASET_ROOT}
+RENDERER=osmesa
+HELDOUT_36_38_INCLUDED=0
+EOF
+fi
+
+export CUDA_VISIBLE_DEVICES="${GPU_LIST}"
+export LOCAL_TEACHER_CKPT="${TEACHER}"
+export LOCAL_LATENTLOOP_ADAPTER="${LATENTLOOP}"
+export CANONICAL_ROW
+export ROOT_DIR="${DATASET_ROOT}"
+export VIT_CHECKPOINT_PATH="${VIT_CHECKPOINT}"
+export LIBERO_PATH="${LIBERO_ROOT}"
+export LIBERO_GL_BACKEND=osmesa
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+export LIBERO_GL_REQUIRE_ACTUAL=1
+export TOKENIZERS_PARALLELISM=false
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+export SAVE_VIDEO=0
+
+if [[ "${RESUME_EVAL_FROM_SELECTED}" == "0" ]]; then
+echo "[1/12] Source/evaluator lock"
+python "${LOCK_TOOL}" \
+    --repo-root "${REPO_ROOT}" \
+    --output-dir "${CAMPAIGN}/source_lock" \
+    --teacher "${TEACHER}" \
+    --adapter "${LATENTLOOP}" \
+    --canonical-row "${CANONICAL_ROW}" \
+    --vit-checkpoint "${VIT_CHECKPOINT}" \
+    --dataset-root "${DATASET_ROOT}"
+LOCK="${CAMPAIGN}/source_lock/source_lock_manifest.json"
+python - "${LOCK}" <<'PY'
+import json
+import sys
+
+assert json.load(open(sys.argv[1], encoding="utf-8"))["status"] == "PASS"
+PY
+[[ "$(wc -l < "${CAMPAIGN}/source_lock/canonical_episode_manifest.csv")" -eq 201 ]] \
+    || fail "canonical manifest must contain header plus 200 episodes"
+
+echo "[2/12] Action-token alignment"
+python "${ALIGN_TOOL}" \
+    --repo-root "${REPO_ROOT}" \
+    --output "${CAMPAIGN}/action_token_alignment.json"
+python - "${CAMPAIGN}/action_token_alignment.json" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["status"] == "PASS"
+assert value["verified_overlap_previous_to_current"] == [[1, 0], [2, 1]]
+PY
+
+mkdir -p "${CAMPAIGN}/offline/calibration"
+echo "[3/12] Raw-loss calibration"
+CUDA_VISIBLE_DEVICES="${OFFLINE_GPU}" python "${OFFLINE_TOOL}" \
+    --repo-root "${REPO_ROOT}" --source-lock "${LOCK}" \
+    --teacher "${TEACHER}" --canonical-adapter "${LATENTLOOP}" \
+    --mode action_correction \
+    --dataset-root "${DATASET_ROOT}" --vit-checkpoint "${VIT_CHECKPOINT}" \
+    --libero-path "${LIBERO_ROOT}" --device cuda:0 \
+    --batch-size 16 --workers 1 --max-batches "${CALIBRATION_BATCHES}" \
+    --output "${CAMPAIGN}/offline/calibration/action_raw.json"
+python "${CALIBRATE_TOOL}" \
+    --raw-metrics "${CAMPAIGN}/offline/calibration/action_raw.json" \
+    --mode action_correction \
+    --executed-contribution-ratio 0.5 \
+    --regularization-contribution-ratio 0.01 \
+    --output "${CAMPAIGN}/offline/calibration/action_weights.json"
+require_json_true "${CAMPAIGN}/offline/calibration/action_weights.json" pass
+
+CUDA_VISIBLE_DEVICES="${OFFLINE_GPU}" python "${OFFLINE_TOOL}" \
+    --repo-root "${REPO_ROOT}" --source-lock "${LOCK}" \
+    --teacher "${TEACHER}" --canonical-adapter "${LATENTLOOP}" \
+    --mode anchor_bridge \
+    --dataset-root "${DATASET_ROOT}" --vit-checkpoint "${VIT_CHECKPOINT}" \
+    --libero-path "${LIBERO_ROOT}" --device cuda:0 \
+    --batch-size 16 --workers 1 --max-batches "${CALIBRATION_BATCHES}" \
+    --output "${CAMPAIGN}/offline/calibration/nonrecurrent_raw.json"
+python "${CALIBRATE_TOOL}" \
+    --raw-metrics "${CAMPAIGN}/offline/calibration/nonrecurrent_raw.json" \
+    --mode anchor_bridge \
+    --output "${CAMPAIGN}/offline/calibration/nonrecurrent_weights.json"
+require_json_true "${CAMPAIGN}/offline/calibration/nonrecurrent_weights.json" pass
+
+echo "[4/12] Training smokes"
+CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+NODE_NUM=4 \
+STAGE=smoke RUN_TAG="${CAMPAIGN_TAG}_action_smoke" \
+RUN_ROOT="${CAMPAIGN}/train/action_smoke" MASTER_PORT="$((MASTER_PORT_BASE + 0))" \
+LATENTLOOP_ACTION_CALIBRATION_JSON="${CAMPAIGN}/offline/calibration/action_weights.json" \
+bash "${ACTION_TRAIN}"
+require_file "${CAMPAIGN}/train/action_smoke/training_wrapper_complete.txt"
+
+CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+NODE_NUM=4 \
+STAGE=smoke RUN_TAG="${CAMPAIGN_TAG}_nonrecurrent_smoke" \
+RUN_ROOT="${CAMPAIGN}/train/nonrecurrent_smoke" MASTER_PORT="$((MASTER_PORT_BASE + 10))" \
+LATENTLOOP_NONRECURRENT_CALIBRATION_JSON="${CAMPAIGN}/offline/calibration/nonrecurrent_weights.json" \
+bash "${NONRECURRENT_TRAIN}"
+require_file "${CAMPAIGN}/train/nonrecurrent_smoke/training_wrapper_complete.txt"
+
+echo "[5/12] Full matched action-correction training"
+CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+NODE_NUM=4 \
+STAGE=full RUN_TAG="${CAMPAIGN_TAG}_action_full" \
+RUN_ROOT="${CAMPAIGN}/train/action_full" MASTER_PORT="$((MASTER_PORT_BASE + 20))" \
+LATENTLOOP_ACTION_CALIBRATION_JSON="${CAMPAIGN}/offline/calibration/action_weights.json" \
+bash "${ACTION_TRAIN}"
+require_file "${CAMPAIGN}/train/action_full/training_wrapper_complete.txt"
+
+echo "[6/12] Full nonrecurrent latent training"
+CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+NODE_NUM=4 \
+STAGE=full RUN_TAG="${CAMPAIGN_TAG}_nonrecurrent_full" \
+RUN_ROOT="${CAMPAIGN}/train/nonrecurrent_full" MASTER_PORT="$((MASTER_PORT_BASE + 30))" \
+LATENTLOOP_NONRECURRENT_CALIBRATION_JSON="${CAMPAIGN}/offline/calibration/nonrecurrent_weights.json" \
+bash "${NONRECURRENT_TRAIN}"
+require_file "${CAMPAIGN}/train/nonrecurrent_full/training_wrapper_complete.txt"
+
+validate_checkpoints() {
+    local mode=$1
+    local train_root=$2
+    local output_root=$3
+    local checkpoints=()
+    mkdir -p "${output_root}"
+    mapfile -t checkpoints < <(find "${train_root}/checkpoints" -name 'microstep_*.pth' -type f | sort)
+    [[ ${#checkpoints[@]} -eq 40 ]] \
+        || fail "expected 40 ${mode} checkpoints, found ${#checkpoints[@]}"
+    local index=0
+    for checkpoint in "${checkpoints[@]}"; do
+        index=$((index + 1))
+        local stem output
+        stem="$(basename "${checkpoint}" .pth)"
+        output="${output_root}/${stem}.json"
+        echo "[validation ${mode}] ${index}/40 ${stem}"
+        CUDA_VISIBLE_DEVICES="${OFFLINE_GPU}" python "${OFFLINE_TOOL}" \
+            --repo-root "${REPO_ROOT}" --source-lock "${LOCK}" \
+            --teacher "${TEACHER}" --canonical-adapter "${LATENTLOOP}" \
+            --adapter-checkpoint "${checkpoint}" --mode "${mode}" \
+            --dataset-root "${DATASET_ROOT}" --vit-checkpoint "${VIT_CHECKPOINT}" \
+            --libero-path "${LIBERO_ROOT}" --device cuda:0 \
+            --batch-size 16 --workers 1 --max-batches "${VALIDATION_BATCHES}" \
+            --output "${output}"
+    done
+}
+
+echo "[7/12] Held-out validation and checkpoint selection"
+validate_checkpoints action_correction \
+    "${CAMPAIGN}/train/action_full" \
+    "${CAMPAIGN}/offline/action_candidates"
+validate_checkpoints anchor_bridge \
+    "${CAMPAIGN}/train/nonrecurrent_full" \
+    "${CAMPAIGN}/offline/nonrecurrent_candidates"
+
+mapfile -t ACTION_JSON < <(find "${CAMPAIGN}/offline/action_candidates" -name 'microstep_*.json' -type f | sort)
+mapfile -t NONRECURRENT_JSON < <(find "${CAMPAIGN}/offline/nonrecurrent_candidates" -name 'microstep_*.json' -type f | sort)
+ACTION_ARGS=()
+NONRECURRENT_ARGS=()
+for path in "${ACTION_JSON[@]}"; do ACTION_ARGS+=(--input "${path}"); done
+for path in "${NONRECURRENT_JSON[@]}"; do NONRECURRENT_ARGS+=(--input "${path}"); done
+python "${SELECT_TOOL}" "${ACTION_ARGS[@]}" --mode action_correction \
+    --output "${CAMPAIGN}/selection/action_selection.json"
+python "${SELECT_TOOL}" "${NONRECURRENT_ARGS[@]}" --mode anchor_bridge \
+    --output "${CAMPAIGN}/selection/nonrecurrent_selection.json"
+
+else
+    echo "[RESUME] Reusing completed source lock, training, validation, and selection"
+    LOCK="${CAMPAIGN}/source_lock/source_lock_manifest.json"
+    require_file "${LOCK}"
+    require_json_true "${LOCK}" status
+    require_file "${CAMPAIGN}/train/action_full/training_wrapper_complete.txt"
+    require_file "${CAMPAIGN}/train/nonrecurrent_full/training_wrapper_complete.txt"
+    require_file "${CAMPAIGN}/selection/action_selection.json"
+    require_file "${CAMPAIGN}/selection/nonrecurrent_selection.json"
+    export SOURCE_LOCK_OVERRIDE_DIR="${CAMPAIGN}/source_lock"
+fi
+
+ACTION_SELECTION="${CAMPAIGN}/selection/action_selection.json"
+NONRECURRENT_SELECTION="${CAMPAIGN}/selection/nonrecurrent_selection.json"
+read -r ACTION_CKPT NONRECURRENT_CKPT < <(
+    python - "${ACTION_SELECTION}" "${NONRECURRENT_SELECTION}" <<'PY'
+import json
+import sys
+
+print(
+    json.load(open(sys.argv[1], encoding="utf-8"))["selected_checkpoint"],
+    json.load(open(sys.argv[2], encoding="utf-8"))["selected_checkpoint"],
+)
+PY
+)
+require_file "${ACTION_CKPT}"
+require_file "${NONRECURRENT_CKPT}"
+
+echo "[8/12] K1 full-path parity smoke"
+PARITY="${CAMPAIGN}/eval/parity_smoke"
+PARITY_COMPLETE=0
+if [[ "${RESUME_EVAL_FROM_SELECTED}" == "1" \
+    && -s "${PARITY}/evaluation_wrapper_complete.txt" \
+    && -s "${PARITY}/k1_parity.json" ]]; then
+    require_json_true "${PARITY}/k1_parity.json" pass
+    PARITY_COMPLETE=1
+    echo "[RESUME] Reusing completed K1 parity smoke"
+elif [[ "${RESUME_EVAL_FROM_SELECTED}" == "1" && -e "${PARITY}" ]]; then
+    PARITY_ARCHIVE="${CAMPAIGN}/eval/parity_smoke_failed_$(date +%Y%m%d_%H%M%S)"
+    [[ ! -e "${PARITY_ARCHIVE}" ]] || fail "parity archive already exists: ${PARITY_ARCHIVE}"
+    mv "${PARITY}" "${PARITY_ARCHIVE}"
+    echo "[RESUME] Preserved failed parity artifacts at ${PARITY_ARCHIVE}"
+fi
+if [[ "${PARITY_COMPLETE}" == "0" ]]; then
+    CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+    EPISODES_PER_TASK=4 NUM_TASKS=1 NODE_NUM=4 \
+    STAGE=parity_smoke RUN_TAG="${CAMPAIGN_TAG}_parity" RESULT_ROOT="${PARITY}" \
+    MASTER_PORT_BASE="$((MASTER_PORT_BASE + 100))" \
+    ACTION_CORRECTION_CKPT="${ACTION_CKPT}" NONRECURRENT_CKPT="${NONRECURRENT_CKPT}" \
+    ACTION_SELECTION_JSON="${ACTION_SELECTION}" NONRECURRENT_SELECTION_JSON="${NONRECURRENT_SELECTION}" \
+    bash "${EVAL_WRAPPER}"
+    python "${PARITY_TOOL}" \
+        --baseline-root "${PARITY}/full_seer_k1" \
+        --candidate "canonical=${PARITY}/canonical_loaded_k1" \
+        --candidate "action=${PARITY}/action_loaded_k1" \
+        --candidate "nonrecurrent=${PARITY}/nonrecurrent_loaded_k1" \
+        --action-tolerance 1e-6 \
+        --output "${PARITY}/k1_parity.json"
+    require_json_true "${PARITY}/k1_parity.json" pass
+fi
+
+echo "[9/12] 100-episode screening"
+SCREEN="${CAMPAIGN}/eval/screening_100"
+CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+EPISODES_PER_TASK=10 NUM_TASKS=10 NODE_NUM=2 \
+STAGE=screening RUN_TAG="${CAMPAIGN_TAG}_screening" RESULT_ROOT="${SCREEN}" \
+MASTER_PORT_BASE="$((MASTER_PORT_BASE + 200))" \
+ACTION_CORRECTION_CKPT="${ACTION_CKPT}" NONRECURRENT_CKPT="${NONRECURRENT_CKPT}" \
+ACTION_SELECTION_JSON="${ACTION_SELECTION}" NONRECURRENT_SELECTION_JSON="${NONRECURRENT_SELECTION}" \
+RESUME_EXISTING_ROWS="${RESUME_EVAL_FROM_SELECTED}" \
+bash "${EVAL_WRAPPER}"
+if [[ "${RESUME_EVAL_FROM_SELECTED}" == "1" \
+    && -s "${SCREEN}/aggregate/comparison_summary.json" \
+    && -s "${SCREEN}/aggregate/screening_gate.json" ]]; then
+    echo "[RESUME] Reusing completed screening aggregate"
+else
+    if [[ -e "${SCREEN}/aggregate" ]]; then
+        SCREEN_AGGREGATE_ARCHIVE="${SCREEN}/aggregate_failed_$(date +%Y%m%d_%H%M%S)"
+        mv "${SCREEN}/aggregate" "${SCREEN_AGGREGATE_ARCHIVE}"
+        echo "[RESUME] Preserved incomplete screening aggregate at ${SCREEN_AGGREGATE_ARCHIVE}"
+    fi
+    python "${AGGREGATE_TOOL}" \
+        --stage screening --source-lock "${SCREEN}/source_lock/source_lock_manifest.json" \
+        --action-selection "${ACTION_SELECTION}" --nonrecurrent-selection "${NONRECURRENT_SELECTION}" \
+        --row "full_seer_k1=${SCREEN}/full_seer_k1" \
+        --row "canonical_latentloop_k4=${SCREEN}/canonical_latentloop_k4" \
+        --row "matched_action_correction_k4=${SCREEN}/matched_action_correction_k4" \
+        --row "nonrecurrent_latent_k4=${SCREEN}/nonrecurrent_latent_k4" \
+        --row "no_observation_latentloop_k4=${SCREEN}/no_observation_latentloop_k4" \
+        --row "predicted_horizon_replay_k4=${SCREEN}/predicted_horizon_replay_k4" \
+        --output-dir "${SCREEN}/aggregate"
+fi
+SCREENING_GATE="${SCREEN}/aggregate/screening_gate.json"
+read -r ACTION_CONFIRM NONRECURRENT_CONFIRM < <(
+    python - "${SCREENING_GATE}" <<'PY'
+import json
+import sys
+
+rows = json.load(open(sys.argv[1], encoding="utf-8"))["rows"]
+print(
+    int(rows["matched_action_correction_k4"]["proceed_to_confirmation"]),
+    int(rows["nonrecurrent_latent_k4"]["proceed_to_confirmation"]),
+)
+PY
+)
+
+echo "[10/12] Source-gated 200-episode confirmation"
+CONFIRM="${CAMPAIGN}/eval/confirmation_200"
+CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+EPISODES_PER_TASK=20 NUM_TASKS=10 NODE_NUM=4 \
+STAGE=confirmation RUN_TAG="${CAMPAIGN_TAG}_confirmation" RESULT_ROOT="${CONFIRM}" \
+MASTER_PORT_BASE="$((MASTER_PORT_BASE + 300))" \
+ACTION_CORRECTION_CKPT="${ACTION_CKPT}" NONRECURRENT_CKPT="${NONRECURRENT_CKPT}" \
+ACTION_SELECTION_JSON="${ACTION_SELECTION}" NONRECURRENT_SELECTION_JSON="${NONRECURRENT_SELECTION}" \
+SCREENING_GATE_JSON="${SCREENING_GATE}" \
+RESUME_EXISTING_ROWS="${RESUME_EVAL_FROM_SELECTED}" \
+bash "${EVAL_WRAPPER}"
+
+CONFIRM_ROWS=(
+    --row "full_seer_k1=${CONFIRM}/full_seer_k1"
+    --row "canonical_latentloop_k4=${CONFIRM}/canonical_latentloop_k4"
+    --row "no_observation_latentloop_k4=${CONFIRM}/no_observation_latentloop_k4"
+    --row "predicted_horizon_replay_k4=${CONFIRM}/predicted_horizon_replay_k4"
+)
+if [[ "${ACTION_CONFIRM}" == "1" ]]; then
+    CONFIRM_ROWS+=(--row "matched_action_correction_k4=${CONFIRM}/matched_action_correction_k4")
+fi
+if [[ "${NONRECURRENT_CONFIRM}" == "1" ]]; then
+    CONFIRM_ROWS+=(--row "nonrecurrent_latent_k4=${CONFIRM}/nonrecurrent_latent_k4")
+fi
+if [[ "${RESUME_EVAL_FROM_SELECTED}" == "1" \
+    && -s "${CONFIRM}/aggregate/comparison_summary.json" ]]; then
+    echo "[RESUME] Reusing completed confirmation aggregate"
+else
+    if [[ -e "${CONFIRM}/aggregate" ]]; then
+        CONFIRM_AGGREGATE_ARCHIVE="${CONFIRM}/aggregate_failed_$(date +%Y%m%d_%H%M%S)"
+        mv "${CONFIRM}/aggregate" "${CONFIRM_AGGREGATE_ARCHIVE}"
+        echo "[RESUME] Preserved incomplete confirmation aggregate at ${CONFIRM_AGGREGATE_ARCHIVE}"
+    fi
+    python "${AGGREGATE_TOOL}" \
+        --stage confirmation --source-lock "${CONFIRM}/source_lock/source_lock_manifest.json" \
+        --action-selection "${ACTION_SELECTION}" --nonrecurrent-selection "${NONRECURRENT_SELECTION}" \
+        "${CONFIRM_ROWS[@]}" --output-dir "${CONFIRM}/aggregate"
+fi
+
+if [[ -s "${CONFIRM}/aggregate/preliminary_k4_verdict.json" \
+    && "${RESUME_EVAL_FROM_SELECTED}" == "1" ]]; then
+    echo "[RESUME] Reusing preliminary K4 verdict"
+elif [[ -s "${CONFIRM}/aggregate/decision_inputs.json" ]]; then
+    python "${DECISION_TOOL}" \
+        --repo-root "${REPO_ROOT}" \
+        --inputs "${CONFIRM}/aggregate/decision_inputs.json" \
+        --output "${CONFIRM}/aggregate/preliminary_k4_verdict.json"
+fi
+
+echo "[11/12] Optional K2/K8 diagnostic"
+DIAGNOSTIC_STATUS=SKIPPED
+if [[ "${RUN_K2_K8}" == "1" && "${ACTION_CONFIRM}" == "1" && "${NONRECURRENT_CONFIRM}" == "1" ]]; then
+    DIAG="${CAMPAIGN}/eval/diagnostic_k2_k8"
+    CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+    EPISODES_PER_TASK=20 NUM_TASKS=10 NODE_NUM=4 \
+    STAGE=diagnostic_k2_k8 RUN_TAG="${CAMPAIGN_TAG}_k2_k8" RESULT_ROOT="${DIAG}" \
+    MASTER_PORT_BASE="$((MASTER_PORT_BASE + 400))" \
+    ACTION_CORRECTION_CKPT="${ACTION_CKPT}" NONRECURRENT_CKPT="${NONRECURRENT_CKPT}" \
+    ACTION_SELECTION_JSON="${ACTION_SELECTION}" NONRECURRENT_SELECTION_JSON="${NONRECURRENT_SELECTION}" \
+    RESUME_EXISTING_ROWS="${RESUME_EVAL_FROM_SELECTED}" \
+    bash "${EVAL_WRAPPER}"
+    if [[ "${RESUME_EVAL_FROM_SELECTED}" == "1" \
+        && -s "${DIAG}/aggregate/comparison_summary.json" \
+        && -s "${DIAG}/aggregate/additional_evidence.json" ]]; then
+        echo "[RESUME] Reusing completed K2/K8 aggregate"
+    else
+        if [[ -e "${DIAG}/aggregate" ]]; then
+            DIAG_AGGREGATE_ARCHIVE="${DIAG}/aggregate_failed_$(date +%Y%m%d_%H%M%S)"
+            mv "${DIAG}/aggregate" "${DIAG_AGGREGATE_ARCHIVE}"
+            echo "[RESUME] Preserved incomplete K2/K8 aggregate at ${DIAG_AGGREGATE_ARCHIVE}"
+        fi
+        python "${AGGREGATE_TOOL}" \
+            --stage diagnostic --source-lock "${DIAG}/source_lock/source_lock_manifest.json" \
+            --action-selection "${ACTION_SELECTION}" --nonrecurrent-selection "${NONRECURRENT_SELECTION}" \
+            --primary-summary "${CONFIRM}/aggregate/comparison_summary.json" \
+            --row "canonical_latentloop_k2=${DIAG}/canonical_latentloop_k2" \
+            --row "matched_action_correction_k2=${DIAG}/matched_action_correction_k2" \
+            --row "nonrecurrent_latent_k2=${DIAG}/nonrecurrent_latent_k2" \
+            --row "canonical_latentloop_k8=${DIAG}/canonical_latentloop_k8" \
+            --row "matched_action_correction_k8=${DIAG}/matched_action_correction_k8" \
+            --row "nonrecurrent_latent_k8=${DIAG}/nonrecurrent_latent_k8" \
+            --output-dir "${DIAG}/aggregate"
+    fi
+    if [[ -s "${CONFIRM}/aggregate/final_verdict_with_k2_k8.json" \
+        && "${RESUME_EVAL_FROM_SELECTED}" == "1" ]]; then
+        echo "[RESUME] Reusing final verdict with K2/K8"
+    else
+        python "${DECISION_TOOL}" \
+            --repo-root "${REPO_ROOT}" \
+            --inputs "${CONFIRM}/aggregate/decision_inputs.json" \
+            --additional-evidence "${DIAG}/aggregate/additional_evidence.json" \
+            --output "${CONFIRM}/aggregate/final_verdict_with_k2_k8.json"
+    fi
+    DIAGNOSTIC_STATUS=COMPLETE
+fi
+
+echo "[12/12] Final contract"
+python - "${CAMPAIGN}/sequential_run_summary.json" <<PY
+import json
+import pathlib
+import sys
+
+output = pathlib.Path(sys.argv[1])
+output.write_text(json.dumps({
+    "schema_version": 1,
+    "protocol": "seer_latentloop_q1_q2_sequential_v1",
+    "status": "COMPLETE",
+    "campaign": "${CAMPAIGN}",
+    "action_confirmation": bool(int("${ACTION_CONFIRM}")),
+    "nonrecurrent_confirmation": bool(int("${NONRECURRENT_CONFIRM}")),
+    "k2_k8_status": "${DIAGNOSTIC_STATUS}",
+    "heldout_36_38_status": "DISABLED_BY_PREDECLARED_GUARD",
+    "selected_action_checkpoint": "${ACTION_CKPT}",
+    "selected_nonrecurrent_checkpoint": "${NONRECURRENT_CKPT}",
+}, indent=2) + "\n", encoding="utf-8")
+PY
+date --iso-8601=seconds > "${CAMPAIGN}/sequential_run_complete.txt"
+rm -f "${CAMPAIGN}/sequential_run_failed.env"
+trap - ERR INT TERM
+echo "[DONE] ${CAMPAIGN}"
+echo "[DONE] ${CONFIRM}/aggregate/aggregate_report.md"

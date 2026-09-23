@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "rule_scope": "Predeclared screening rules, not universal statistical laws",
+  "confirmatory_checkpoints": [36, 38],
+  "supported": {
+    "k1_parity_required": true,
+    "dense_l4_max_allowed_drop_per_checkpoint_pp": 1.0,
+    "mean_dense_l4_minus_l1_min_pp": 2.0,
+    "mean_dense_l4_minus_none_min_pp": 3.0,
+    "dense_l4_must_beat_executed_hold_baselines": true,
+    "l10_minus_l4_max_pp": 1.0,
+    "positive_feedback_direction_required_on_both_checkpoints": true
+  },
+  "pareto_improvement_only": {
+    "max_performance_drop_pp": 2.0,
+    "minimum_full_query_reduction_ratio": 0.5
+  },
+  "verdicts": [
+    "COMMITMENT_FEEDBACK_SUPPORTED",
+    "PARETO_IMPROVEMENT_ONLY",
+    "COMMITMENT_FEEDBACK_NOT_SUPPORTED",
+    "COMMITMENT_FEEDBACK_INCONCLUSIVE"
+  ]
+}
