@@ -1,7 +1,10 @@
-# Seer Wrappers
+# Seer VLA-Cache baseline
 
-Put Seer helper scripts managed by `gnaroshi_vla` here. Upstream scripts copied from
-`seer_node3` are preserved under `../upstream/scripts/`.
+`run_seer_vla_cache_libero_long.sh` is the sole paper baseline entrypoint. It runs
+native Seer (`off`), indexed-full control (`matched_full`), and architecture-adapted
+cache reuse (`reuse`) with an explicit public33 checkpoint.
 
-The top-level `scripts/run_experiment.sh` is the preferred entrypoint for new
-tracked runs because it records environment, command, config, and result context.
+This is an architecture-adapted implementation: Seer's compressed condition tokens
+and action-query relevance replace the official method's raw spatial patch tokens and
+language attention. The distinction and negative latency result are documented in
+`codex_outputs/seer/{paper_results,legacy_results}.md`.
