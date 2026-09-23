@@ -17,8 +17,8 @@ export VALIDATION_EVERY_DATA_EPOCHS="${VALIDATION_EVERY_DATA_EPOCHS:-4}"
 export CHECKPOINT_EVERY_DATA_EPOCHS="${CHECKPOINT_EVERY_DATA_EPOCHS:-4}"
 export LOG_EVERY_UPDATES="${LOG_EVERY_UPDATES:-100}"
 export MASTER_PORT_BASE="${MASTER_PORT_BASE:-18200}"
-export LATENT_BRIDGE_RESULT_ROOT="${LATENT_BRIDGE_RESULT_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/latent_bridge/public33_compute_matched_full_egl50_seed42}"
-export LATENT_BRIDGE_EFFICIENT_SYNC_STAGE="${LATENT_BRIDGE_EFFICIENT_SYNC_STAGE:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/latent_bridge/public33_full_egl50_seed42/continuity_and_sync}"
+export LATENT_BRIDGE_RESULT_ROOT="${LATENT_BRIDGE_RESULT_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/seer/latent_bridge/libero_long_compute_matched}"
+export LATENT_BRIDGE_EFFICIENT_SYNC_STAGE="${LATENT_BRIDGE_EFFICIENT_SYNC_STAGE:-/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/seer/latent_bridge/libero_long/continuity_and_sync}"
 
 source "${wrapper_dir}/common.sh"
 latent_bridge_require_runtime

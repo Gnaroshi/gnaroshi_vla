@@ -3,11 +3,11 @@
 set -euo pipefail
 
 LATENT_BRIDGE_EFFICIENT_WRAPPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export LATENT_BRIDGE_RESULT_ROOT="${LATENT_BRIDGE_RESULT_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/latent_bridge/public33_compute_matched_full_egl50_seed42}"
+export LATENT_BRIDGE_RESULT_ROOT="${LATENT_BRIDGE_RESULT_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/seer/latent_bridge/libero_long_compute_matched}"
 export LATENT_BRIDGE_RENDERER="${LATENT_BRIDGE_RENDERER:-egl}"
 source "${LATENT_BRIDGE_EFFICIENT_WRAPPER_DIR}/../latent_bridge/common.sh"
 
-LATENT_BRIDGE_EFFICIENT_SYNC_STAGE="${LATENT_BRIDGE_EFFICIENT_SYNC_STAGE:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/latent_bridge/public33_full_egl50_seed42/continuity_and_sync}"
+LATENT_BRIDGE_EFFICIENT_SYNC_STAGE="${LATENT_BRIDGE_EFFICIENT_SYNC_STAGE:-/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/seer/latent_bridge/libero_long/continuity_and_sync}"
 LATENT_BRIDGE_EFFICIENT_PREFLIGHT_ROOT="${LATENT_BRIDGE_EFFICIENT_PREFLIGHT_ROOT:-${LATENT_BRIDGE_RESULT_ROOT}/preflight}"
 
 latent_bridge_require_runtime() {

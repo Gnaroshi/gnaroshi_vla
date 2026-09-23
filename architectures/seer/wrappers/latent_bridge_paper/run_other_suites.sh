@@ -7,7 +7,9 @@ repo_root="$(cd "${wrapper_dir}/../../../.." && pwd)"
 expected_repo="${EXPECTED_REPO:-/home/mingyujung/private/gnaroshi_vla_latent_bridge_paper}"
 shared_root=/home/mingyujung/shared/nvme1/mingyujung/robotics/seer
 suite_study_root="${shared_root}/libero_suite_study"
-paper_root="${LATENT_BRIDGE_PAPER_ROOT:-${shared_root}/paper_latent_bridge}"
+gnaroshi_shared_root=/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla
+paper_checkpoint_root="${gnaroshi_shared_root}/artifacts/checkpoints/seer/paper"
+paper_root="${LATENT_BRIDGE_PAPER_ROOT:-${gnaroshi_shared_root}/results/seer/latent_bridge}"
 
 fail() {
     echo "[ERROR] $*" >&2
@@ -73,19 +75,19 @@ PY
 
 run_suite \
     libero_spatial \
-    "${suite_study_root}/campaigns/spatial_object_goal_v1/train/libero_spatial/baseline/seer_libero_spatial_scratch_seed42/33.pth" \
+    "${paper_checkpoint_root}/libero_spatial/teacher_scratch33.pth" \
     05965065657b3a8797df034292baed648d73e4c3c1f2466617781242a945925c \
     seer_libero "$(( ${MASTER_PORT_BASE:-19200} + 0 ))"
 
 run_suite \
     libero_object \
-    "${suite_study_root}/campaigns/spatial_object_goal_v1/train/libero_object/baseline/seer_libero_object_scratch_seed42/39.pth" \
+    "${paper_checkpoint_root}/libero_object/teacher_scratch39.pth" \
     d9b8833ff8fc2819736f6f13862b488bce90c132973391552bf6c6f60dbbc417 \
     seer_libero_mojoco332 "$(( ${MASTER_PORT_BASE:-19200} + 300 ))"
 
 run_suite \
     libero_goal \
-    "${suite_study_root}/campaigns/spatial_object_goal_v1/train/libero_goal/baseline/seer_libero_goal_scratch_seed42/39.pth" \
+    "${paper_checkpoint_root}/libero_goal/teacher_scratch39.pth" \
     76da3ba380cf0fc730c9dc29e5dcfddd3b5db7082f1e873967b8031eb000afec \
     seer_libero "$(( ${MASTER_PORT_BASE:-19200} + 600 ))"
 
