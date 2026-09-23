@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+"""Aggregate the frozen 200-episode joint-surrogate comparison.
+
+The evaluator summary contains compatibility counters accumulated across several
+historical protocols.  This aggregator deliberately recomputes causal calls,
+latencies, continuity, and error-reset metrics from the per-step and per-episode
+artifacts produced by the current evaluator.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from methods.latentloop_comparison.metrics import (
+    distribution_summary as _distribution_summary,
+    hierarchical_paired_sr_interval,
+    paired_outcome_counts,
+    task_success_rates,
+)
+
+
+ROW_NAMES = (
+    "full_seer_k1",
+    "canonical_latentloop_k8",
+    "recursive_action_correction_k8",
+    "naive_hybrid_kf8_kg3",
+    "parameter_matched_wide_k8",
+    "joint_anchor_surrogate_kf8_kg3",
+)
+
+
+@dataclass(frozen=True)
+class EvaluationRow:
+    name: str
+    root: Path
+    summary_path: Path
+    episode_path: Path
+    args_path: Path
+    step_paths: tuple[Path, ...]
+    summary_payload: dict[str, Any]
+    args_payload: dict[str, Any]
+    episode_rows: list[dict[str, str]]
+    step_rows: list[dict[str, str]]
+    outcomes: dict[tuple[int, int, int], int]
+    metrics: dict[str, Any]
+
+
+def distribution_summary(values: list[float]) -> dict[str, float | int | None]:
+    """Return JSON-safe summaries; empty evidence is represented by ``None``."""
+
+    result = _distribution_summary(values)
+    return {
+        key: (
+            None
+            if isinstance(value, float) and not math.isfinite(value)
+            else value
+        )
+        for key, value in result.items()
+    }
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def find_one(root: Path, pattern: str) -> Path:
+    matches = sorted(root.rglob(pattern))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected exactly one {pattern} below {root}, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def finite_float(row: dict[str, str], key: str, *, default: float = 0.0) -> float:
+    raw = row.get(key, "")
+    value = float(default) if raw in {None, ""} else float(raw)
+    if not math.isfinite(value):
+        raise RuntimeError(f"Nonfinite {key}={raw!r}")
+    return value
+
+
+def integer(row: dict[str, str], key: str, *, default: int = 0) -> int:
+    return int(finite_float(row, key, default=float(default)))
+
+
+def episode_key(row: dict[str, str]) -> tuple[int, int, int]:
+    return int(row["task_id"]), int(row["episode_id"]), int(row["seed"])
+
+
+def validate_renderer(summary: dict[str, Any], row_name: str) -> None:
+    renderer = summary.get("renderer_backend", {})
+    rank_contexts = renderer.get("rank_contexts", [])
+    checks = {
+        "effective_backend": renderer.get("effective_backend") == "osmesa",
+        "classification": renderer.get("backend_classification")
+        == "software_osmesa",
+        "rank0_context": renderer.get("actual_context_verified") is True,
+        "all_rank_context": renderer.get("all_ranks_actual_context_verified") is True,
+        "four_rank_records": len(rank_contexts) == 4,
+        "all_rank_backend": all(
+            item.get("effective_backend") == "osmesa"
+            and item.get("actual_context_verified") is True
+            for item in rank_contexts
+        ),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise RuntimeError(f"{row_name} is not source-locked OSMesa: {failed}")
+
+
+def continuity_metrics(step_rows: list[dict[str, str]]) -> dict[str, Any]:
+    trajectories: dict[tuple[int, int], list[tuple[int, np.ndarray]]] = {}
+    for row in step_rows:
+        key = int(row["task_id"]), int(row["episode_id"])
+        action = np.asarray(
+            [finite_float(row, f"action_{index}") for index in range(7)],
+            dtype=np.float64,
+        )
+        trajectories.setdefault(key, []).append((int(row["timestep"]), action))
+    translation: list[float] = []
+    rotation: list[float] = []
+    switches = 0
+    steps = 0
+    for trajectory in trajectories.values():
+        ordered = sorted(trajectory)
+        timesteps = [item[0] for item in ordered]
+        if len(timesteps) != len(set(timesteps)):
+            raise RuntimeError("Duplicate step key in trajectory")
+        actions = np.stack([item[1] for item in ordered])
+        steps += len(actions)
+        if len(actions) >= 3:
+            second = actions[2:, :6] - 2.0 * actions[1:-1, :6] + actions[:-2, :6]
+            translation.extend(np.linalg.norm(second[:, :3], axis=-1).tolist())
+            rotation.extend(np.linalg.norm(second[:, 3:6], axis=-1).tolist())
+        if len(actions) >= 2:
+            switches += int(np.count_nonzero(actions[1:, 6] != actions[:-1, 6]))
+    return {
+        "translation_second_difference": distribution_summary(translation),
+        "rotation_second_difference": distribution_summary(rotation),
+        "gripper_switches_recomputed": switches,
+        "gripper_switches_per_100_steps_recomputed": 100.0
+        * switches
+        / max(1, steps),
+    }
+
+
+def error_by_age(
+    rows: list[dict[str, str]], value_key: str, age_key: str
+) -> dict[str, dict[str, float | int]]:
+    grouped: dict[int, list[float]] = {}
+    for row in rows:
+        raw_value = row.get(value_key, "")
+        raw_age = row.get(age_key, "")
+        if raw_value in {None, ""} or raw_age in {None, ""}:
+            continue
+        value = float(raw_value)
+        age = int(float(raw_age))
+        if not math.isfinite(value):
+            raise RuntimeError(f"Nonfinite {value_key} at age {age}")
+        grouped.setdefault(age, []).append(value)
+    return {
+        f"age{age}": distribution_summary(values)
+        for age, values in sorted(grouped.items())
+    }
+
+
+def level_latency(rows: list[dict[str, str]]) -> dict[str, Any]:
+    grouped: dict[str, list[float]] = {}
+    for row in rows:
+        raw_level = row.get("hierarchical_level", "")
+        if raw_level not in {None, ""}:
+            label = f"level_{int(float(raw_level))}"
+        elif integer(row, "full_forward_called"):
+            label = "full"
+        else:
+            label = "lightweight"
+        grouped.setdefault(label, []).append(
+            finite_float(row, "causal_executed_policy_ms")
+        )
+    return {
+        label: distribution_summary(values) for label, values in sorted(grouped.items())
+    }
+
+
+def summarize_row(
+    name: str,
+    episode_rows: list[dict[str, str]],
+    step_rows: list[dict[str, str]],
+    parameters: int,
+) -> dict[str, Any]:
+    successes = [integer(row, "success") for row in episode_rows]
+    environment_steps = [finite_float(row, "num_steps") for row in episode_rows]
+    total_environment_steps = int(sum(environment_steps))
+    causal_latency = [
+        finite_float(row, "causal_executed_policy_ms") for row in step_rows
+    ]
+    full_calls = sum(integer(row, "full_forward_called") for row in step_rows)
+    exact_skip_head_calls = sum(integer(row, "action_head_called") for row in step_rows)
+    action_head_calls = full_calls + exact_skip_head_calls
+    fast_encoder_calls = sum(integer(row, "fast_encoder_called") for row in step_rows)
+    updater_calls = sum(integer(row, "lrnode_update_called") for row in step_rows)
+    surrogate_calls = sum(integer(row, "joint_surrogate_called") for row in step_rows)
+    short_reversals = sum(
+        finite_float(row, "gripper_reverse_within_5_count") for row in episode_rows
+    )
+    metrics = {
+        "episodes": len(episode_rows),
+        "successes": int(sum(successes)),
+        "success_rate": float(np.mean(successes)),
+        "task_success_rates": task_success_rates(
+            {episode_key(row): integer(row, "success") for row in episode_rows}
+        ),
+        "environment_steps": distribution_summary(environment_steps),
+        "total_environment_steps": total_environment_steps,
+        "policy_steps": len(step_rows),
+        "parameters": int(parameters),
+        "calls": {
+            "full_seer": int(full_calls),
+            "seer_action_head": int(action_head_calls),
+            "observation_encoder": int(fast_encoder_calls),
+            "latent_updater": int(updater_calls),
+            "action_surrogate": int(surrogate_calls),
+        },
+        "calls_per_environment_step": {
+            "full_seer": full_calls / max(1, len(step_rows)),
+            "seer_action_head": action_head_calls / max(1, len(step_rows)),
+            "observation_encoder": fast_encoder_calls / max(1, len(step_rows)),
+            "latent_updater": updater_calls / max(1, len(step_rows)),
+            "action_surrogate": surrogate_calls / max(1, len(step_rows)),
+        },
+        "policy_latency_ms": distribution_summary(causal_latency),
+        "level_policy_latency_ms": level_latency(step_rows),
+        "gripper_switches": int(
+            sum(finite_float(row, "gripper_switch_count") for row in episode_rows)
+        ),
+        "gripper_switches_per_100_steps": 100.0
+        * sum(finite_float(row, "gripper_switch_count") for row in episode_rows)
+        / max(1, total_environment_steps),
+        "gripper_short_reversals_within_5": int(short_reversals),
+        "gripper_short_reversals_within_5_per_100_steps": 100.0
+        * short_reversals
+        / max(1, total_environment_steps),
+        **continuity_metrics(step_rows),
+        "errors": {
+            "latent_by_full_refresh_age": error_by_age(
+                step_rows,
+                "joint_latent_error",
+                "joint_latent_error_full_refresh_age",
+            ),
+            "action_surrogate_by_regeneration_age": error_by_age(
+                step_rows,
+                "joint_action_surrogate_error",
+                "joint_anchor_elapsed",
+            ),
+            "executed_token_by_regeneration_age": error_by_age(
+                step_rows,
+                "joint_executed_token_error",
+                "joint_anchor_elapsed",
+            ),
+            "tail_token_by_regeneration_age": error_by_age(
+                step_rows,
+                "joint_tail_token_error",
+                "joint_anchor_elapsed",
+            ),
+            "action_before_regeneration_age2": distribution_summary(
+                [
+                    finite_float(row, "joint_action_surrogate_error")
+                    for row in step_rows
+                    if row.get("joint_action_surrogate_error", "") not in {None, ""}
+                    and row.get("joint_anchor_elapsed", "") not in {None, ""}
+                    and int(float(row["joint_anchor_elapsed"])) == 2
+                ]
+            ),
+            "action_after_exact_regeneration": distribution_summary(
+                [
+                    finite_float(row, "joint_action_surrogate_error")
+                    for row in step_rows
+                    if integer(row, "joint_anchor_replaced_by_exact") == 1
+                ]
+            ),
+            "latent_after_full_refresh": distribution_summary(
+                [
+                    finite_float(row, "joint_latent_error")
+                    for row in step_rows
+                    if integer(row, "full_forward_called") == 1
+                    and row.get("joint_latent_error", "") not in {None, ""}
+                ]
+            ),
+        },
+    }
+    return metrics
+
+
+def load_row(
+    scientific_root: Path,
+    name: str,
+    parameters: int,
+    expected_manifest: dict[tuple[int, int, int], str],
+) -> EvaluationRow:
+    root = scientific_root / name
+    if not root.is_dir():
+        raise FileNotFoundError(root)
+    summary_path = find_one(root, "eval_summary.json")
+    episode_path = find_one(root, "eval_episode_metrics.csv")
+    args_path = find_one(root, "args_snapshot_*.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    args_payload = json.loads(args_path.read_text(encoding="utf-8"))
+    validate_renderer(summary, name)
+    if int(args_payload.get("action_pred_steps", -1)) != 3:
+        raise RuntimeError(f"{name} did not use P=3")
+    if not bool(args_payload.get("eval_libero_ensembling", False)):
+        raise RuntimeError(f"{name} did not enable temporal ensembling")
+    episode_rows = read_csv(episode_path)
+    if len(episode_rows) != 200:
+        raise RuntimeError(f"{name} must contain 200 episodes, got {len(episode_rows)}")
+    outcomes = {episode_key(row): integer(row, "success") for row in episode_rows}
+    if len(outcomes) != len(episode_rows):
+        raise RuntimeError(f"Duplicate episode key in {episode_path}")
+    expected_keys = set(expected_manifest)
+    if set(outcomes) != expected_keys:
+        missing = sorted(expected_keys - set(outcomes))[:10]
+        extra = sorted(set(outcomes) - expected_keys)[:10]
+        raise RuntimeError(f"{name} manifest mismatch: missing={missing}, extra={extra}")
+    task_name_mismatches = [
+        {
+            "key": episode_key(row),
+            "expected": expected_manifest[episode_key(row)],
+            "actual": row.get("task_name", ""),
+        }
+        for row in episode_rows
+        if row.get("task_name", "") != expected_manifest[episode_key(row)]
+    ]
+    if task_name_mismatches:
+        raise RuntimeError(
+            f"{name} task-name manifest mismatch: {task_name_mismatches[:10]}"
+        )
+    step_dir = episode_path.parent / "eval_step_logs"
+    step_paths = tuple(sorted(step_dir.glob("*.csv")))
+    if not step_paths:
+        raise FileNotFoundError(f"No step logs below {step_dir}")
+    step_rows = [row for path in step_paths for row in read_csv(path)]
+    step_keys = [
+        (int(row["task_id"]), int(row["episode_id"]), int(row["timestep"]))
+        for row in step_rows
+    ]
+    if len(step_keys) != len(set(step_keys)):
+        raise RuntimeError(f"Duplicate step keys for {name}")
+    if not all(integer(row, "temporal_ensemble_enabled") == 1 for row in step_rows):
+        raise RuntimeError(f"{name} step logs contain disabled temporal ensembling")
+    metrics = summarize_row(name, episode_rows, step_rows, parameters)
+    return EvaluationRow(
+        name=name,
+        root=root,
+        summary_path=summary_path,
+        episode_path=episode_path,
+        args_path=args_path,
+        step_paths=step_paths,
+        summary_payload=summary,
+        args_payload=args_payload,
+        episode_rows=episode_rows,
+        step_rows=step_rows,
+        outcomes=outcomes,
+        metrics=metrics,
+    )
+
+
+def pair(
+    left: EvaluationRow,
+    right: EvaluationRow,
+    *,
+    iterations: int,
+    seed: int,
+) -> dict[str, Any]:
+    return {
+        "left": left.name,
+        "right": right.name,
+        "success_rate": hierarchical_paired_sr_interval(
+            left.outcomes,
+            right.outcomes,
+            iterations=iterations,
+            seed=seed,
+        ),
+        "paired_outcomes": paired_outcome_counts(left.outcomes, right.outcomes),
+    }
+
+
+def ratio(numerator: float, denominator: float) -> float:
+    if denominator == 0.0:
+        return 1.0 if numerator == 0.0 else float("inf")
+    return numerator / denominator
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scientific-root", type=Path, required=True)
+    parser.add_argument("--source-lock", type=Path, required=True)
+    parser.add_argument("--parity", type=Path, required=True)
+    parser.add_argument("--offline-gates", type=Path, required=True)
+    parser.add_argument("--offline-comparison", type=Path, required=True)
+    parser.add_argument("--decision-rule", type=Path, required=True)
+    parser.add_argument("--bootstrap-iterations", type=int, default=10_000)
+    parser.add_argument("--bootstrap-seed", type=int, default=20260816)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    args = parser.parse_args()
+    if args.output_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite {args.output_dir}")
+    if args.bootstrap_iterations <= 0:
+        raise ValueError("bootstrap-iterations must be positive")
+    for path in (
+        args.source_lock,
+        args.parity,
+        args.offline_gates,
+        args.offline_comparison,
+        args.decision_rule,
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+    source_lock = json.loads(args.source_lock.read_text(encoding="utf-8"))
+    parity = json.loads(args.parity.read_text(encoding="utf-8"))
+    offline_gates = json.loads(args.offline_gates.read_text(encoding="utf-8"))
+    offline_comparison = json.loads(
+        args.offline_comparison.read_text(encoding="utf-8")
+    )
+    decision_rule = json.loads(args.decision_rule.read_text(encoding="utf-8"))
+    if source_lock.get("status") != "PASS":
+        raise RuntimeError("Source lock is not PASS")
+    if decision_rule.get("frozen") is not True:
+        raise RuntimeError("Decision rule is not frozen")
+    manifest_path = Path(source_lock["episode_manifest"]["path"])
+    if sha256(manifest_path) != source_lock["episode_manifest"]["sha256"]:
+        raise RuntimeError("Episode manifest changed after source lock")
+    manifest_rows = read_csv(manifest_path)
+    expected_manifest = {
+        episode_key(row): row["task_name"] for row in manifest_rows
+    }
+    if len(expected_manifest) != 200:
+        raise RuntimeError("Frozen episode manifest must contain 200 unique episodes")
+
+    parameters = source_lock["parameters"]
+    parameter_map = {
+        "full_seer_k1": 0,
+        "canonical_latentloop_k8": int(parameters["canonical_total"]),
+        "recursive_action_correction_k8": 469_963,
+        "naive_hybrid_kf8_kg3": int(parameters["canonical_total"]) + 469_963,
+        "parameter_matched_wide_k8": int(parameters["wide_total"]),
+        "joint_anchor_surrogate_kf8_kg3": int(parameters["joint_total"]),
+    }
+    rows = {
+        name: load_row(
+            args.scientific_root,
+            name,
+            parameter_map[name],
+            expected_manifest,
+        )
+        for name in ROW_NAMES
+    }
+    joint = rows["joint_anchor_surrogate_kf8_kg3"]
+    canonical = rows["canonical_latentloop_k8"]
+    recursive = rows["recursive_action_correction_k8"]
+    naive = rows["naive_hybrid_kf8_kg3"]
+    wide = rows["parameter_matched_wide_k8"]
+    comparisons = {
+        "joint_minus_canonical": pair(
+            joint,
+            canonical,
+            iterations=args.bootstrap_iterations,
+            seed=args.bootstrap_seed,
+        ),
+        "joint_minus_recursive": pair(
+            joint,
+            recursive,
+            iterations=args.bootstrap_iterations,
+            seed=args.bootstrap_seed + 1,
+        ),
+        "joint_minus_naive": pair(
+            joint,
+            naive,
+            iterations=args.bootstrap_iterations,
+            seed=args.bootstrap_seed + 2,
+        ),
+        "joint_minus_wide": pair(
+            joint,
+            wide,
+            iterations=args.bootstrap_iterations,
+            seed=args.bootstrap_seed + 3,
+        ),
+    }
+
+    def ci_pp(name: str, bound: str) -> float:
+        return 100.0 * float(comparisons[name]["success_rate"][bound])
+
+    canonical_head_rate = canonical.metrics["calls_per_environment_step"][
+        "seer_action_head"
+    ]
+    joint_head_rate = joint.metrics["calls_per_environment_step"]["seer_action_head"]
+    canonical_p50 = float(canonical.metrics["policy_latency_ms"]["p50"])
+    joint_p50 = float(joint.metrics["policy_latency_ms"]["p50"])
+    wide_p50 = float(wide.metrics["policy_latency_ms"]["p50"])
+    naive_p50 = float(naive.metrics["policy_latency_ms"]["p50"])
+    joint_wide_low = ci_pp("joint_minus_wide", "ci_low")
+    joint_wide_high = ci_pp("joint_minus_wide", "ci_high")
+    joint_naive_low = ci_pp("joint_minus_naive", "ci_low")
+    task_regressions = sum(
+        1
+        for task_id in canonical.metrics["task_success_rates"]
+        if float(canonical.metrics["task_success_rates"][task_id]["sr"])
+        - float(joint.metrics["task_success_rates"][task_id]["sr"])
+        > 0.20
+    )
+    metrics = {
+        "k1_parity": bool(parity.get("pass")),
+        "joint_vs_canonical_ci_low_pp": ci_pp(
+            "joint_minus_canonical", "ci_low"
+        ),
+        "joint_vs_recursive_ci_low_pp": ci_pp(
+            "joint_minus_recursive", "ci_low"
+        ),
+        "action_head_reduction_fraction": 1.0
+        - ratio(joint_head_rate, canonical_head_rate),
+        "parameter_ratio": float(parameters["joint_ratio"]),
+        "latency_reduction_fraction": 1.0 - ratio(joint_p50, canonical_p50),
+        "supported_advantage_at_latency_overhead": ci_pp(
+            "joint_minus_canonical", "ci_low"
+        )
+        > 0.0,
+        "latency_overhead_fraction": max(
+            0.0, ratio(joint_p50, canonical_p50) - 1.0
+        ),
+        "gripper_short_reversal_ratio": ratio(
+            float(
+                joint.metrics[
+                    "gripper_short_reversals_within_5_per_100_steps"
+                ]
+            ),
+            float(
+                canonical.metrics[
+                    "gripper_short_reversals_within_5_per_100_steps"
+                ]
+            ),
+        ),
+        "joint_better_pareto_than_wide": bool(
+            (joint_wide_low > 0.0 and joint_p50 <= 1.05 * wide_p50)
+            or (joint_wide_low > -3.0 and joint_p50 <= 0.95 * wide_p50)
+        ),
+        "tasks_regressed_over_20pp": int(task_regressions),
+        "joint_materially_improves_naive": bool(
+            joint_naive_low > 0.0
+            or (joint_naive_low > -3.0 and joint_p50 <= 0.95 * naive_p50)
+        ),
+        "offline_gates_pass": bool(
+            offline_gates.get("pass") and offline_comparison.get("pass")
+        ),
+        "wide_matches_or_exceeds_joint": bool(
+            -joint_wide_high > -3.0 and wide_p50 <= 1.05 * joint_p50
+        ),
+        "recovers_recursive_collapse": ci_pp(
+            "joint_minus_recursive", "ci_low"
+        )
+        > 0.0,
+    }
+
+    joint_errors = joint.metrics["errors"]
+    required_error_groups = (
+        joint_errors["latent_by_full_refresh_age"],
+        joint_errors["action_surrogate_by_regeneration_age"],
+        joint_errors["executed_token_by_regeneration_age"],
+        joint_errors["tail_token_by_regeneration_age"],
+    )
+    if any(not group for group in required_error_groups):
+        raise RuntimeError("Joint row is missing required two-error trace evidence")
+    after_regeneration = joint_errors["action_after_exact_regeneration"]
+    if int(after_regeneration["count"]) == 0 or float(after_regeneration["max"]) != 0.0:
+        raise RuntimeError("Exact regeneration did not produce measured zero action error")
+
+    output = {
+        "schema_version": 1,
+        "protocol": "joint_latent_action_surrogate_k8_aggregation_v1",
+        "source_lock": str(args.source_lock.resolve()),
+        "source_lock_sha256": sha256(args.source_lock),
+        "decision_rule": str(args.decision_rule.resolve()),
+        "decision_rule_sha256": sha256(args.decision_rule),
+        "episode_manifest": str(manifest_path.resolve()),
+        "episode_manifest_sha256": sha256(manifest_path),
+        "paired_episodes_per_row": 200,
+        "renderer": "osmesa",
+        "temporal_ensemble": True,
+        "rows": {name: row.metrics for name, row in rows.items()},
+        "paired_comparisons": comparisons,
+        "decision_metrics": metrics,
+        "artifact_provenance": {
+            name: {
+                "root": str(row.root.resolve()),
+                "summary": str(row.summary_path.resolve()),
+                "summary_sha256": sha256(row.summary_path),
+                "episodes": str(row.episode_path.resolve()),
+                "episodes_sha256": sha256(row.episode_path),
+                "args": str(row.args_path.resolve()),
+                "args_sha256": sha256(row.args_path),
+                "step_log_files": len(row.step_paths),
+            }
+            for name, row in rows.items()
+        },
+    }
+    args.output_dir.mkdir(parents=True)
+    (args.output_dir / "joint_k8_comparison.json").write_text(
+        json.dumps(output, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    (args.output_dir / "aggregated_metrics.json").write_text(
+        json.dumps(metrics, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    with (args.output_dir / "joint_k8_comparison.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        fields = (
+            "row",
+            "successes",
+            "episodes",
+            "success_rate",
+            "parameters",
+            "full_seer_calls",
+            "action_head_calls",
+            "encoder_calls",
+            "updater_calls",
+            "surrogate_calls",
+            "policy_p50_ms",
+            "policy_p95_ms",
+            "policy_p99_ms",
+            "translation_second_difference_mean",
+            "rotation_second_difference_mean",
+            "gripper_switches_per_100_steps",
+            "gripper_short_reversals_per_100_steps",
+            "mean_environment_steps",
+        )
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for name in ROW_NAMES:
+            row = rows[name].metrics
+            writer.writerow(
+                {
+                    "row": name,
+                    "successes": row["successes"],
+                    "episodes": row["episodes"],
+                    "success_rate": row["success_rate"],
+                    "parameters": row["parameters"],
+                    "full_seer_calls": row["calls"]["full_seer"],
+                    "action_head_calls": row["calls"]["seer_action_head"],
+                    "encoder_calls": row["calls"]["observation_encoder"],
+                    "updater_calls": row["calls"]["latent_updater"],
+                    "surrogate_calls": row["calls"]["action_surrogate"],
+                    "policy_p50_ms": row["policy_latency_ms"]["p50"],
+                    "policy_p95_ms": row["policy_latency_ms"]["p95"],
+                    "policy_p99_ms": row["policy_latency_ms"]["p99"],
+                    "translation_second_difference_mean": row[
+                        "translation_second_difference"
+                    ]["mean"],
+                    "rotation_second_difference_mean": row[
+                        "rotation_second_difference"
+                    ]["mean"],
+                    "gripper_switches_per_100_steps": row[
+                        "gripper_switches_per_100_steps"
+                    ],
+                    "gripper_short_reversals_per_100_steps": row[
+                        "gripper_short_reversals_within_5_per_100_steps"
+                    ],
+                    "mean_environment_steps": row["environment_steps"]["mean"],
+                }
+            )
+
+    report = [
+        "# Joint Latent-Anchored Action Surrogate: frozen K8 aggregate",
+        "",
+        "All rows use the exact 200-episode manifest, verified OSMesa contexts, P=3, and temporal ensembling.",
+        "Causal policy latency excludes diagnostic-only action-head and Full-Seer shadow calls.",
+        "",
+        "| Row | SR | Params | Full calls | Head calls | Encoder | Updater | Surrogate | Policy p50/p95/p99 ms |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name in ROW_NAMES:
+        row = rows[name].metrics
+        latency = row["policy_latency_ms"]
+        calls = row["calls"]
+        report.append(
+            f"| {name} | {row['successes']}/{row['episodes']} "
+            f"({100.0 * row['success_rate']:.1f}%) | {row['parameters']:,} | "
+            f"{calls['full_seer']} | {calls['seer_action_head']} | "
+            f"{calls['observation_encoder']} | {calls['latent_updater']} | "
+            f"{calls['action_surrogate']} | {latency['p50']:.3f}/"
+            f"{latency['p95']:.3f}/{latency['p99']:.3f} |"
+        )
+    report.extend(
+        [
+            "",
+            "## Frozen decision inputs",
+            "",
+            "```json",
+            json.dumps(metrics, indent=2, allow_nan=False),
+            "```",
+            "",
+            "The final label is intentionally produced by `apply_joint_surrogate_verdict.py` from the separately frozen decision rule.",
+        ]
+    )
+    (args.output_dir / "joint_k8_report.md").write_text(
+        "\n".join(report) + "\n", encoding="utf-8"
+    )
+    print(args.output_dir / "joint_k8_comparison.json")
+
+
+if __name__ == "__main__":
+    main()

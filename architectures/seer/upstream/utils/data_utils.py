@@ -30,7 +30,7 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 import copy
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info, Dataset
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 try:
@@ -52,6 +52,7 @@ from PIL import Image
 import clip
 from pdb import set_trace
 import h5py
+import hashlib
 from scipy.spatial.transform import Rotation as R
 import time
 
@@ -808,6 +809,7 @@ class DataInfo:
     sampler: DistributedSampler = None
     shared_epoch: SharedEpoch = None
     dataset: Dataset = None
+    split_manifest: dict = None
 
     def set_epoch(self, epoch):
         if self.shared_epoch is not None:
@@ -2362,6 +2364,109 @@ def get_libero_pretrain_dataset(args, image_processor, tokenizer, epoch=0, floor
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch, sampler=sampler, dataset=libero_dataset)
 
 
+def _latentloop_comparison_split(args, dataset):
+    """Return a deterministic episode-disjoint split and its manifest."""
+
+    role = str(getattr(args, "latentloop_comparison_split_role", "full"))
+    if role not in {"full", "train", "validation"}:
+        raise ValueError(f"Unknown split role: {role}")
+    comparison_enabled = bool(getattr(args, "latentloop_comparison_protocol", 0))
+    joint_enabled = (
+        str(getattr(args, "joint_latent_action_surrogate_mode", "off")) != "off"
+    )
+    if not (comparison_enabled or joint_enabled) or role == "full":
+        return dataset, None
+    fraction = float(getattr(args, "latentloop_comparison_validation_fraction", 0.05))
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("latentloop_comparison_validation_fraction must be in (0,1)")
+    seed = int(getattr(args, "latentloop_comparison_validation_seed", 20260805))
+    episode_ranges = []
+    dataset_offset = 0
+    for dataset_name, child in zip(dataset.dataset_names, dataset.datasets):
+        episode_offset = 0
+        for episode_id, episode_size in zip(
+            child.episode_list, child.num_step_per_episode
+        ):
+            episode_size = int(episode_size)
+            if episode_size <= 0:
+                continue
+            start = dataset_offset + episode_offset
+            episode_ranges.append(
+                {
+                    "key": f"{dataset_name}:{episode_id}",
+                    "start": start,
+                    "stop": start + episode_size,
+                    "size": episode_size,
+                }
+            )
+            episode_offset += episode_size
+        if episode_offset != len(child):
+            raise RuntimeError(
+                f"Episode accounting mismatch for {dataset_name}: "
+                f"{episode_offset} != {len(child)}"
+            )
+        dataset_offset += len(child)
+    if dataset_offset != len(dataset) or len(episode_ranges) < 2:
+        raise RuntimeError("Comparison split requires at least two valid episodes")
+
+    ordered_episodes = sorted(
+        episode_ranges,
+        key=lambda item: hashlib.sha256(
+            f"{seed}:{item['key']}".encode("utf-8")
+        ).hexdigest(),
+    )
+    target_validation_windows = max(1, int(round(len(dataset) * fraction)))
+    validation_episode_keys = set()
+    validation_windows = 0
+    for episode in ordered_episodes:
+        if len(validation_episode_keys) >= len(ordered_episodes) - 1:
+            break
+        validation_episode_keys.add(episode["key"])
+        validation_windows += episode["size"]
+        if validation_windows >= target_validation_windows:
+            break
+    if not validation_episode_keys:
+        raise RuntimeError("Comparison split produced an empty validation set")
+
+    validation_indices = []
+    train_indices = []
+    for episode in episode_ranges:
+        target = (
+            validation_indices
+            if episode["key"] in validation_episode_keys
+            else train_indices
+        )
+        target.extend(range(episode["start"], episode["stop"]))
+    if not train_indices or not validation_indices:
+        raise RuntimeError("Comparison split produced an empty train/validation set")
+    indices = train_indices if role == "train" else validation_indices
+    manifest = {
+        "protocol": (
+            "joint_latent_action_surrogate_v1"
+            if joint_enabled
+            else "latentloop_q1_q2_comparison_v1"
+        ),
+        "role": role,
+        "split_unit": "episode",
+        "episode_disjoint": True,
+        "seed": seed,
+        "requested_validation_fraction": fraction,
+        "actual_validation_fraction": len(validation_indices) / len(dataset),
+        "source_size": len(dataset),
+        "selected_size": len(indices),
+        "source_episode_count": len(episode_ranges),
+        "validation_episode_count": len(validation_episode_keys),
+        "validation_episode_keys": sorted(validation_episode_keys),
+        "validation_episode_keys_sha256": hashlib.sha256(
+            "\n".join(sorted(validation_episode_keys)).encode("utf-8")
+        ).hexdigest(),
+        "selected_indices_sha256": hashlib.sha256(
+            np.asarray(indices, dtype=np.int64).tobytes()
+        ).hexdigest(),
+    }
+    return Subset(dataset, indices), manifest
+
+
 def get_libero_finetune_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     dataset_names = ["libero_10_converted"]
     shared_epoch = SharedEpoch(epoch=epoch)
@@ -2392,8 +2497,11 @@ def get_libero_finetune_dataset(args, image_processor, tokenizer, epoch=0, floor
         gripper_width=args.gripper_width,
         load_libero_file=args.load_libero_file,
     )
+    dataset_for_loader, split_manifest = _latentloop_comparison_split(
+        args, libero_dataset
+    )
     round_fn = math.floor if floor else math.ceil
-    num_samples = len(libero_dataset)
+    num_samples = len(dataset_for_loader)
     global_batch_size = args.batch_size * args.world_size
     num_batches = round_fn(num_samples / global_batch_size)
     num_workers = max(1, args.workers)
@@ -2409,16 +2517,19 @@ def get_libero_finetune_dataset(args, image_processor, tokenizer, epoch=0, floor
     print(f"num_samples: {num_samples}")
     print('@'*100)
 
+    is_training_split = str(
+        getattr(args, "latentloop_comparison_split_role", "full")
+    ) != "validation"
     sampler = DistributedSampler(
-        libero_dataset,
+        dataset_for_loader,
         num_replicas=args.world_size,
         rank=args.rank,
-        shuffle=True,
+        shuffle=is_training_split,
         seed=args.seed,
-        drop_last=True,
+        drop_last=is_training_split,
     )
     dataloader = DataLoader(
-        libero_dataset,
+        dataset_for_loader,
         batch_size=args.batch_size,
         pin_memory=False,
         num_workers=num_workers,
@@ -2428,12 +2539,18 @@ def get_libero_finetune_dataset(args, image_processor, tokenizer, epoch=0, floor
         # persistent_workers=True,
         persistent_workers=False,
         collate_fn=libero_dataset.collator,
-        drop_last=True
+        drop_last=is_training_split
     )
     dataloader.num_batches = num_batches
     dataloader.num_samples = num_samples
 
-    return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch, sampler=sampler, dataset=libero_dataset)
+    return DataInfo(
+        dataloader=dataloader,
+        shared_epoch=shared_epoch,
+        sampler=sampler,
+        dataset=dataset_for_loader,
+        split_manifest=split_manifest,
+    )
 
 
 class BaseRealDataset(Dataset):
