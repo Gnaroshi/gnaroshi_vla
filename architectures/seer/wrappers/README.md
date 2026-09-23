@@ -1,7 +1,10 @@
-# Seer Wrappers
+# Unified Seer method latency
 
-Put Seer helper scripts managed by `gnaroshi_vla` here. Upstream scripts copied from
-`seer_node3` are preserved under `../upstream/scripts/`.
+`run_seer_unified_policy_latency.sh` measures Seer K1, LatentLoop K2-K8,
+Latent Bridge Large K4, and VLA-Cache in one model-only benchmark. It excludes
+simulator and preprocessing time, uses four independent RTX 3090 replicates, and
+loads all selected checkpoints from the canonical paper checkpoint registry.
 
-The top-level `scripts/run_experiment.sh` is the preferred entrypoint for new
-tracked runs because it records environment, command, config, and result context.
+The final immutable aggregate is stored under
+`.../gnaroshi_vla/results/seer/paper/latency`; new runs use
+`.../gnaroshi_vla/results/seer/latency`.
