@@ -151,6 +151,7 @@ class GPT2Attention(nn.Module):
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
         attention_mask: Optional[torch.FloatTensor] = None,
+        return_attention: bool = False,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
         
         query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
@@ -168,6 +169,8 @@ class GPT2Attention(nn.Module):
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
+        if return_attention:
+            return attn_output, attn_weights
         return attn_output
 
 
@@ -204,13 +207,19 @@ class GPT2Block(nn.Module):
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
         attention_mask: Optional[torch.FloatTensor] = None,
+        return_attention: bool = False,
     ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        attn_output = self.attn(
+        attention_result = self.attn(
             hidden_states,
             attention_mask=attention_mask,
+            return_attention=return_attention,
         )
+        if return_attention:
+            attn_output, attention_weights = attention_result
+        else:
+            attn_output = attention_result
         # residual connection
         hidden_states = attn_output + residual
 
@@ -220,6 +229,8 @@ class GPT2Block(nn.Module):
         # residual connection
         hidden_states = residual + feed_forward_hidden_states  # TODO
 
+        if return_attention:
+            return hidden_states, attention_weights
         return hidden_states 
 
 
@@ -324,6 +335,182 @@ class GPT2Model(GPT2PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.last_fastv_stats = None
+        self.fastv_retention_calls = 0
+        self.fastv_retained_token_sum_by_timestep_camera = None
+        self.fastv_zero_retention_calls_by_timestep_camera = None
+        self.fastv_min_retained_tokens_by_timestep_camera = None
+        self.fastv_max_retained_tokens_by_timestep_camera = None
+
+    @staticmethod
+    def _prune_attention_mask(attention_mask, keep_indices):
+        if attention_mask is None:
+            return None
+        if attention_mask.dim() == 2:
+            return attention_mask.index_select(0, keep_indices).index_select(
+                1, keep_indices
+            )
+        if attention_mask.dim() == 3:
+            return attention_mask.index_select(1, keep_indices).index_select(
+                2, keep_indices
+            )
+        if attention_mask.dim() == 4:
+            return attention_mask.index_select(2, keep_indices).index_select(
+                3, keep_indices
+            )
+        raise ValueError(
+            "FastV supports 2D, 3D, or 4D attention masks; "
+            f"got shape={tuple(attention_mask.shape)}"
+        )
+
+    @classmethod
+    def _score_fastv_visual_tokens(
+        cls,
+        attention_history,
+        visual_indices,
+        query_indices,
+        score_mode,
+    ):
+        if not attention_history:
+            raise ValueError("FastV requires at least one early-layer attention tensor")
+        expected_shape = attention_history[0].shape
+        if len(expected_shape) != 4:
+            raise ValueError(
+                "FastV attention must have shape [B,H,Q,K], "
+                f"got {tuple(expected_shape)}"
+            )
+        if any(item.shape != expected_shape for item in attention_history):
+            raise ValueError("FastV early-layer attention tensors must share one shape")
+
+        if score_mode in {"text_mean_first_l", "action_mean_first_l"}:
+            stacked = torch.stack(attention_history, dim=0)
+            selected = stacked.index_select(-2, query_indices).index_select(
+                -1, visual_indices
+            )
+            return selected.mean(dim=(0, 1, 2, 3))
+        if score_mode in {"last_token_at_l", "hf_last_action_at_l"}:
+            selected = attention_history[-1].index_select(
+                -2, query_indices
+            ).index_select(-1, visual_indices)
+            return selected.mean(dim=(0, 1, 2))
+        raise ValueError(f"Unsupported FastV score mode: {score_mode}")
+
+    @classmethod
+    def _apply_fastv_pruning(
+        cls,
+        hidden_states,
+        attention_mask,
+        attention_history,
+        fastv_config,
+    ):
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                "Seer FastV currently requires per-rank batch size 1 so each policy "
+                "context can select its own visual tokens"
+            )
+        sequence_length = hidden_states.shape[1]
+        device = hidden_states.device
+        visual_indices = torch.as_tensor(
+            fastv_config["visual_token_indices"], dtype=torch.long, device=device
+        )
+        query_indices = torch.as_tensor(
+            fastv_config["score_query_indices"], dtype=torch.long, device=device
+        )
+        retention_diagnostics = bool(
+            fastv_config.get("retention_diagnostics", False)
+        )
+        visual_timesteps = None
+        visual_cameras = None
+        num_timesteps = int(fastv_config["sequence_length"])
+        num_cameras = len(fastv_config["visual_camera_names"])
+        if retention_diagnostics:
+            visual_timesteps = torch.as_tensor(
+                fastv_config["visual_token_timesteps"],
+                dtype=torch.long,
+                device=device,
+            )
+            visual_cameras = torch.as_tensor(
+                fastv_config["visual_token_cameras"],
+                dtype=torch.long,
+                device=device,
+            )
+            if visual_timesteps.numel() != visual_indices.numel():
+                raise ValueError("FastV visual timestep metadata length mismatch")
+            if visual_cameras.numel() != visual_indices.numel():
+                raise ValueError("FastV visual camera metadata length mismatch")
+
+        # The explicit score mode selects both the query family and whether the
+        # first L attention maps or only the final pre-pruning map are aggregated.
+        visual_scores = cls._score_fastv_visual_tokens(
+            attention_history,
+            visual_indices,
+            query_indices,
+            fastv_config["score_mode"],
+        )
+        keep_visual_count = max(
+            1,
+            int(
+                round(
+                    visual_indices.numel()
+                    * (1.0 - float(fastv_config["prune_ratio"]))
+                )
+            ),
+        )
+        selected_relative = torch.topk(
+            visual_scores,
+            keep_visual_count,
+            largest=True,
+            sorted=False,
+        ).indices
+        selected_visual = visual_indices.index_select(0, selected_relative)
+        retained_group_counts = None
+        if retention_diagnostics:
+            selected_group_ids = (
+                visual_timesteps.index_select(0, selected_relative) * num_cameras
+                + visual_cameras.index_select(0, selected_relative)
+            )
+            retained_group_counts = torch.bincount(
+                selected_group_ids,
+                minlength=num_timesteps * num_cameras,
+            ).view(num_timesteps, num_cameras)
+
+        keep_mask = torch.ones(sequence_length, dtype=torch.bool, device=device)
+        keep_mask[visual_indices] = False
+        keep_mask[selected_visual] = True
+        keep_indices = torch.nonzero(keep_mask, as_tuple=False).flatten()
+
+        hidden_states = hidden_states.index_select(1, keep_indices)
+        attention_mask = cls._prune_attention_mask(attention_mask, keep_indices)
+        return hidden_states, attention_mask, keep_indices, retained_group_counts
+
+    def get_fastv_retention_stats(self):
+        if self.fastv_retention_calls == 0:
+            return {
+                "calls": 0,
+                "retained_token_sum_by_timestep_camera": [],
+                "zero_retention_calls_by_timestep_camera": [],
+                "min_retained_tokens_by_timestep_camera": [],
+                "max_retained_tokens_by_timestep_camera": [],
+            }
+
+        def as_list(value):
+            return value.detach().cpu().tolist()
+
+        return {
+            "calls": int(self.fastv_retention_calls),
+            "retained_token_sum_by_timestep_camera": as_list(
+                self.fastv_retained_token_sum_by_timestep_camera
+            ),
+            "zero_retention_calls_by_timestep_camera": as_list(
+                self.fastv_zero_retention_calls_by_timestep_camera
+            ),
+            "min_retained_tokens_by_timestep_camera": as_list(
+                self.fastv_min_retained_tokens_by_timestep_camera
+            ),
+            "max_retained_tokens_by_timestep_camera": as_list(
+                self.fastv_max_retained_tokens_by_timestep_camera
+            ),
+        }
 
     def get_input_embeddings(self):
         return self.wte
@@ -335,6 +522,7 @@ class GPT2Model(GPT2PreTrainedModel):
         self,
         attention_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        fastv_config=None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         
         input_shape = inputs_embeds.size()[:-1]
@@ -343,8 +531,40 @@ class GPT2Model(GPT2PreTrainedModel):
         hidden_states = self.drop(hidden_states)
 
         output_shape = (-1,) + input_shape[1:] + (hidden_states.size(-1),)
+        original_sequence_length = hidden_states.shape[1]
+        fastv_enabled = bool(fastv_config and fastv_config.get("enabled", False))
+        if fastv_enabled and self.training:
+            raise ValueError("FastV is an inference-only token-pruning path")
+        prune_layer = int(fastv_config["prune_layer"]) if fastv_enabled else -1
+        if fastv_enabled and not 1 <= prune_layer < len(self.h):
+            raise ValueError(
+                f"FastV prune_layer must be in [1, {len(self.h) - 1}], got {prune_layer}"
+            )
+        keep_indices = torch.arange(
+            original_sequence_length, device=hidden_states.device
+        )
+        retained_group_counts = None
+        selection_attentions = []
 
         for i, block in enumerate(self.h):
+
+            if fastv_enabled and i == prune_layer:
+                if len(selection_attentions) != prune_layer:
+                    raise RuntimeError(
+                        "FastV did not capture every full-sequence early-layer attention"
+                    )
+                (
+                    hidden_states,
+                    attention_mask,
+                    keep_indices,
+                    retained_group_counts,
+                ) = self._apply_fastv_pruning(
+                    hidden_states,
+                    attention_mask,
+                    selection_attentions,
+                    fastv_config,
+                )
+                selection_attentions = []
 
             if self.gradient_checkpointing and self.training:
                 hidden_states = self._gradient_checkpointing_func(
@@ -353,12 +573,91 @@ class GPT2Model(GPT2PreTrainedModel):
                     attention_mask,
                 )
             else:
-                hidden_states = block(
+                block_output = block(
                     hidden_states,
                     attention_mask=attention_mask,
+                    return_attention=(fastv_enabled and i < prune_layer),
                 )
+                if fastv_enabled and i < prune_layer:
+                    hidden_states, selection_attention = block_output
+                    selection_attentions.append(selection_attention)
+                else:
+                    hidden_states = block_output
 
         hidden_states = self.ln_f(hidden_states)
+        if fastv_enabled and hidden_states.shape[1] != original_sequence_length:
+            restored_hidden_states = hidden_states.new_zeros(
+                hidden_states.shape[0],
+                original_sequence_length,
+                hidden_states.shape[-1],
+            )
+            restored_hidden_states.index_copy_(1, keep_indices, hidden_states)
+            hidden_states = restored_hidden_states
+        if fastv_enabled:
+            retention_diagnostics = bool(
+                fastv_config.get("retention_diagnostics", False)
+            )
+            if retention_diagnostics and retained_group_counts is None:
+                raise RuntimeError("FastV did not produce visual retention diagnostics")
+            if not retention_diagnostics and retained_group_counts is not None:
+                raise RuntimeError("FastV unexpectedly produced retention diagnostics")
+            if retention_diagnostics:
+                retained_group_counts = retained_group_counts.detach().to(dtype=torch.long)
+                if self.fastv_retained_token_sum_by_timestep_camera is None:
+                    self.fastv_retained_token_sum_by_timestep_camera = torch.zeros_like(
+                        retained_group_counts
+                    )
+                    self.fastv_zero_retention_calls_by_timestep_camera = torch.zeros_like(
+                        retained_group_counts
+                    )
+                    self.fastv_min_retained_tokens_by_timestep_camera = (
+                        retained_group_counts.clone()
+                    )
+                    self.fastv_max_retained_tokens_by_timestep_camera = (
+                        retained_group_counts.clone()
+                    )
+                self.fastv_retention_calls += 1
+                self.fastv_retained_token_sum_by_timestep_camera.add_(
+                    retained_group_counts
+                )
+                self.fastv_zero_retention_calls_by_timestep_camera.add_(
+                    retained_group_counts.eq(0).to(dtype=torch.long)
+                )
+                self.fastv_min_retained_tokens_by_timestep_camera.copy_(
+                    torch.minimum(
+                        self.fastv_min_retained_tokens_by_timestep_camera,
+                        retained_group_counts,
+                    )
+                )
+                self.fastv_max_retained_tokens_by_timestep_camera.copy_(
+                    torch.maximum(
+                        self.fastv_max_retained_tokens_by_timestep_camera,
+                        retained_group_counts,
+                    )
+                )
+            self.last_fastv_stats = {
+                "enabled": True,
+                "prune_layer": prune_layer,
+                "prune_ratio": float(fastv_config["prune_ratio"]),
+                "tokens_before_pruning": original_sequence_length,
+                "tokens_after_pruning": int(keep_indices.numel()),
+                "visual_tokens_before_pruning": len(
+                    fastv_config["visual_token_indices"]
+                ),
+                "visual_tokens_after_pruning": int(
+                    fastv_config["visual_tokens_after_pruning"]
+                ),
+                "score_mode": fastv_config["score_mode"],
+                "score_layer_count": prune_layer,
+                "selection_scope": fastv_config["selection_scope"],
+                "retention_diagnostics": retention_diagnostics,
+            }
+        else:
+            self.last_fastv_stats = {
+                "enabled": False,
+                "tokens_before_pruning": original_sequence_length,
+                "tokens_after_pruning": original_sequence_length,
+            }
         hidden_states = hidden_states.view(output_shape)
         
         return hidden_states

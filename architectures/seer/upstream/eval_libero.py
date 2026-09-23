@@ -1,5 +1,6 @@
 import os
 import json
+import sys
 from pathlib import Path
 import random
 
@@ -12,14 +13,31 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from models.seer_model import SeerAgent
 from utils.arguments_utils import get_parser
 from utils.distributed_utils import init_distributed_device, world_info_from_env
-from utils.eval_utils_libero import eval_one_epoch_libero_ddp
+from utils.eval_utils_libero import (
+    eval_one_epoch_libero_ddp,
+    get_renderer_backend_metadata,
+)
 from utils.lrnode_logging_utils import save_lrnode_run_snapshots
+
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+if str(_WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_WORKSPACE_ROOT))
+from architectures.seer.adapters.latentloop_comparison import attach_comparison_adapter
+from architectures.seer.adapters.latentloop_plan_continuation import attach_plan_adapter
 
 
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
     np.random.seed(seed + rank)
     random.seed(seed + rank)
+
+
+def _attach_configured_plan_adapter(model, args):
+    """Preserve legacy plan adapters unless the Q1/Q2 protocol is explicit."""
+
+    if bool(getattr(args, "latentloop_comparison_protocol", 0)):
+        return attach_comparison_adapter(model, args)
+    return attach_plan_adapter(model, args)
 
 
 def _save_eval_args_snapshot(args):
@@ -34,7 +52,10 @@ def _save_eval_args_snapshot(args):
         out_dir = os.path.join(ckpt_dir, "analysis")
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    payload = {k: v for k, v in vars(args).items()}
+    payload = {
+        **{k: v for k, v in vars(args).items()},
+        "renderer_backend": get_renderer_backend_metadata(),
+    }
     out_path = os.path.join(out_dir, "args_snapshot.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, default=str)
@@ -57,7 +78,12 @@ def _is_lrnode_adapter_only_state_dict(state_dict):
     keys = list(state_dict.keys())
     if not keys:
         return False
-    has_lrnode = any("lrnode_" in key or ".lrnode" in key for key in keys)
+    has_lrnode = any(
+        "lrnode_" in key
+        or ".lrnode" in key
+        or "latentloop_plan_adapter" in key
+        for key in keys
+    )
     has_core_seer = any(
         marker in key
         for key in keys
@@ -74,14 +100,26 @@ def _is_lrnode_adapter_only_state_dict(state_dict):
 
 
 def _is_lrnode_state_key(key):
-    return key.startswith("module.lrnode_delta_encoder.") or key.startswith("module.lrnode_dynamics.")
+    return (
+        key.startswith("module.lrnode_delta_encoder.")
+        or key.startswith("module.lrnode_dynamics.")
+        or key.startswith("module.latentloop_plan_adapter.")
+    )
 
 
 def _expected_checkpoint_keys(ddp_model, checkpoint_kind):
     if checkpoint_kind == "adapter":
+        has_plan_adapter = hasattr(ddp_model.module, "latentloop_plan_adapter")
         return {
             name for name, _ in ddp_model.named_parameters()
-            if _is_lrnode_state_key(name)
+            if (
+                name.startswith("module.latentloop_plan_adapter.")
+                if has_plan_adapter
+                else (
+                    name.startswith("module.lrnode_delta_encoder.")
+                    or name.startswith("module.lrnode_dynamics.")
+                )
+            )
         }
     if checkpoint_kind == "base":
         return {
@@ -157,6 +195,14 @@ def main():
         print(f"[EVAL ARGS] use_lrnode_latent_update={bool(args.use_lrnode_latent_update)}")
         print(f"[EVAL ARGS] lrnode_eval_skip_full_forward={bool(args.lrnode_eval_skip_full_forward)}")
         print(f"[EVAL ARGS] lrnode_query_interval={args.lrnode_query_interval}")
+        print(
+            "[EVAL ARGS] "
+            f"latentloop_segment_grid_enable={bool(args.latentloop_segment_grid_enable)}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"latentloop_feedback_schedule={args.latentloop_feedback_schedule}"
+        )
         print(f"[EVAL ARGS] lrnode_eval_ablation_mode={args.lrnode_eval_ablation_mode}")
         print(f"[EVAL ARGS] lrnode_no_delta_mode={args.lrnode_no_delta_mode}")
         print(f"[EVAL ARGS] lrnode_chunk_token_policy={args.lrnode_chunk_token_policy}")
@@ -178,6 +224,32 @@ def main():
         print(f"[EVAL ARGS] lrnode_multistep_train={bool(args.lrnode_multistep_train)}")
         print(f"[EVAL ARGS] lrnode_train_max_horizon={args.lrnode_train_max_horizon}")
         print(f"[EVAL ARGS] lrnode_gate_init_bias={args.lrnode_gate_init_bias}")
+        print(
+            "[EVAL ARGS] "
+            f"fastv_enabled={bool(args.fastv_enabled)}, "
+            f"fastv_prune_layer={args.fastv_prune_layer}, "
+            f"fastv_prune_ratio={args.fastv_prune_ratio}, "
+            f"fastv_score_mode={args.fastv_score_mode}, "
+            "fastv_retention_diagnostics="
+            f"{bool(args.fastv_retention_diagnostics)}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"lrnode_every_step_filter_mode={args.lrnode_every_step_filter_mode}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"lrnode_every_step_filter_alpha={args.lrnode_every_step_filter_alpha}"
+        )
+        print(
+            "[EVAL ARGS] "
+            f"lrnode_every_step_filter_beta={args.lrnode_every_step_filter_beta}"
+        )
+        print(
+            "[EVAL ARGS] "
+            "lrnode_every_step_filter_diagnostics="
+            f"{bool(args.lrnode_every_step_filter_diagnostics)}"
+        )
     _save_eval_args_snapshot(args)
     random_seed(args.seed)
 
@@ -215,7 +287,17 @@ def main():
         lrnode_log_sanity=args.lrnode_log_sanity,
         lrnode_gate_init_bias=args.lrnode_gate_init_bias,
         lrnode_trace=args.lrnode_trace,
+        fastv_enabled=args.fastv_enabled,
+        fastv_prune_layer=args.fastv_prune_layer,
+        fastv_prune_ratio=args.fastv_prune_ratio,
+        fastv_score_mode=args.fastv_score_mode,
+        fastv_retention_diagnostics=args.fastv_retention_diagnostics,
     )
+    if args.rank == 0:
+        print(f"[FASTV CONFIG] {model.fastv_config}")
+    plan_adapter_status = _attach_configured_plan_adapter(model, args)
+    if args.rank == 0:
+        print(f"[LATENTLOOP PLAN ADAPTER] {plan_adapter_status}")
 
     random_seed(args.seed, args.rank)
     print(f"Start running LIBERO evaluation on rank {args.rank}.")
@@ -302,16 +384,37 @@ def main():
             ckpt = getattr(args, "resume_from_checkpoint", "")
             ckpt_dir = os.path.dirname(ckpt) if ckpt else os.path.join(os.getcwd(), "eval_analysis", args.run_name)
             analysis_dir = os.path.join(ckpt_dir, "analysis")
-        save_lrnode_run_snapshots(args, ddp_model, analysis_dir, repo_dir=os.getcwd())
+        save_lrnode_run_snapshots(
+            args,
+            ddp_model,
+            analysis_dir,
+            repo_dir=os.getcwd(),
+            extra_metadata={"renderer_backend": get_renderer_backend_metadata()},
+        )
 
     ddp_model.eval()
-    if args.finetune_type == "libero_10":
+    supported_libero_suites = {
+        "libero_spatial",
+        "libero_object",
+        "libero_goal",
+        "libero_10",
+    }
+    if args.finetune_type in supported_libero_suites:
         eval_one_epoch_libero_ddp(
             args=args,
             model=ddp_model,
             image_processor=model.image_processor,
             tokenizer=clip,
         )
+        if args.rank == 0:
+            _save_eval_args_snapshot(args)
+            save_lrnode_run_snapshots(
+                args,
+                ddp_model,
+                analysis_dir,
+                repo_dir=os.getcwd(),
+                extra_metadata={"renderer_backend": get_renderer_backend_metadata()},
+            )
     else:
         raise NotImplementedError
 

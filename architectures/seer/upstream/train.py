@@ -1,6 +1,7 @@
 import glob
 import os
 import json
+import sys
 from pathlib import Path
 import random
 from collections import OrderedDict
@@ -22,11 +23,25 @@ from utils.data_utils import get_calvin_dataset, get_calvin_val_dataset, get_dro
 from utils.distributed_utils import init_distributed_device, world_info_from_env  
 from utils.lrnode_logging_utils import save_lrnode_run_snapshots
 
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+if str(_WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_WORKSPACE_ROOT))
+from architectures.seer.adapters.latentloop_comparison import attach_comparison_adapter
+from architectures.seer.adapters.latentloop_plan_continuation import attach_plan_adapter
+
 
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
     np.random.seed(seed + rank)
     random.seed(seed + rank)
+
+
+def _attach_configured_plan_adapter(model, args):
+    """Route only the explicit Q1/Q2 protocol to the new comparison adapters."""
+
+    if bool(getattr(args, "latentloop_comparison_protocol", 0)):
+        return attach_comparison_adapter(model, args)
+    return attach_plan_adapter(model, args)
 
 def count_parameters(model):
     total_params = 0
@@ -42,18 +57,29 @@ def _is_lrnode_parameter(name):
     return name.startswith("lrnode_delta_encoder.") or name.startswith("lrnode_dynamics.")
 
 
+def _is_plan_parameter(name):
+    return name.startswith("latentloop_plan_adapter.")
+
+
 def _apply_lrnode_train_protocol(model, args):
     protocol = getattr(args, "lrnode_train_protocol", "joint")
     freeze_for_adapter = bool(getattr(args, "lrnode_freeze_seer_for_adapter", 0))
     assert_only_lrnode = bool(getattr(args, "lrnode_assert_only_lrnode_trainable", 0))
+    plan_mode = str(getattr(args, "latentloop_plan_adapter_mode", "off"))
 
     if protocol == "adapter":
         freeze_for_adapter = True
         args.lrnode_freeze_seer_for_adapter = 1
         if not bool(getattr(args, "use_lrnode_latent_update", 0)):
             raise ValueError("lrnode_train_protocol=adapter requires --use_lrnode_latent_update 1")
-        if not bool(getattr(args, "lrnode_train_latent_distill", 0)):
-            raise ValueError("lrnode_train_protocol=adapter requires --lrnode_train_latent_distill 1")
+        if (
+            plan_mode == "off"
+            and not bool(getattr(args, "lrnode_train_latent_distill", 0))
+        ):
+            raise ValueError(
+                "lrnode_train_protocol=adapter requires LR-NODE distillation or "
+                "a latentloop_plan_adapter_mode"
+            )
         if args.finetune_from_pretrained_ckpt is None and args.resume_from_checkpoint is None:
             raise ValueError(
                 "lrnode_train_protocol=adapter requires --finetune_from_pretrained_ckpt or --resume_from_checkpoint"
@@ -62,16 +88,24 @@ def _apply_lrnode_train_protocol(model, args):
     if freeze_for_adapter:
         for name, param in model.named_parameters():
             param.requires_grad_(False)
-            if _is_lrnode_parameter(name):
+            if (
+                _is_plan_parameter(name)
+                if plan_mode != "off"
+                else _is_lrnode_parameter(name)
+            ):
                 param.requires_grad_(True)
 
     non_lrnode_trainable = [
         name for name, param in model.named_parameters()
-        if param.requires_grad and not _is_lrnode_parameter(name)
+        if param.requires_grad
+        and not (
+            _is_plan_parameter(name) if plan_mode != "off" else _is_lrnode_parameter(name)
+        )
     ]
     lrnode_trainable = [
         name for name, param in model.named_parameters()
-        if param.requires_grad and _is_lrnode_parameter(name)
+        if param.requires_grad
+        and (_is_plan_parameter(name) if plan_mode != "off" else _is_lrnode_parameter(name))
     ]
 
     if assert_only_lrnode and non_lrnode_trainable:
@@ -81,10 +115,14 @@ def _apply_lrnode_train_protocol(model, args):
             f"{preview}"
         )
     if freeze_for_adapter and not lrnode_trainable:
-        raise RuntimeError("LR-NODE adapter protocol selected, but no LR-NODE parameters are trainable")
+        raise RuntimeError("Adapter protocol selected, but no selected adapter parameters are trainable")
 
     return {
         "protocol": protocol,
+        "plan_adapter_mode": plan_mode,
+        "plan_adapter_parameter_match": getattr(
+            model, "latentloop_plan_adapter_report", None
+        ),
         "freeze_for_adapter": freeze_for_adapter,
         "num_lrnode_trainable_tensors": len(lrnode_trainable),
         "num_non_lrnode_trainable_tensors": len(non_lrnode_trainable),
@@ -160,19 +198,25 @@ def _apply_precision_policy(model, args):
     return model
 
 
-def _load_raw_model_checkpoint(model, ckpt_path):
+def _load_raw_model_checkpoint(model, ckpt_path, allowed_prefixes=None):
     checkpoint = torch.load(ckpt_path, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     stripped = OrderedDict()
     for key, value in state_dict.items():
         if key.startswith("module."):
-            stripped[key[len("module."):]] = value
-        else:
-            stripped[key] = value
+            key = key[len("module."):]
+        if allowed_prefixes is not None and not key.startswith(tuple(allowed_prefixes)):
+            continue
+        stripped[key] = value
+    if not stripped:
+        raise RuntimeError(
+            f"No checkpoint keys matched allowed_prefixes={allowed_prefixes}: {ckpt_path}"
+        )
     missing, unexpected = model.load_state_dict(stripped, strict=False)
     return {
         "missing": list(missing),
         "unexpected": list(unexpected),
+        "loaded": sorted(stripped),
     }
 
 @record
@@ -193,6 +237,7 @@ def main(args):
     print("run_name:", args.run_name)
     _save_train_args_snapshot(args)
     model = _build_seer_agent_from_args(args, device_id)
+    plan_adapter_status = _attach_configured_plan_adapter(model, args)
     if args.finetune_type == "calvin":
         calvin_dataset = get_calvin_dataset(args, model.image_processor, clip, epoch=0, except_lang=args.except_lang)
     elif args.finetune_type == "droid":
@@ -205,6 +250,14 @@ def main(args):
         calvin_dataset = get_real_finetune_dataset(args, model.image_processor, clip, epoch=0)
     elif args.finetune_type == "oxe":
         calvin_dataset = get_oxe_dataset(args, model.image_processor, clip, epoch=0)
+    if args.rank == 0 and getattr(calvin_dataset, "split_manifest", None) is not None:
+        analysis_dir = Path(args.save_checkpoint_path) / args.run_name / "analysis"
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        split_path = analysis_dir / "dataset_split_manifest.json"
+        if split_path.exists():
+            raise FileExistsError(f"Refusing to overwrite split manifest: {split_path}")
+        with open(split_path, "w", encoding="utf-8") as handle:
+            json.dump(calvin_dataset.split_manifest, handle, indent=2)
     random_seed(args.seed, args.rank)
     print(f"Start running training on rank {args.rank}.")
     if args.rank == 0 and args.report_to_wandb:
@@ -274,9 +327,57 @@ def main(args):
         with open(os.path.join(analysis_dir, "lrnode_train_protocol_status.json"), "w", encoding="utf-8") as f:
             json.dump(lrnode_protocol_status, f, indent=2, default=str)
     ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=True)
-    optimizer = torch.optim.AdamW([p for p in ddp_model.parameters() if p.requires_grad], lr=args.learning_rate, weight_decay=args.weight_decay)  # TODO make sure the parameters which need to be optimized are passing
-    total_training_steps = calvin_dataset.dataloader.num_batches * args.num_epochs
-    args.warmup_steps = calvin_dataset.dataloader.num_batches * args.warmup_epochs
+    trainable_named_parameters = [
+        (name, parameter)
+        for name, parameter in ddp_model.named_parameters()
+        if parameter.requires_grad
+    ]
+    optimizer = torch.optim.AdamW([p for _, p in trainable_named_parameters], lr=args.learning_rate, weight_decay=args.weight_decay)  # TODO make sure the parameters which need to be optimized are passing
+    configured_target = int(
+        getattr(args, "latentloop_comparison_target_microbatches", 0)
+    )
+    total_training_steps = (
+        configured_target
+        if configured_target > 0
+        else calvin_dataset.dataloader.num_batches * args.num_epochs
+    )
+    configured_warmup = int(
+        getattr(args, "latentloop_comparison_warmup_microbatches", 0)
+    )
+    args.warmup_steps = (
+        configured_warmup
+        if configured_warmup > 0
+        else calvin_dataset.dataloader.num_batches * args.warmup_epochs
+    )
+    if args.rank == 0 and bool(getattr(args, "latentloop_comparison_protocol", 0)):
+        analysis_dir = Path(args.save_checkpoint_path) / args.run_name / "analysis"
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        optimizer_audit_path = analysis_dir / "optimizer_parameter_audit.json"
+        if optimizer_audit_path.exists():
+            raise FileExistsError(
+                f"Refusing to overwrite optimizer audit: {optimizer_audit_path}"
+            )
+        with open(optimizer_audit_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "optimizer": "AdamW",
+                    "learning_rate": args.learning_rate,
+                    "weight_decay": args.weight_decay,
+                    "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                    "target_microbatches": total_training_steps,
+                    "target_optimizer_steps": total_training_steps
+                    // args.gradient_accumulation_steps,
+                    "warmup_microbatches": args.warmup_steps,
+                    "trainable_parameters": sum(
+                        parameter.numel() for _, parameter in trainable_named_parameters
+                    ),
+                    "trainable_parameter_names": [
+                        name for name, _ in trainable_named_parameters
+                    ],
+                },
+                handle,
+                indent=2,
+            )
     if args.rank == 0:
         print(f"Total training steps: {total_training_steps}")
     if args.lr_scheduler == "linear":
@@ -312,6 +413,16 @@ def main(args):
             optimizer, num_warmup_steps=args.warmup_steps
         )
     resume_from_epoch = 0
+    if (
+        bool(getattr(args, "latentloop_comparison_protocol", 0))
+        and args.resume_from_checkpoint is not None
+    ):
+        raise ValueError(
+            "Comparison-protocol resume is disabled because the exact global "
+            "microbatch counter is not serialized yet. Start a fresh unique run "
+            "instead of silently changing the matched training budget."
+        )
+    args.latentloop_comparison_completed_microbatches = 0
     if args.finetune_from_pretrained_ckpt is not None:
         if args.rank == 0:
             print(f"Starting finetuning from pretrained checkpoint {args.finetune_from_pretrained_ckpt}")    
@@ -337,6 +448,48 @@ def main(args):
             checkpoint["model_state_dict"]["module.transformer_backbone_position_embedding"] = checkpoint["model_state_dict"]["module.transformer_backbone_position_embedding"][:, :args.sequence_length, :, :]
         print("loading pretrained weights :", checkpoint["model_state_dict"].keys())
         ddp_model.load_state_dict(checkpoint["model_state_dict"], False)
+    if args.lrnode_init_adapter_ckpt is not None:
+        if args.resume_from_checkpoint is not None:
+            raise ValueError(
+                "--lrnode_init_adapter_ckpt is model-only initialization and cannot "
+                "be combined with --resume_from_checkpoint"
+            )
+        if not os.path.isfile(args.lrnode_init_adapter_ckpt):
+            raise FileNotFoundError(args.lrnode_init_adapter_ckpt)
+        init_status = _load_raw_model_checkpoint(
+            ddp_model.module,
+            args.lrnode_init_adapter_ckpt,
+            allowed_prefixes=("lrnode_delta_encoder.", "lrnode_dynamics."),
+        )
+        expected_adapter_keys = {
+            name
+            for name, _ in ddp_model.module.named_parameters()
+            if _is_lrnode_parameter(name)
+        }
+        loaded_adapter_keys = set(init_status["loaded"])
+        missing_adapter_keys = sorted(expected_adapter_keys - loaded_adapter_keys)
+        extra_adapter_keys = sorted(loaded_adapter_keys - expected_adapter_keys)
+        if missing_adapter_keys or extra_adapter_keys:
+            raise RuntimeError(
+                "Model-only LR-NODE initialization contract failed: "
+                f"missing={missing_adapter_keys[:50]}, "
+                f"unexpected={extra_adapter_keys[:50]}"
+            )
+        unexpected = [
+            key for key in init_status["unexpected"] if "optimizer" not in key
+        ]
+        if unexpected:
+            raise RuntimeError(
+                "Unexpected keys in model-only adapter initialization: "
+                f"{unexpected[:50]}"
+            )
+        if args.rank == 0:
+            print(
+                "[LR-NODE MODEL-ONLY INIT] "
+                f"path={args.lrnode_init_adapter_ckpt} "
+                f"loaded={len(init_status['loaded'])} "
+                f"missing={len(init_status['missing'])} unexpected=0"
+            )
     if args.resume_from_checkpoint is not None:
         if args.rank == 0:
             print(f"Loading checkpoint from {args.resume_from_checkpoint}")
@@ -368,6 +521,9 @@ def main(args):
             f"lrnode_use_post_layernorm={bool(args.lrnode_use_post_layernorm)} "
             f"lrnode_multistep_train={bool(args.lrnode_multistep_train)} "
             f"lrnode_train_max_horizon={args.lrnode_train_max_horizon} "
+            f"lrnode_runtime_aligned_train={bool(args.lrnode_runtime_aligned_train)} "
+            f"lrnode_runtime_horizon={args.lrnode_runtime_horizon} "
+            f"lrnode_frozen_teacher_eval_mode={bool(args.lrnode_frozen_teacher_eval_mode)} "
             f"lrnode_gate_init_bias={args.lrnode_gate_init_bias}"
         )
     
@@ -375,7 +531,7 @@ def main(args):
     for epoch in range(resume_from_epoch, args.num_epochs):
         calvin_dataset.set_epoch(epoch)
         calvin_loader = calvin_dataset.dataloader
-        train_one_epoch_calvin(
+        budget_complete = train_one_epoch_calvin(
             args=args,
             model=ddp_model,
             seer_distill_teacher_model=seer_distill_teacher_model,
@@ -386,7 +542,13 @@ def main(args):
             device_id=device_id,
             wandb=wandb,
         )
-        if args.rank == 0 and args.save_checkpoint and epoch % args.save_checkpoint_seq == 0 and epoch > args.start_save_checkpoint:
+        if (
+            args.rank == 0
+            and args.save_checkpoint
+            and not bool(getattr(args, "latentloop_comparison_protocol", 0))
+            and epoch % args.save_checkpoint_seq == 0
+            and epoch > args.start_save_checkpoint
+        ):
             checkpoint_dict = {
                 "epoch": epoch,
                 "model_state_dict": get_checkpoint(ddp_model),
@@ -400,6 +562,27 @@ def main(args):
             if args.delete_previous_checkpoint:
                 if epoch > 0:
                     os.remove(ckpt_path)
+        if budget_complete:
+            if args.rank == 0:
+                completion_path = Path(ckpt_dir) / "analysis" / "training_budget_complete.json"
+                completion_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(completion_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "completed": True,
+                            "target_microbatches": int(
+                                args.latentloop_comparison_target_microbatches
+                            ),
+                            "target_optimizer_steps": int(
+                                args.latentloop_comparison_target_microbatches
+                                // args.gradient_accumulation_steps
+                            ),
+                            "terminal_epoch": epoch,
+                        },
+                        handle,
+                        indent=2,
+                    )
+            break
 
 if __name__ == "__main__":
     parser = get_parser()

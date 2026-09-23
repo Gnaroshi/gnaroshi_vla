@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UPSTREAM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
 # Scratch Seer baseline protocol for LR-NODE comparisons.
 # This trains the unmodified Seer policy from scratch in the current repository.
 # LR-NODE is explicitly disabled, and outputs are separated from old experiments.
@@ -29,12 +32,31 @@ echo "[TRAIN INFO] experiment_tag=${EXPERIMENT_TAG}"
 echo "[TRAIN INFO] run_name=${RUN_NAME}"
 echo "[TRAIN INFO] latest_pointer_after_success=${latest_dir}/scratch.env"
 
+if [[ ! -d "${root_dir}/${dataset}" ]]; then
+    echo "[ERROR] Missing converted dataset: ${root_dir}/${dataset}" >&2
+    exit 1
+fi
+if [[ ! -f "${vit_checkpoint_path}" ]]; then
+    echo "[ERROR] Missing ViT checkpoint: ${vit_checkpoint_path}" >&2
+    exit 1
+fi
+
+dataset_info_args=()
+if [[ -n "${LIBERO_DATASET_INFO_PATH:-}" ]]; then
+    dataset_info_args+=(--libero_dataset_info_path "${LIBERO_DATASET_INFO_PATH}")
+fi
+wandb_args=()
+if [[ "${REPORT_TO_WANDB:-1}" == "1" ]]; then
+    wandb_args+=(--report_to_wandb)
+fi
+
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 master_port="${MASTER_PORT:-10311}"
 node=1
 node_num="${NODE_NUM:-4}"
 
+cd "${UPSTREAM_DIR}"
 torchrun --nnodes=${node} --nproc_per_node=${node_num} --master_port=${master_port} train.py \
     --traj_cons \
     --rgb_pad 10 \
@@ -53,6 +75,8 @@ torchrun --nnodes=${node} --nproc_per_node=${node_num} --master_port=${master_po
     --learning_rate "${LEARNING_RATE:-1e-3}" \
     --save_checkpoint \
     --finetune_type libero_finetune \
+    --libero_dataset_name "${dataset}" \
+    "${dataset_info_args[@]}" \
     --root_dir "${root_dir}" \
     --wandb_project "${WANDB_PROJECT:-seer}" \
     --weight_decay 1e-4 \
@@ -73,7 +97,7 @@ torchrun --nnodes=${node} --nproc_per_node=${node_num} --master_port=${master_po
     --gripper_width \
     --warmup_epochs 5 \
     --libero_path "${libero_path}" \
-    --report_to_wandb \
+    "${wandb_args[@]}" \
     --multi_step_action 1 \
     --use_lrnode_latent_update 0 \
     --lrnode_train_latent_distill 0

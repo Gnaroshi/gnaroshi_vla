@@ -44,9 +44,9 @@ safe_tag() {
 which_server="${WHICH_SERVER:-sd1}"
 dataset="${DATASET:-libero_10_converted}"
 libero_path="${LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
-vit_checkpoint_path="${VIT_CHECKPOINT_PATH:-checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
+vit_checkpoint_path="${VIT_CHECKPOINT_PATH:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/vit_mae/mae_pretrain_vit_base.pth}"
 save_checkpoint_path="${SAVE_CHECKPOINT_PATH:-checkpoints/}"
-protocol_root="${LRNODE_PROTOCOL_ROOT:-/home/mingyujung/private/seer/seer_node3/runs_lrnode_protocol_20260616}"
+protocol_root="${LRNODE_PROTOCOL_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/seer/latentloop/runs}"
 latest_baseline="${BASELINE_ENV:-${protocol_root}/train/_latest/scratch.env}"
 latest_ours="${OURS_ENV:-${protocol_root}/train/_latest/scratch_node.env}"
 

@@ -1,12 +1,64 @@
 import sys, os
+from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
+if str(_WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_WORKSPACE_ROOT))
 
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-os.environ["PYOPENGL_PLATFORM"] = "osmesa"
-os.environ['MUJOCO_GL'] = 'osmesa'
 
-from pathlib import Path
+
+def _configure_libero_renderer_backend():
+    explicit_backend = os.environ.get("LIBERO_GL_BACKEND", "").strip().lower()
+    mujoco_gl = os.environ.get("MUJOCO_GL", "").strip().lower()
+    pyopengl_platform = os.environ.get("PYOPENGL_PLATFORM", "").strip().lower()
+
+    if explicit_backend:
+        backend = explicit_backend
+        configured_by = "LIBERO_GL_BACKEND"
+    else:
+        configured = {value for value in (mujoco_gl, pyopengl_platform) if value}
+        if len(configured) > 1:
+            raise RuntimeError(
+                "Conflicting renderer settings before LIBERO import: "
+                f"MUJOCO_GL={mujoco_gl!r}, PYOPENGL_PLATFORM={pyopengl_platform!r}. "
+                "Set LIBERO_GL_BACKEND explicitly to 'osmesa' or 'egl'."
+            )
+        backend = next(iter(configured), "osmesa")
+        configured_by = (
+            "MUJOCO_GL/PYOPENGL_PLATFORM" if configured else "default_osmesa"
+        )
+
+    if backend not in {"osmesa", "egl"}:
+        raise ValueError(
+            f"Unsupported LIBERO_GL_BACKEND={backend!r}; expected 'osmesa' or 'egl'."
+        )
+
+    # Renderer selection must happen before robosuite, MuJoCo, or PyOpenGL imports.
+    os.environ["LIBERO_GL_BACKEND"] = backend
+    os.environ["MUJOCO_GL"] = backend
+    os.environ["PYOPENGL_PLATFORM"] = backend
+    return {
+        "schema_version": 1,
+        "requested_backend": backend,
+        "effective_backend": backend,
+        "configured_by": configured_by,
+        "mujoco_gl": backend,
+        "pyopengl_platform": backend,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "render_gpu_device_id": None,
+        "actual_gl_vendor": None,
+        "actual_gl_renderer": None,
+        "actual_gl_version": None,
+        "backend_classification": "unverified",
+        "actual_context_verified": False,
+        "verification_method": "configured_environment_only",
+    }
+
+
+_RENDERER_BACKEND_METADATA = _configure_libero_renderer_backend()
+
 import copy
 import fcntl
 import io
@@ -25,7 +77,28 @@ from scipy.spatial.transform import Rotation as R
 from tqdm.auto import tqdm
 
 from utils.data_utils import preprocess_image, preprocess_text_calvin
+from utils.lrnode_mechanism_utils import (
+    action_second_differences,
+    capture_rng_state,
+    classify_transition,
+    counterfactual_requires_skip_shadow,
+    deterministic_step_seed,
+    extract_simulator_signals,
+    fuse_latents,
+    gripper_summary,
+    matched_random_latent,
+    mix_action_tokens,
+    preserve_rng_state,
+    rng_states_equal,
+    save_trace_episode,
+    temporal_ensemble_probability,
+)
 from utils.train_utils import get_cast_dtype
+from architectures.seer.adapters.latentloop_plan_continuation.trace_adapter import (
+    save_plan_trace_episode,
+)
+from methods.latentloop_plan_continuation.action_correction import shift_action_horizon
+from methods.latentloop_plan_continuation.feedback_source import FeedbackFeatureBuffer
 
 try:
     import imageio.v2 as imageio
@@ -67,7 +140,112 @@ def _is_rank0() -> bool:
         return True
 
 
+def get_renderer_backend_metadata():
+    return copy.deepcopy(_RENDERER_BACKEND_METADATA)
+
+
+def _renderer_gpu_device_id(local_device_id: int) -> int:
+    """Map a torch local rank to the physical EGL device expected by this robosuite."""
+    if _RENDERER_BACKEND_METADATA["effective_backend"] != "egl":
+        return int(local_device_id)
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return int(local_device_id)
+    try:
+        physical_ids = [int(item.strip()) for item in visible.split(",")]
+    except ValueError as exc:
+        raise RuntimeError(
+            "This robosuite EGL backend requires numeric CUDA_VISIBLE_DEVICES entries; "
+            f"got {visible!r}."
+        ) from exc
+    if not 0 <= int(local_device_id) < len(physical_ids):
+        raise RuntimeError(
+            f"Local render device {local_device_id} is outside CUDA_VISIBLE_DEVICES={visible!r}."
+        )
+    return physical_ids[int(local_device_id)]
+
+
+def _decode_gl_string(value):
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def verify_renderer_backend(env, render_gpu_device_id: int):
+    """Query the active OpenGL context and reject software fallback for strict EGL runs."""
+    context = getattr(env.sim, "_render_context_offscreen", None)
+    if context is None:
+        raise RuntimeError("LIBERO environment has no offscreen render context to verify.")
+    gl_context = getattr(context, "gl_ctx", None)
+    if gl_context is None or not hasattr(gl_context, "make_current"):
+        raise RuntimeError("LIBERO offscreen context does not expose an active GL context.")
+    gl_context.make_current()
+
+    from OpenGL import GL
+
+    vendor = _decode_gl_string(GL.glGetString(GL.GL_VENDOR))
+    renderer = _decode_gl_string(GL.glGetString(GL.GL_RENDERER))
+    version = _decode_gl_string(GL.glGetString(GL.GL_VERSION))
+    combined = " ".join(value or "" for value in (vendor, renderer)).lower()
+    is_software = any(
+        token in combined
+        for token in ("llvmpipe", "softpipe", "software rasterizer", "mesa/x.org")
+    )
+    requested = _RENDERER_BACKEND_METADATA["requested_backend"]
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if is_software:
+        classification = "software_osmesa"
+    elif requested == "egl":
+        classification = "hardware_egl"
+    else:
+        classification = "nonsoftware_context"
+
+    _RENDERER_BACKEND_METADATA.update(
+        {
+            "render_gpu_device_id": int(render_gpu_device_id),
+            "process_rank": int(rank),
+            "actual_gl_vendor": vendor,
+            "actual_gl_renderer": renderer,
+            "actual_gl_version": version,
+            "backend_classification": classification,
+            "actual_context_verified": bool(vendor and renderer and version),
+            "verification_method": "active_opengl_context_glGetString",
+        }
+    )
+
+    strict = os.environ.get("LIBERO_GL_REQUIRE_ACTUAL", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if strict and not _RENDERER_BACKEND_METADATA["actual_context_verified"]:
+        raise RuntimeError(
+            "Strict renderer verification failed: GL_VENDOR/GL_RENDERER/GL_VERSION "
+            f"were not all available: {get_renderer_backend_metadata()}"
+        )
+    if strict and requested == "egl" and is_software:
+        raise RuntimeError(
+            "Strict EGL verification detected a software OpenGL renderer: "
+            f"{get_renderer_backend_metadata()}"
+        )
+
+    if not getattr(verify_renderer_backend, "_printed_ranks", None):
+        verify_renderer_backend._printed_ranks = set()
+    if rank not in verify_renderer_backend._printed_ranks:
+        print(
+            "[LIBERO RENDERER] "
+            f"rank={rank} backend={requested} render_gpu_device_id={render_gpu_device_id} "
+            f"vendor={vendor!r} renderer={renderer!r} version={version!r} "
+            f"classification={classification}"
+        )
+        verify_renderer_backend._printed_ranks.add(rank)
+    return get_renderer_backend_metadata()
+
+
 def _atomic_write_json(path: Path, payload) -> None:
+    if isinstance(payload, dict) and "renderer_backend" not in payload:
+        payload = {**payload, "renderer_backend": get_renderer_backend_metadata()}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
@@ -83,6 +261,7 @@ def _write_live_eval_progress(
     total_sequences: int,
     local_assigned: int,
     last_eval_id: int,
+    started_at_unix_s: float,
 ) -> None:
     """Persist asynchronous completed-episode SR without synchronizing DDP ranks."""
     log_dir = os.environ.get("LOG_DIR")
@@ -121,6 +300,7 @@ def _write_live_eval_progress(
             "last_episode_id": int(last_eval_id) % int(num_eval_episodes),
             "last_success": bool(local_results[-1]),
             "task_progress": task_progress,
+            "started_at_unix_s": float(started_at_unix_s),
             "updated_at_unix_s": time.time(),
         }
         rank_path = analysis_dir / f"eval_progress_rank{rank}.json"
@@ -158,6 +338,14 @@ def _write_live_eval_progress(
                     float(item["successes"]) / item["completed"] if item["completed"] else 0.0
                 )
 
+            now = time.time()
+            aggregate_started_at = min(
+                float(item.get("started_at_unix_s", now)) for item in rank_payloads
+            ) if rank_payloads else now
+            elapsed_s = max(0.0, now - aggregate_started_at)
+            episodes_per_s = float(completed) / elapsed_s if elapsed_s > 0.0 else 0.0
+            remaining = max(0, int(total_sequences) - completed)
+            eta_s = float(remaining) / episodes_per_s if episodes_per_s > 0.0 else None
             aggregate = {
                 "schema_version": 1,
                 "status": "complete" if completed == int(total_sequences) else "running",
@@ -169,13 +357,25 @@ def _write_live_eval_progress(
                 "ranks_reporting": len(rank_payloads),
                 "world_size": world_size,
                 "task_progress": aggregate_tasks,
-                "updated_at_unix_s": time.time(),
+                "started_at_unix_s": aggregate_started_at,
+                "elapsed_s": elapsed_s,
+                "episodes_per_s": episodes_per_s,
+                "remaining": remaining,
+                "eta_s": eta_s,
+                "estimated_completion_unix_s": now + eta_s if eta_s is not None else None,
+                "updated_at_unix_s": now,
             }
             _atomic_write_json(analysis_dir / "eval_progress.json", aggregate)
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
+        eta_text = (
+            f"{aggregate['eta_s'] / 3600.0:.2f}h"
+            if aggregate["eta_s"] is not None
+            else "pending"
+        )
         print(
             f"[EVAL PROGRESS] completed={completed}/{total_sequences} "
+            f"remaining={aggregate['remaining']} eta={eta_text} "
             f"successes={successes} completed_sr={100.0 * aggregate['completed_success_rate']:.2f}% "
             f"ranks={len(rank_payloads)}/{world_size} last_rank={rank} "
             f"last_task={rank_payload['last_task_id']} last_episode={rank_payload['last_episode_id']} "
@@ -265,9 +465,36 @@ class ModelWrapper:
                  lrnode_eval_profile_full_action_head=0,
                  lrnode_eval_refresh_policy="periodic", lrnode_eval_max_full_forwards_per_episode=1,
                  lrnode_eval_ablation_mode="stepwise", lrnode_no_delta_mode="zero",
-                 lrnode_chunk_token_policy="skip_only"):
+                 lrnode_chunk_token_policy="skip_only", lrnode_mechanism_trace=0,
+                 lrnode_trace_save_latents=0, lrnode_trace_episode_limit=0,
+                 lrnode_trace_output_dir="", lrnode_counterfactual_mode="standard",
+                 lrnode_counterfactual_mix_stage="pre_ensemble",
+                 lrnode_latent_fusion_alpha=0.0, lrnode_latent_fusion_mode="every_step",
+                 lrnode_matched_random_seed=20260724,
+                 lrnode_matched_random_norm_mode="per_token",
+                 lrnode_every_step_filter_mode="off",
+                 lrnode_every_step_filter_alpha=0.5,
+                 lrnode_every_step_filter_beta=0.5,
+                 lrnode_every_step_filter_diagnostics=0,
+                 latentloop_segment_grid_enable=0,
+                 latentloop_feedback_schedule="dense",
+                 latentloop_same_input_stochasticity_repeats=0,
+                 latentloop_same_input_stochasticity_output="",
+                 latentloop_plan_trace=0,
+                 latentloop_plan_trace_save_latents=0,
+                 latentloop_plan_trace_output_dir="",
+                 latentloop_plan_trace_row_id="",
+                 latentloop_plan_trace_paired_group="",
+                 latentloop_feedback_source="current",
+                 latentloop_plan_adapter_mode="off"):
         super().__init__()
         self.model = model
+        base_model = self._base_model()
+        self.fastv_config = dict(getattr(base_model, "fastv_config", {}))
+        self.fastv_enabled = bool(self.fastv_config.get("enabled", False))
+        self.fastv_runtime_calls = 0
+        self.fastv_runtime_mismatches = 0
+        self.fastv_last_runtime_stats = None
         self.cast_type = cast_dtype
         self.text_process_fn = functools.partial(preprocess_text_calvin, tokenizer=tokenizer)
         self.image_process_fn = functools.partial(preprocess_image, image_processor=image_processor)
@@ -292,6 +519,144 @@ class ModelWrapper:
         self.lrnode_eval_step_log = bool(lrnode_eval_step_log)
         self.lrnode_eval_shadow_full_forward = bool(lrnode_eval_shadow_full_forward)
         self.lrnode_eval_profile_full_action_head = bool(lrnode_eval_profile_full_action_head)
+        self.latentloop_plan_trace = bool(latentloop_plan_trace)
+        self.latentloop_plan_trace_save_latents = bool(
+            latentloop_plan_trace_save_latents
+        )
+        self.latentloop_plan_trace_output_dir = str(
+            latentloop_plan_trace_output_dir
+        ).strip()
+        self.latentloop_plan_trace_row_id = str(latentloop_plan_trace_row_id).strip()
+        self.latentloop_plan_trace_paired_group = str(
+            latentloop_plan_trace_paired_group
+        ).strip()
+        self.lrnode_mechanism_trace = bool(lrnode_mechanism_trace)
+        self.lrnode_trace_save_latents = bool(lrnode_trace_save_latents)
+        self.lrnode_trace_episode_limit = max(0, int(lrnode_trace_episode_limit))
+        self.lrnode_trace_output_dir = str(lrnode_trace_output_dir).strip()
+        self.lrnode_counterfactual_mode = str(lrnode_counterfactual_mode)
+        self.lrnode_counterfactual_mix_stage = str(lrnode_counterfactual_mix_stage)
+        self.lrnode_latent_fusion_alpha = float(lrnode_latent_fusion_alpha)
+        self.lrnode_latent_fusion_mode = str(lrnode_latent_fusion_mode)
+        self.lrnode_matched_random_seed = int(lrnode_matched_random_seed)
+        self.lrnode_matched_random_norm_mode = str(lrnode_matched_random_norm_mode)
+        self.lrnode_every_step_filter_mode = str(lrnode_every_step_filter_mode)
+        self.lrnode_every_step_filter_alpha = float(lrnode_every_step_filter_alpha)
+        self.lrnode_every_step_filter_beta = float(lrnode_every_step_filter_beta)
+        self.lrnode_every_step_filter_diagnostics = bool(
+            lrnode_every_step_filter_diagnostics
+        )
+        self.latentloop_segment_grid_enable = bool(
+            latentloop_segment_grid_enable
+        )
+        self.latentloop_feedback_schedule = str(
+            latentloop_feedback_schedule
+        )
+        self.latentloop_segment_executor = None
+        self.latentloop_same_input_stochasticity_repeats = int(
+            latentloop_same_input_stochasticity_repeats
+        )
+        self.latentloop_same_input_stochasticity_output = str(
+            latentloop_same_input_stochasticity_output
+        ).strip()
+        self.latentloop_same_input_stochasticity_done = False
+        self.latentloop_feedback_source = str(latentloop_feedback_source)
+        self.latentloop_feedback_buffer = FeedbackFeatureBuffer(
+            self.latentloop_feedback_source
+        )
+        self.latentloop_plan_adapter_mode = str(latentloop_plan_adapter_mode)
+        if self.latentloop_plan_adapter_mode != "off":
+            base_model = self._base_model()
+            if not hasattr(base_model, "latentloop_plan_adapter"):
+                raise RuntimeError(
+                    "Plan adapter mode was requested but the model has no attached adapter"
+                )
+            attached_mode = str(base_model.latentloop_plan_adapter.mode)
+            if attached_mode != self.latentloop_plan_adapter_mode:
+                raise RuntimeError(
+                    f"Attached plan adapter mode={attached_mode}, requested="
+                    f"{self.latentloop_plan_adapter_mode}"
+                )
+            if not (self.use_lrnode_latent_update and self.lrnode_eval_skip_full_forward):
+                raise ValueError(
+                    "Plan adapter evaluation requires the existing periodic skip schedule"
+                )
+        if self.latentloop_feedback_source == "time_shifted":
+            if not (self.use_lrnode_latent_update and self.lrnode_eval_skip_full_forward):
+                raise ValueError("time-shifted feedback requires the LatentLoop skip path")
+            if self.latentloop_plan_adapter_mode != "off":
+                raise ValueError(
+                    "time-shifted feedback isolates the recurrent LatentLoop updater and "
+                    "cannot be combined with a matched baseline adapter"
+                )
+        if self.latentloop_same_input_stochasticity_repeats < 0:
+            raise ValueError(
+                "latentloop_same_input_stochasticity_repeats must be non-negative"
+            )
+        self.lrnode_every_step_filter = None
+        if self.lrnode_every_step_filter_mode != "off":
+            workspace_root = str(Path(__file__).resolve().parents[4])
+            if workspace_root not in sys.path:
+                sys.path.insert(0, workspace_root)
+            from architectures.seer.adapters.latent_prediction_correction import (
+                SeerLatentFilterAdapter,
+            )
+
+            self.lrnode_every_step_filter = SeerLatentFilterAdapter(
+                mode=self.lrnode_every_step_filter_mode,
+                alpha=self.lrnode_every_step_filter_alpha,
+                beta=self.lrnode_every_step_filter_beta,
+            )
+            if not self.use_lrnode_latent_update:
+                raise ValueError(
+                    "lrnode_every_step_filter_mode requires "
+                    "use_lrnode_latent_update=1"
+                )
+            if self.lrnode_eval_skip_full_forward:
+                raise ValueError(
+                    "Every-step latent filtering requires "
+                    "lrnode_eval_skip_full_forward=0"
+                )
+            if self.lrnode_query_interval != 1:
+                raise ValueError(
+                    "Every-step latent filtering requires lrnode_query_interval=1"
+                )
+            if self.lrnode_counterfactual_mode != "standard":
+                raise ValueError(
+                    "Every-step latent filtering cannot be combined with "
+                    "lrnode_counterfactual_mode"
+                )
+            if self.lrnode_eval_shadow_full_forward:
+                raise ValueError(
+                    "Every-step latent filtering already executes full Seer every step; "
+                    "set lrnode_eval_shadow_full_forward=0"
+                )
+        valid_counterfactual_modes = {
+            "standard",
+            "full_arm_full_gripper",
+            "lr_arm_lr_gripper",
+            "lr_arm_full_gripper",
+            "full_arm_lr_gripper",
+            "latent_fusion",
+            "matched_random",
+        }
+        if self.lrnode_counterfactual_mode not in valid_counterfactual_modes:
+            raise ValueError(
+                f"Unknown lrnode_counterfactual_mode={self.lrnode_counterfactual_mode}; "
+                f"expected one of {sorted(valid_counterfactual_modes)}"
+            )
+        if self.lrnode_counterfactual_mix_stage != "pre_ensemble":
+            raise ValueError("Only pre_ensemble arm/gripper mixing is implemented")
+        if not 0.0 <= self.lrnode_latent_fusion_alpha <= 1.0:
+            raise ValueError("lrnode_latent_fusion_alpha must be in [0, 1]")
+        if self.lrnode_latent_fusion_mode not in {"every_step", "soft_reset_only"}:
+            raise ValueError("lrnode_latent_fusion_mode must be every_step or soft_reset_only")
+        if self.lrnode_matched_random_norm_mode not in {"per_token", "global"}:
+            raise ValueError("lrnode_matched_random_norm_mode must be per_token or global")
+        if self.lrnode_counterfactual_mode != "standard" and not self.lrnode_eval_shadow_full_forward:
+            raise ValueError(
+                "Non-standard lrnode_counterfactual_mode requires lrnode_shadow_full_forward=1"
+            )
         self.lrnode_eval_refresh_policy = str(lrnode_eval_refresh_policy)
         if self.lrnode_eval_refresh_policy not in {"periodic", "first_only", "fixed_budget"}:
             raise ValueError(f"Unknown lrnode_eval_refresh_policy={self.lrnode_eval_refresh_policy}")
@@ -304,6 +669,13 @@ class ModelWrapper:
             raise ValueError(
                 f"Unknown lrnode_eval_ablation_mode={self.lrnode_eval_ablation_mode}; "
                 f"expected one of {sorted(valid_ablation_modes)}"
+            )
+        if (
+            self.lrnode_counterfactual_mode != "standard"
+            and self.lrnode_eval_ablation_mode != "stepwise"
+        ):
+            raise ValueError(
+                "Counterfactual mechanism modes require lrnode_eval_ablation_mode=stepwise"
             )
         self.lrnode_no_delta_mode = str(lrnode_no_delta_mode)
         if self.lrnode_no_delta_mode not in {"zero", "learned_constant", "previous"}:
@@ -319,12 +691,53 @@ class ModelWrapper:
                 "Only lrnode_chunk_token_policy=skip_only is implemented for "
                 "seer_token_chunk ablation"
             )
+        if self.latentloop_segment_grid_enable:
+            if not (
+                self.use_lrnode_latent_update
+                and self.lrnode_eval_skip_full_forward
+            ):
+                raise ValueError(
+                    "latentloop_segment_grid_enable=1 requires the existing "
+                    "LatentLoop skip path"
+                )
+            if self.lrnode_eval_refresh_policy != "periodic":
+                raise ValueError(
+                    "LatentLoop segment-grid execution requires periodic refresh"
+                )
+            if self.lrnode_eval_ablation_mode != "stepwise":
+                raise ValueError(
+                    "Feedback schedules require lrnode_eval_ablation_mode=stepwise; "
+                    "hold and replay baselines run with the segment-grid flag off"
+                )
+            if self.lrnode_every_step_filter is not None:
+                raise ValueError(
+                    "LatentLoop segment-grid execution cannot be combined with "
+                    "every-step latent filtering"
+                )
+            if self.lrnode_counterfactual_mode != "standard":
+                raise ValueError(
+                    "LatentLoop segment-grid execution cannot be combined with "
+                    "counterfactual execution modes"
+                )
+            workspace_root = str(Path(__file__).resolve().parents[4])
+            if workspace_root not in sys.path:
+                sys.path.insert(0, workspace_root)
+            from architectures.seer.adapters.latentloop_segment_grid import (
+                LatentLoopSegmentExecutor,
+            )
+
+            self.latentloop_segment_executor = LatentLoopSegmentExecutor(
+                segment_length=self.lrnode_query_interval,
+                feedback_schedule=self.latentloop_feedback_schedule,
+            )
         self.lrnode_episode_full_forward_calls = 0
         self.lrnode_cached_latent = None
         self.lrnode_cached_image_primary = None
         self.lrnode_cached_image_wrist = None
         self.lrnode_cached_state = None
         self.lrnode_cached_action_tokens = None
+        self.lrnode_cached_action_arm = None
+        self.lrnode_cached_gripper_logit = None
         self.lrnode_cached_env_action = None
         self.lrnode_cached_age = 0
         self.lrnode_last_full_timestep = None
@@ -336,6 +749,9 @@ class ModelWrapper:
         self.hold_latent_steps = 0
         self.chunk_token_steps = 0
         self.no_delta_steps = 0
+        self.observation_conditioned_update_calls = 0
+        self.zero_feature_update_calls = 0
+        self.observation_cache_advance_calls = 0
         self.full_forward_latency_sum = 0.0
         self.full_action_head_latency_sum = 0.0
         self.full_non_action_head_latency_sum = 0.0
@@ -354,11 +770,45 @@ class ModelWrapper:
         self.shadow_action_l2_sum = 0.0
         self.shadow_action_hold_l1_sum = 0.0
         self.shadow_age_stats = {}
+        self.counterfactual_arm_lr_steps = 0
+        self.counterfactual_arm_full_steps = 0
+        self.counterfactual_gripper_lr_steps = 0
+        self.counterfactual_gripper_full_steps = 0
+        self.counterfactual_latent_fusion_steps = 0
+        self.counterfactual_matched_random_steps = 0
+        self.every_step_filter_prior_calls = 0
+        self.every_step_filter_fusion_calls = 0
+        self.every_step_filter_action_head_calls = 0
+        self.every_step_filter_diagnostic_action_head_calls = 0
+        self.every_step_filter_prior_latency_sum = 0.0
+        self.every_step_filter_fusion_latency_sum = 0.0
+        self.every_step_filter_action_head_latency_sum = 0.0
+        self.every_step_filter_diagnostic_latency_sum = 0.0
+        self.every_step_filter_rng_checks = 0
+        self.every_step_filter_rng_failures = 0
         self.current_step_records = []
+        self.current_trace_scalars = []
+        self.current_trace_tensors = []
+        self.current_plan_trace_scalars = []
+        self.current_plan_trace_tensors = []
+        self.previous_raw_primary = None
+        self.previous_raw_wrist = None
+        self.previous_raw_proprio = None
+        self.latentloop_anchor_latent = None
+        self.latentloop_anchor_image_primary = None
+        self.latentloop_anchor_image_wrist = None
+        self.latentloop_anchor_state = None
         self.episode_metrics = []
         self.current_episode_start_time = None
+        self.current_task_id = -1
+        self.current_task_name = ""
+        self.current_episode_id = -1
+        self.trace_episode_count = 0
+        self.previous_step_was_full = None
         self.last_action = None
         self.last_action_delta = None
+        if self.lrnode_every_step_filter is not None:
+            self.lrnode_every_step_filter.reset()
         setattr(self._base_model(), "profile_full_action_head", self.lrnode_eval_profile_full_action_head)
         if self.lrnode_eval_skip_full_forward:
             base_model = self._base_model()
@@ -372,6 +822,9 @@ class ModelWrapper:
                     7,
                 ]
             ).to(self.device)
+            self.shadow_all_time_actions = torch.zeros_like(self.all_time_actions)
+        else:
+            self.shadow_all_time_actions = None
 
     def reset(self):
         self.img_queue = deque(maxlen=self.history_len)
@@ -386,14 +839,31 @@ class ModelWrapper:
         self.lrnode_cached_image_wrist = None
         self.lrnode_cached_state = None
         self.lrnode_cached_action_tokens = None
+        self.lrnode_cached_action_arm = None
+        self.lrnode_cached_gripper_logit = None
         self.lrnode_cached_env_action = None
         self.lrnode_cached_age = 0
         self.lrnode_last_full_timestep = None
         self.lrnode_episode_full_forward_calls = 0
         self.current_step_records = []
+        self.current_trace_scalars = []
+        self.current_trace_tensors = []
+        self.current_plan_trace_scalars = []
+        self.current_plan_trace_tensors = []
+        self.previous_raw_primary = None
+        self.previous_raw_wrist = None
+        self.previous_raw_proprio = None
+        self.latentloop_anchor_latent = None
+        self.latentloop_anchor_image_primary = None
+        self.latentloop_anchor_image_wrist = None
+        self.latentloop_anchor_state = None
+        self.latentloop_feedback_buffer.reset()
         self.current_episode_start_time = time.perf_counter()
+        self.previous_step_was_full = None
         self.last_action = None
         self.last_action_delta = None
+        if self.lrnode_every_step_filter is not None:
+            self.lrnode_every_step_filter.reset()
         if self.use_ensembling:
             self.all_time_actions = torch.zeros(
                 [
@@ -402,8 +872,16 @@ class ModelWrapper:
                     7,
                 ]
             ).to(self.device)
+            self.shadow_all_time_actions = torch.zeros_like(self.all_time_actions)
+        else:
+            self.shadow_all_time_actions = None
 
         self.cnt += 1
+
+    def set_episode_context(self, task, env):
+        self.current_task_id = int(getattr(env, "task_id", -1))
+        self.current_task_name = str(getattr(task, "name", getattr(env, "task_name", "")))
+        self.current_episode_id = int(getattr(env, "exp_id", -1))
 
     def _base_model(self):
         return self.model.module if hasattr(self.model, "module") else self.model
@@ -417,29 +895,55 @@ class ModelWrapper:
             return num_step - 1
         return -1
 
-    def _action_sequence_to_env_action(self, action_seq, timestep):
+    def _action_sequence_to_probability_action(self, action_seq, timestep, ensemble_buffer):
         if action_seq.dim() != 3 or action_seq.shape[0] != 1 or action_seq.shape[-1] != 7:
             raise RuntimeError(f"Expected action sequence [1, action_pred_steps, 7], got {tuple(action_seq.shape)}")
 
         if self.use_ensembling:
-            self.all_time_actions[timestep:timestep + 1, timestep:timestep + self.action_pred_steps] = action_seq
-            actions_for_curr_step = self.all_time_actions[:, timestep]
-            actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
-            actions_for_curr_step = actions_for_curr_step[actions_populated]
-            k = self.ensembling_temp
-            exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-            exp_weights = exp_weights / exp_weights.sum()
-            exp_weights = torch.from_numpy(exp_weights).to(self.device).unsqueeze(dim=1)
-            action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+            if ensemble_buffer is None:
+                raise RuntimeError("Temporal ensembling requires an explicit branch-local buffer")
+            action, candidate_count = temporal_ensemble_probability(
+                action_seq,
+                timestep,
+                ensemble_buffer,
+                self.ensembling_temp,
+            )
         else:
             action = action_seq[:, 0]
+            candidate_count = 1
+        return action, candidate_count
 
+    def _threshold_probability_action(self, action):
         action = torch.concat((action[:, :6], action[:, 6:] > 0.5), dim=-1)
         action[:, -1] = (action[:, -1] - 0.5) * 2
         action = action.detach().cpu().numpy()[-1]
         if action.shape != (7,):
             raise RuntimeError(f"LIBERO action must have shape (7,), got {action.shape}")
         return action
+
+    def _action_sequence_to_env_action(self, action_seq, timestep):
+        action_probability, candidate_count = self._action_sequence_to_probability_action(
+            action_seq,
+            timestep,
+            self.all_time_actions if self.use_ensembling else None,
+        )
+        return (
+            self._threshold_probability_action(action_probability),
+            action_probability.detach(),
+            candidate_count,
+        )
+
+    def _shadow_action_sequence_to_env_action(self, action_seq, timestep):
+        action_probability, candidate_count = self._action_sequence_to_probability_action(
+            action_seq,
+            timestep,
+            self.shadow_all_time_actions if self.use_ensembling else None,
+        )
+        return (
+            self._threshold_probability_action(action_probability),
+            action_probability.detach(),
+            candidate_count,
+        )
 
     def _raw_action_token_to_env_action(self, action_token):
         if action_token.dim() == 3:
@@ -454,6 +958,121 @@ class ModelWrapper:
         if action.shape != (7,):
             raise RuntimeError(f"LIBERO action must have shape (7,), got {action.shape}")
         return action
+
+    def _run_same_input_stochasticity_sanity(
+        self,
+        input_image_primary,
+        input_image_wrist,
+        input_state,
+        input_text_token,
+        selected_step,
+        timestep,
+    ):
+        """Repeat one fixed preprocessed full-Seer input without changing rollout RNG."""
+
+        repeats = self.latentloop_same_input_stochasticity_repeats
+        if repeats <= 0 or self.latentloop_same_input_stochasticity_done:
+            return None
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+            raise RuntimeError(
+                "Same-input stochasticity sanity requires NODE_NUM=1 so one fixed "
+                "input produces exactly one artifact"
+            )
+
+        workspace_root = str(Path(__file__).resolve().parents[4])
+        if workspace_root not in sys.path:
+            sys.path.insert(0, workspace_root)
+        from methods.latentloop_segment_grid.serialization import atomic_write_json
+        from methods.latentloop_segment_grid.stochasticity import (
+            array_fingerprint,
+            summarize_repeated_outputs,
+        )
+
+        latents = []
+        raw_actions = []
+        executed_actions = []
+        with preserve_rng_state(include_cuda=True):
+            for _ in range(repeats):
+                outputs = self.model(
+                    image_primary=input_image_primary,
+                    image_wrist=input_image_wrist,
+                    state=input_state,
+                    text_token=input_text_token,
+                    action=torch.zeros(
+                        1, self.history_len, 7, device=input_state.device
+                    ),
+                    return_action_latent=True,
+                )
+                if not isinstance(outputs, dict):
+                    raise RuntimeError(
+                        "return_action_latent=True must return the Seer output dictionary"
+                    )
+                latent = outputs["action_latent"][:, selected_step]
+                raw_action = torch.cat(
+                    [
+                        outputs["arm_pred_action"][:, selected_step],
+                        outputs["gripper_pred_action"][:, selected_step],
+                    ],
+                    dim=-1,
+                )
+                if self.use_ensembling:
+                    ensemble_buffer = torch.zeros_like(self.all_time_actions)
+                else:
+                    ensemble_buffer = None
+                probability, _ = self._action_sequence_to_probability_action(
+                    raw_action,
+                    timestep,
+                    ensemble_buffer,
+                )
+                executed = self._threshold_probability_action(probability)
+                latents.append(latent.detach().float().cpu().numpy())
+                raw_actions.append(raw_action.detach().float().cpu().numpy())
+                executed_actions.append(np.asarray(executed, dtype=np.float32))
+
+        payload = {
+            "schema_version": 1,
+            "diagnostic": "same_preprocessed_input_full_seer_stochasticity",
+            "repeat_count": repeats,
+            "model_training": bool(self.model.training),
+            "fixed_timestep": int(timestep),
+            "selected_context_step": int(selected_step),
+            "temporal_ensemble_enabled": int(self.use_ensembling),
+            "input_shapes": {
+                "image_primary": list(input_image_primary.shape),
+                "image_wrist": list(input_image_wrist.shape),
+                "state": list(input_state.shape),
+                "text_token": list(input_text_token.shape),
+            },
+            "input_sha256": {
+                "image_primary": array_fingerprint(
+                    input_image_primary.detach().cpu().numpy()
+                ),
+                "image_wrist": array_fingerprint(
+                    input_image_wrist.detach().cpu().numpy()
+                ),
+                "state": array_fingerprint(input_state.detach().cpu().numpy()),
+                "text_token": array_fingerprint(
+                    input_text_token.detach().cpu().numpy()
+                ),
+            },
+            **summarize_repeated_outputs(
+                latents, raw_actions, executed_actions
+            ),
+        }
+        output_path = self.latentloop_same_input_stochasticity_output
+        if not output_path:
+            log_dir = os.environ.get("LOG_DIR")
+            if not log_dir:
+                raise RuntimeError(
+                    "Set latentloop_same_input_stochasticity_output or LOG_DIR"
+                )
+            output_path = str(
+                Path(log_dir) / "analysis" / "same_input_stochasticity.json"
+            )
+        atomic_write_json(Path(output_path), payload, refuse_overwrite=True)
+        self.latentloop_same_input_stochasticity_done = True
+        print(f"[LatentLoop] same-input stochasticity saved: {output_path}")
+        return payload
 
     def _should_use_lrnode(self, timestep):
         if not (
@@ -496,6 +1115,8 @@ class ModelWrapper:
         gripper,
         state,
         action_tokens=None,
+        action_arm=None,
+        gripper_logit=None,
         timestep=None,
     ):
         if not self.use_lrnode_latent_update:
@@ -506,12 +1127,22 @@ class ModelWrapper:
             if action_tokens.dim() != 3 or action_tokens.shape[0] != 1 or action_tokens.shape[-1] != 7:
                 raise RuntimeError(f"Expected cached action tokens [1, action_pred_steps, 7], got {tuple(action_tokens.shape)}")
             self.lrnode_cached_action_tokens = action_tokens.detach()
+        if action_arm is not None:
+            self.lrnode_cached_action_arm = action_arm.detach()
+        if gripper_logit is not None:
+            self.lrnode_cached_gripper_logit = gripper_logit.detach()
         self.lrnode_cached_image_primary = image_x.detach()
         self.lrnode_cached_image_wrist = gripper.detach()
         self.lrnode_cached_state = state.detach()
         self.lrnode_cached_latent = action_latent[:, selected_step].detach()
         self.lrnode_cached_age = 0
         self.lrnode_last_full_timestep = int(timestep) if timestep is not None else None
+        self.latentloop_feedback_buffer.reset()
+        if self.latentloop_plan_adapter_mode == "anchor_bridge":
+            self.latentloop_anchor_latent = self.lrnode_cached_latent
+            self.latentloop_anchor_image_primary = image_x.detach()
+            self.latentloop_anchor_image_wrist = gripper.detach()
+            self.latentloop_anchor_state = state.detach()
 
     def _cache_executed_env_action(self, action):
         if self.use_lrnode_latent_update:
@@ -539,6 +1170,9 @@ class ModelWrapper:
         state,
         use_zero_delta=False,
         compute_hold_action=False,
+        commit_cache=True,
+        decode_action=True,
+        timestep=None,
     ):
         base_model = self._base_model()
         if self.lrnode_cached_latent is None:
@@ -553,7 +1187,7 @@ class ModelWrapper:
         else:
             self._sync_cuda()
             t_fast = time.perf_counter()
-            u_delta = base_model.lrnode_encode_delta(
+            current_u_delta = base_model.lrnode_encode_delta(
                 key_image_primary=self.lrnode_cached_image_primary[:, 0],
                 key_image_wrist=self.lrnode_cached_image_wrist[:, 0],
                 cur_image_primary=image_x[:, 0],
@@ -564,6 +1198,25 @@ class ModelWrapper:
             self._sync_cuda()
             fast_encoder_ms = (time.perf_counter() - t_fast) * 1000.0
             fast_encoder_called = 1
+            if timestep is None:
+                raise ValueError("Observation-conditioned updates require timestep")
+            if self.latentloop_feedback_source == "current":
+                u_delta = current_u_delta
+                feature_source_step = int(timestep)
+                time_shift_initialized_with_zero = 0
+            else:
+                feedback = self.latentloop_feedback_buffer.select(
+                    current_u_delta, int(timestep)
+                )
+                u_delta = feedback.feature
+                feature_source_step = int(feedback.source_step)
+                time_shift_initialized_with_zero = int(
+                    feedback.initialized_with_zero
+                )
+
+        if use_zero_delta:
+            feature_source_step = -1
+            time_shift_initialized_with_zero = 0
 
         self._sync_cuda()
         t_node = time.perf_counter()
@@ -576,15 +1229,30 @@ class ModelWrapper:
         self._sync_cuda()
         node_update_ms = (time.perf_counter() - t_node) * 1000.0
 
-        self._sync_cuda()
-        t_head = time.perf_counter()
-        arm_action, gripper_action = base_model.decode_action_from_latent(z_next)
-        self._sync_cuda()
-        action_head_ms = (time.perf_counter() - t_head) * 1000.0
-
-        action_seq = torch.concat((arm_action, gripper_action), dim=-1)
+        action_diagnostics = None
+        action_seq = None
+        if decode_action:
+            self._sync_cuda()
+            t_head = time.perf_counter()
+            if (
+                self.lrnode_mechanism_trace
+                or self.latentloop_plan_trace
+                or self.lrnode_eval_shadow_full_forward
+            ):
+                action_diagnostics = base_model.decode_action_diagnostics_from_latent(z_next)
+                arm_action = action_diagnostics["arm"]
+                gripper_action = action_diagnostics["gripper_probability"]
+            else:
+                arm_action, gripper_action = base_model.decode_action_from_latent(z_next)
+            self._sync_cuda()
+            action_head_ms = (time.perf_counter() - t_head) * 1000.0
+            action_seq = torch.concat((arm_action, gripper_action), dim=-1)
+        else:
+            action_head_ms = 0.0
         hold_action_seq = None
         if compute_hold_action:
+            if not decode_action:
+                raise ValueError("compute_hold_action=True requires decode_action=True")
             with torch.no_grad():
                 hold_arm_action, hold_gripper_action = base_model.decode_action_from_latent(z_prev.detach())
             hold_action_seq = torch.concat((hold_arm_action, hold_gripper_action), dim=-1)
@@ -592,34 +1260,205 @@ class ModelWrapper:
         gate = getattr(base_model.lrnode_dynamics, "last_gate", None)
         imgdiff_primary = (image_x[:, 0].detach().float() - self.lrnode_cached_image_primary[:, 0].detach().float()).abs()
         imgdiff_wrist = (gripper[:, 0].detach().float() - self.lrnode_cached_image_wrist[:, 0].detach().float()).abs()
+        proprio_delta = (
+            state[:, 0].detach().float() - self.lrnode_cached_state[:, 0].detach().float()
+        )
         debug = {
             "cache_age": age,
             "skip_age": age,
             "fast_encoder_called": fast_encoder_called,
             "lrnode_update_called": 1,
-            "action_head_called": 1,
+            "observation_conditioned_update_called": int(not use_zero_delta),
+            "zero_feature_update_called": int(use_zero_delta),
+            "action_head_called": int(decode_action),
             "fast_encoder_ms": fast_encoder_ms,
             "node_update_ms": node_update_ms,
             "action_head_ms": action_head_ms,
             "gate_mean": float(gate.detach().float().mean().item()) if gate is not None else 0.0,
             "gate_max": float(gate.detach().float().max().item()) if gate is not None else 0.0,
             "u_delta_norm": float(u_delta.detach().float().norm(dim=-1).mean().item()),
+            "feature_source_step": feature_source_step,
+            "feedback_source": self.latentloop_feedback_source,
+            "time_shift_initialized_with_zero": time_shift_initialized_with_zero,
             "image_diff_primary_l1": float(imgdiff_primary.mean().item()),
             "image_diff_wrist_l1": float(imgdiff_wrist.mean().item()),
+            "proprio_delta_l2": float(proprio_delta.norm(dim=-1).mean().item()),
             "update_norm": float(update.detach().float().norm(dim=-1).mean().item()) if update is not None else 0.0,
             "z_norm": float(z_next.detach().float().norm(dim=-1).mean().item()),
             "z_pred": z_next.detach(),
             "z_hold": z_prev.detach(),
-            "action_pred": action_seq.detach(),
+            "z_prev": z_prev.detach(),
+            "u_delta": u_delta.detach(),
+            "lrnode_update": update.detach() if update is not None else None,
+            "lrnode_gate": gate.detach() if gate is not None else None,
+            "observation_cache_advanced": int(commit_cache),
         }
+        if action_seq is not None:
+            debug["action_pred"] = action_seq.detach()
+        if action_diagnostics is not None:
+            debug["action_pred_gripper_logit"] = action_diagnostics["gripper_logit"].detach()
+            debug["action_pred_gripper_probability"] = action_diagnostics[
+                "gripper_probability"
+            ].detach()
         if hold_action_seq is not None:
             debug["action_hold"] = hold_action_seq.detach()
-        self.lrnode_cached_latent = z_next.detach()
+        if commit_cache:
+            self.lrnode_cached_latent = z_next.detach()
+            self.lrnode_cached_image_primary = image_x.detach()
+            self.lrnode_cached_image_wrist = gripper.detach()
+            self.lrnode_cached_state = state.detach()
+            self.lrnode_cached_age = age
+        return action_seq, debug
+
+    def _update_action_correction_cache(self, image_x, gripper, state, timestep):
+        """Run the matched full-horizon action-space correction baseline."""
+
+        if self.lrnode_cached_action_arm is None or self.lrnode_cached_gripper_logit is None:
+            raise RuntimeError("Action correction requires a cached full-Seer raw horizon")
+        adapter = self._base_model().latentloop_plan_adapter
+        age = self.lrnode_cached_age + 1
+        self._sync_cuda()
+        encoder_t0 = time.perf_counter()
+        feature = adapter.encode_delta(
+            self.lrnode_cached_image_primary[:, 0],
+            self.lrnode_cached_image_wrist[:, 0],
+            image_x[:, 0],
+            gripper[:, 0],
+            self.lrnode_cached_state[:, 0],
+            state[:, 0],
+        )
+        self._sync_cuda()
+        encoder_ms = (time.perf_counter() - encoder_t0) * 1000.0
+        predictor_t0 = time.perf_counter()
+        output = adapter.forward_from_feature(
+            self.lrnode_cached_action_arm,
+            self.lrnode_cached_gripper_logit,
+            feature,
+            age=float(age),
+        )
+        self._sync_cuda()
+        predictor_ms = (time.perf_counter() - predictor_t0) * 1000.0
+        action_seq = torch.cat([output.arm, output.gripper_probability], dim=-1)
+        proprio_delta = state[:, 0].float() - self.lrnode_cached_state[:, 0].float()
+        primary_change = (
+            image_x[:, 0].float() - self.lrnode_cached_image_primary[:, 0].float()
+        ).abs().mean()
+        wrist_change = (
+            gripper[:, 0].float() - self.lrnode_cached_image_wrist[:, 0].float()
+        ).abs().mean()
+        self.lrnode_cached_action_arm = output.arm.detach()
+        self.lrnode_cached_gripper_logit = output.gripper_logit.detach()
+        self.lrnode_cached_action_tokens = action_seq.detach()
         self.lrnode_cached_image_primary = image_x.detach()
         self.lrnode_cached_image_wrist = gripper.detach()
         self.lrnode_cached_state = state.detach()
         self.lrnode_cached_age = age
-        return action_seq, debug
+        return action_seq, {
+            "cache_age": age,
+            "skip_age": age,
+            "feature_source_step": int(timestep),
+            "feedback_source": "current",
+            "fast_encoder_called": 1,
+            "lrnode_update_called": 1,
+            "action_head_called": 0,
+            "observation_conditioned_update_called": 1,
+            "zero_feature_update_called": 0,
+            "observation_cache_advanced": 1,
+            "fast_encoder_ms": encoder_ms,
+            "node_update_ms": predictor_ms,
+            "action_head_ms": 0.0,
+            "u_delta_norm": float(feature.float().norm(dim=-1).mean().item()),
+            "image_diff_primary_l1": float(primary_change.item()),
+            "image_diff_wrist_l1": float(wrist_change.item()),
+            "proprio_delta_l2": float(proprio_delta.norm(dim=-1).mean().item()),
+            "update_norm": float(output.arm_residual.float().norm(dim=-1).mean().item()),
+            "z_norm": 0.0,
+            "action_pred": action_seq.detach(),
+            "action_pred_gripper_logit": output.gripper_logit.detach(),
+            "action_pred_gripper_probability": output.gripper_probability.detach(),
+            "u_delta": feature.detach(),
+        }
+
+    def _update_anchor_bridge_cache(self, image_x, gripper, state, timestep):
+        """Predict from the fixed segment anchor without recursive latent input."""
+
+        if self.latentloop_anchor_latent is None:
+            raise RuntimeError("Anchor bridge requires a full-refresh segment anchor")
+        adapter = self._base_model().latentloop_plan_adapter
+        age = self.lrnode_cached_age + 1
+        self._sync_cuda()
+        encoder_t0 = time.perf_counter()
+        feature = adapter.encode_anchor_to_current(
+            self.latentloop_anchor_image_primary[:, 0],
+            self.latentloop_anchor_image_wrist[:, 0],
+            image_x[:, 0],
+            gripper[:, 0],
+            self.latentloop_anchor_state[:, 0],
+            state[:, 0],
+        )
+        self._sync_cuda()
+        encoder_ms = (time.perf_counter() - encoder_t0) * 1000.0
+        predictor_t0 = time.perf_counter()
+        output = adapter.forward_from_feature(
+            self.latentloop_anchor_latent, feature, age=float(age)
+        )
+        self._sync_cuda()
+        predictor_ms = (time.perf_counter() - predictor_t0) * 1000.0
+        head_t0 = time.perf_counter()
+        diagnostics = self._base_model().decode_action_diagnostics_from_latent(
+            output.latent
+        )
+        self._sync_cuda()
+        head_ms = (time.perf_counter() - head_t0) * 1000.0
+        action_seq = torch.cat(
+            [diagnostics["arm"], diagnostics["gripper_probability"]], dim=-1
+        )
+        proprio_delta = (
+            state[:, 0].float() - self.latentloop_anchor_state[:, 0].float()
+        )
+        primary_change = (
+            image_x[:, 0].float()
+            - self.latentloop_anchor_image_primary[:, 0].float()
+        ).abs().mean()
+        wrist_change = (
+            gripper[:, 0].float()
+            - self.latentloop_anchor_image_wrist[:, 0].float()
+        ).abs().mean()
+        self.lrnode_cached_latent = output.latent.detach()
+        self.lrnode_cached_image_primary = image_x.detach()
+        self.lrnode_cached_image_wrist = gripper.detach()
+        self.lrnode_cached_state = state.detach()
+        self.lrnode_cached_age = age
+        return action_seq, {
+            "cache_age": age,
+            "skip_age": age,
+            "feature_source_step": int(timestep),
+            "feedback_source": "current",
+            "fast_encoder_called": 1,
+            "lrnode_update_called": 1,
+            "action_head_called": 1,
+            "observation_conditioned_update_called": 1,
+            "zero_feature_update_called": 0,
+            "observation_cache_advanced": 1,
+            "fast_encoder_ms": encoder_ms,
+            "node_update_ms": predictor_ms,
+            "action_head_ms": head_ms,
+            "u_delta_norm": float(feature.float().norm(dim=-1).mean().item()),
+            "image_diff_primary_l1": float(primary_change.item()),
+            "image_diff_wrist_l1": float(wrist_change.item()),
+            "proprio_delta_l2": float(proprio_delta.norm(dim=-1).mean().item()),
+            "update_norm": float(output.residual.float().norm(dim=-1).mean().item()),
+            "z_norm": float(output.latent.float().norm(dim=-1).mean().item()),
+            "z_pred": output.latent.detach(),
+            "lrnode_update": output.residual.detach(),
+            "lrnode_gate": output.gate.detach(),
+            "action_pred": action_seq.detach(),
+            "action_pred_gripper_logit": diagnostics["gripper_logit"].detach(),
+            "action_pred_gripper_probability": diagnostics[
+                "gripper_probability"
+            ].detach(),
+            "u_delta": feature.detach(),
+        }
 
     def _decode_from_cached_latent(self):
         base_model = self._base_model()
@@ -630,7 +1469,9 @@ class ModelWrapper:
         z_prev = self.lrnode_cached_latent
         self._sync_cuda()
         t_head = time.perf_counter()
-        arm_action, gripper_action = base_model.decode_action_from_latent(z_prev)
+        diagnostics = base_model.decode_action_diagnostics_from_latent(z_prev)
+        arm_action = diagnostics["arm"]
+        gripper_action = diagnostics["gripper_probability"]
         self._sync_cuda()
         action_head_ms = (time.perf_counter() - t_head) * 1000.0
         action_seq = torch.concat((arm_action, gripper_action), dim=-1)
@@ -647,11 +1488,185 @@ class ModelWrapper:
             "gate_mean": 0.0,
             "gate_max": 0.0,
             "u_delta_norm": 0.0,
+            "feedback_source": self.latentloop_feedback_source,
+            "time_shift_initialized_with_zero": 0,
             "image_diff_primary_l1": 0.0,
             "image_diff_wrist_l1": 0.0,
             "update_norm": 0.0,
             "z_norm": float(z_prev.detach().float().norm(dim=-1).mean().item()),
+            "feature_source_step": -1,
+            "action_pred": action_seq.detach(),
+            "action_pred_gripper_logit": diagnostics["gripper_logit"].detach(),
+            "action_pred_gripper_probability": gripper_action.detach(),
         }
+
+    def _run_shadow_full_forward(
+        self,
+        input_image_primary,
+        input_image_wrist,
+        input_state,
+        input_text_token,
+        selected_step,
+    ):
+        base_model = self._base_model()
+        previous_profile = bool(getattr(base_model, "profile_full_action_head", False))
+        previous_head_ms = float(getattr(base_model, "last_full_action_head_ms", 0.0))
+        self._sync_cuda()
+        shadow_t0 = time.perf_counter()
+        try:
+            with preserve_rng_state(include_cuda=True):
+                base_model.profile_full_action_head = False
+                shadow_outputs = self.model(
+                    image_primary=input_image_primary,
+                    image_wrist=input_image_wrist,
+                    state=input_state,
+                    text_token=input_text_token,
+                    action=torch.zeros(1, self.history_len, 7).to(input_state.device),
+                    return_action_latent=True,
+                )
+                shadow_latent = shadow_outputs["action_latent"][:, selected_step].detach()
+                shadow_diagnostics = base_model.decode_action_diagnostics_from_latent(
+                    shadow_latent
+                )
+        finally:
+            base_model.profile_full_action_head = previous_profile
+            base_model.last_full_action_head_ms = previous_head_ms
+        self._sync_cuda()
+        shadow_ms = (time.perf_counter() - shadow_t0) * 1000.0
+        shadow_action = torch.cat(
+            [
+                shadow_diagnostics["arm"],
+                shadow_diagnostics["gripper_probability"],
+            ],
+            dim=-1,
+        ).detach()
+        return {
+            "latent": shadow_latent,
+            "action": shadow_action,
+            "arm": shadow_diagnostics["arm"].detach(),
+            "gripper_logit": shadow_diagnostics["gripper_logit"].detach(),
+            "gripper_probability": shadow_diagnostics["gripper_probability"].detach(),
+            "latency_ms": shadow_ms,
+        }
+
+    def _decode_diagnostic_latent(self, latent):
+        diagnostics = self._base_model().decode_action_diagnostics_from_latent(latent)
+        return (
+            torch.cat(
+                [diagnostics["arm"], diagnostics["gripper_probability"]],
+                dim=-1,
+            ),
+            diagnostics,
+        )
+
+    def _apply_skip_counterfactual(
+        self,
+        timestep,
+        lr_action_seq,
+        lrnode_debug,
+        shadow,
+    ):
+        mode = self.lrnode_counterfactual_mode
+        arm_source = "lr"
+        gripper_source = "lr"
+        executed_latent = lrnode_debug.get("z_pred")
+        extra = {}
+
+        if mode in {
+            "full_arm_full_gripper",
+            "lr_arm_lr_gripper",
+            "lr_arm_full_gripper",
+            "full_arm_lr_gripper",
+        }:
+            action_seq, arm_source, gripper_source = mix_action_tokens(
+                lr_action_seq,
+                shadow["action"],
+                mode,
+            )
+        elif mode == "latent_fusion" and self.lrnode_latent_fusion_mode == "every_step":
+            executed_latent = fuse_latents(
+                lrnode_debug["z_pred"],
+                shadow["latent"],
+                self.lrnode_latent_fusion_alpha,
+            )
+            action_seq, diagnostics = self._decode_diagnostic_latent(executed_latent)
+            self.lrnode_cached_latent = executed_latent.detach()
+            self.counterfactual_latent_fusion_steps += 1
+            extra = {
+                "counterfactual_gripper_logit": diagnostics["gripper_logit"].detach(),
+                "counterfactual_gripper_probability": diagnostics[
+                    "gripper_probability"
+                ].detach(),
+            }
+            arm_source = "fusion"
+            gripper_source = "fusion"
+        elif mode == "matched_random":
+            seed = deterministic_step_seed(
+                self.lrnode_matched_random_seed,
+                self.current_task_id,
+                self.current_episode_id,
+                timestep,
+            )
+            executed_latent, learned_delta, random_delta = matched_random_latent(
+                lrnode_debug["z_pred"],
+                shadow["latent"],
+                seed=seed,
+                norm_mode=self.lrnode_matched_random_norm_mode,
+            )
+            action_seq, diagnostics = self._decode_diagnostic_latent(executed_latent)
+            self.lrnode_cached_latent = executed_latent.detach()
+            self.counterfactual_matched_random_steps += 1
+            extra = {
+                "matched_random_seed": seed,
+                "learned_delta": learned_delta.detach(),
+                "random_delta": random_delta.detach(),
+                "learned_delta_norm": float(learned_delta.detach().float().norm().item()),
+                "random_delta_norm": float(random_delta.detach().float().norm().item()),
+                "counterfactual_gripper_logit": diagnostics["gripper_logit"].detach(),
+                "counterfactual_gripper_probability": diagnostics[
+                    "gripper_probability"
+                ].detach(),
+            }
+            arm_source = "random"
+            gripper_source = "random"
+        else:
+            action_seq = lr_action_seq
+
+        if arm_source == "lr":
+            self.counterfactual_arm_lr_steps += 1
+        elif arm_source == "full":
+            self.counterfactual_arm_full_steps += 1
+        if gripper_source == "lr":
+            self.counterfactual_gripper_lr_steps += 1
+        elif gripper_source == "full":
+            self.counterfactual_gripper_full_steps += 1
+        return action_seq, executed_latent, arm_source, gripper_source, extra
+
+    def _trace_enabled_for_current_episode(self):
+        return self.lrnode_mechanism_trace and (
+            self.lrnode_trace_episode_limit == 0
+            or self.trace_episode_count < self.lrnode_trace_episode_limit
+        )
+
+    def _trace_output_path(self):
+        if self.lrnode_trace_output_dir:
+            return Path(self.lrnode_trace_output_dir)
+        log_dir = os.environ.get("LOG_DIR")
+        if not log_dir:
+            raise RuntimeError(
+                "lrnode_mechanism_trace requires lrnode_trace_output_dir or LOG_DIR"
+            )
+        return Path(log_dir) / "analysis" / "mechanism_trace"
+
+    def _plan_trace_output_path(self):
+        if self.latentloop_plan_trace_output_dir:
+            return Path(self.latentloop_plan_trace_output_dir)
+        log_dir = os.environ.get("LOG_DIR")
+        if not log_dir:
+            raise RuntimeError(
+                "latentloop_plan_trace requires latentloop_plan_trace_output_dir or LOG_DIR"
+            )
+        return Path(log_dir) / "analysis" / "plan_trace"
 
     def _cached_chunk_token_action(self, timestep):
         if self.lrnode_cached_action_tokens is None:
@@ -674,12 +1689,19 @@ class ModelWrapper:
                 "For this MVP use K <= action_pred_steps + 1."
             )
         action_token = self.lrnode_cached_action_tokens[:, token_idx:token_idx + 1]
+        replay_horizon = self.lrnode_cached_action_tokens
+        replay_gripper_logit = self.lrnode_cached_gripper_logit
+        for _ in range(skip_age):
+            replay_horizon = shift_action_horizon(replay_horizon)
+            if replay_gripper_logit is not None:
+                replay_gripper_logit = shift_action_horizon(replay_gripper_logit)
         self.lrnode_cached_age = skip_age
         action = self._raw_action_token_to_env_action(action_token)
         return action, {
             "cache_age": skip_age,
             "skip_age": skip_age,
             "token_idx_used": token_idx,
+            "feature_source_step": -1,
             "action_head_called": 0,
             "lrnode_update_called": 0,
             "fast_encoder_called": 0,
@@ -693,6 +1715,11 @@ class ModelWrapper:
             "image_diff_wrist_l1": 0.0,
             "update_norm": 0.0,
             "z_norm": 0.0,
+            "action_pred": replay_horizon.detach(),
+            "action_pred_gripper_logit": (
+                None if replay_gripper_logit is None else replay_gripper_logit.detach()
+            ),
+            "action_pred_gripper_probability": replay_horizon[..., 6:].detach(),
         }
 
     def get_lrnode_stats(self):
@@ -705,9 +1732,28 @@ class ModelWrapper:
             self.full_non_action_head_latency_sum / self.full_forward_calls if self.full_forward_calls else 0.0
         )
         avg_lrnode_latency = self.lrnode_latency_sum / self.lrnode_update_calls if self.lrnode_update_calls else 0.0
-        query_reduction = self.lrnode_update_calls / total_calls if total_calls else 0.0
+        query_reduction = (
+            0.0
+            if self.lrnode_every_step_filter is not None
+            else self.lrnode_update_calls / total_calls if total_calls else 0.0
+        )
         full_query_reduction_ratio = 1.0 - (self.full_forward_calls / self.num_policy_steps) if self.num_policy_steps else 0.0
         effective_query_interval = self.num_policy_steps / self.full_forward_calls if self.full_forward_calls else 0.0
+        transformer_backbone = self._base_model().transformer_backbone
+        retention_getter = getattr(
+            transformer_backbone, "get_fastv_retention_stats", None
+        )
+        fastv_retention = (
+            retention_getter()
+            if callable(retention_getter)
+            else {
+                "calls": 0,
+                "retained_token_sum_by_timestep_camera": [],
+                "zero_retention_calls_by_timestep_camera": [],
+                "min_retained_tokens_by_timestep_camera": [],
+                "max_retained_tokens_by_timestep_camera": [],
+            }
+        )
         return {
             "num_env_steps": self.num_policy_steps,
             "full_forward_calls": self.full_forward_calls,
@@ -718,6 +1764,25 @@ class ModelWrapper:
             "hold_latent_steps": self.hold_latent_steps,
             "chunk_token_steps": self.chunk_token_steps,
             "no_delta_steps": self.no_delta_steps,
+            "latentloop_segment_grid_enabled": int(
+                self.latentloop_segment_executor is not None
+            ),
+            "segment_length": int(self.lrnode_query_interval),
+            "feedback_schedule": (
+                self.latentloop_feedback_schedule
+                if self.latentloop_segment_executor is not None
+                else "not_applicable"
+            ),
+            "planned_feedback_density": (
+                None
+                if self.latentloop_segment_executor is None
+                else self.latentloop_segment_executor.plan.density
+            ),
+            "observation_conditioned_update_calls": (
+                self.observation_conditioned_update_calls
+            ),
+            "zero_feature_update_calls": self.zero_feature_update_calls,
+            "observation_cache_advance_calls": self.observation_cache_advance_calls,
             "num_fallback_full_calls": 0,
             "refresh_policy": self.lrnode_eval_refresh_policy,
             "max_full_forwards_per_episode": int(self.lrnode_eval_max_full_forwards_per_episode),
@@ -767,12 +1832,157 @@ class ModelWrapper:
             "shadow_action_hold_l1": self.shadow_action_hold_l1_sum / self.shadow_full_forward_calls
             if self.shadow_full_forward_calls else 0.0,
             "shadow_by_age": self.shadow_age_stats,
+            "mechanism_trace_enabled": int(self.lrnode_mechanism_trace),
+            "counterfactual_mode": self.lrnode_counterfactual_mode,
+            "counterfactual_mix_stage": self.lrnode_counterfactual_mix_stage,
+            "counterfactual_arm_lr_steps": self.counterfactual_arm_lr_steps,
+            "counterfactual_arm_full_steps": self.counterfactual_arm_full_steps,
+            "counterfactual_gripper_lr_steps": self.counterfactual_gripper_lr_steps,
+            "counterfactual_gripper_full_steps": self.counterfactual_gripper_full_steps,
+            "counterfactual_latent_fusion_steps": self.counterfactual_latent_fusion_steps,
+            "counterfactual_matched_random_steps": self.counterfactual_matched_random_steps,
+            "every_step_filter_mode": self.lrnode_every_step_filter_mode,
+            "every_step_filter_alpha": self.lrnode_every_step_filter_alpha,
+            "every_step_filter_beta": self.lrnode_every_step_filter_beta,
+            "every_step_filter_diagnostics": int(
+                self.lrnode_every_step_filter_diagnostics
+            ),
+            "every_step_filter_prior_calls": self.every_step_filter_prior_calls,
+            "every_step_filter_fusion_calls": self.every_step_filter_fusion_calls,
+            "every_step_filter_action_head_calls": (
+                self.every_step_filter_action_head_calls
+            ),
+            "every_step_filter_diagnostic_action_head_calls": (
+                self.every_step_filter_diagnostic_action_head_calls
+            ),
+            "avg_every_step_filter_prior_latency_sec": (
+                self.every_step_filter_prior_latency_sum
+                / self.every_step_filter_prior_calls
+                if self.every_step_filter_prior_calls else 0.0
+            ),
+            "avg_every_step_filter_fusion_latency_sec": (
+                self.every_step_filter_fusion_latency_sum
+                / max(1, self.num_policy_steps)
+            ),
+            "avg_every_step_filter_action_head_latency_sec": (
+                self.every_step_filter_action_head_latency_sum
+                / self.every_step_filter_action_head_calls
+                if self.every_step_filter_action_head_calls else 0.0
+            ),
+            "avg_every_step_filter_diagnostic_latency_sec": (
+                self.every_step_filter_diagnostic_latency_sum
+                / max(1, self.num_policy_steps)
+            ),
+            "every_step_filter_rng_checks": self.every_step_filter_rng_checks,
+            "every_step_filter_rng_failures": self.every_step_filter_rng_failures,
+            "query_reduction_claim_allowed": int(
+                self.lrnode_every_step_filter is None
+            ),
+            "full_forward_calls_per_policy_step": (
+                self.full_forward_calls / self.num_policy_steps
+                if self.num_policy_steps else 0.0
+            ),
+            "fastv_enabled": int(self.fastv_enabled),
+            "fastv_retention_diagnostics": int(
+                self.fastv_config.get("retention_diagnostics", False)
+            ),
+            "fastv_runtime_calls": int(self.fastv_runtime_calls),
+            "fastv_runtime_mismatches": int(self.fastv_runtime_mismatches),
+            "fastv_prune_layer": int(self.fastv_config.get("prune_layer", -1)),
+            "fastv_prune_ratio": float(self.fastv_config.get("prune_ratio", 0.0)),
+            "fastv_tokens_before_pruning": int(
+                self.fastv_config.get("tokens_before_pruning", 0)
+            ),
+            "fastv_tokens_after_pruning": int(
+                self.fastv_config.get("tokens_after_pruning", 0)
+            ),
+            "fastv_visual_tokens_before_pruning": int(
+                self.fastv_config.get("visual_tokens_before_pruning", 0)
+            ),
+            "fastv_visual_tokens_after_pruning": int(
+                self.fastv_config.get("visual_tokens_after_pruning", 0)
+            ),
+            "fastv_pruned_transformer_layers": int(
+                self.fastv_config.get("pruned_transformer_layers", 0)
+            ),
+            "fastv_score_layer_count": int(
+                self.fastv_config.get("score_layer_count", 0)
+            ),
+            "fastv_score_mode": str(
+                self.fastv_config.get("score_mode", "last_token_at_l")
+            ),
+            "fastv_score_query_indices": [
+                int(index)
+                for index in self.fastv_config.get("score_query_indices", [])
+            ],
+            "fastv_selection_scope": str(
+                self.fastv_config.get("selection_scope", "global_visual")
+            ),
+            "fastv_camera_names": list(
+                self.fastv_config.get("visual_camera_names", ["primary", "wrist"])
+            ),
+            "fastv_original_visual_tokens_by_timestep_camera": [
+                [int(value) for value in row]
+                for row in self.fastv_config.get(
+                    "original_visual_tokens_by_timestep_camera", []
+                )
+            ],
+            "fastv_retention_calls": int(fastv_retention["calls"]),
+            "fastv_retained_token_sum_by_timestep_camera": [
+                [int(value) for value in row]
+                for row in fastv_retention[
+                    "retained_token_sum_by_timestep_camera"
+                ]
+            ],
+            "fastv_zero_retention_calls_by_timestep_camera": [
+                [int(value) for value in row]
+                for row in fastv_retention[
+                    "zero_retention_calls_by_timestep_camera"
+                ]
+            ],
+            "fastv_min_retained_tokens_by_timestep_camera": [
+                [int(value) for value in row]
+                for row in fastv_retention[
+                    "min_retained_tokens_by_timestep_camera"
+                ]
+            ],
+            "fastv_max_retained_tokens_by_timestep_camera": [
+                [int(value) for value in row]
+                for row in fastv_retention[
+                    "max_retained_tokens_by_timestep_camera"
+                ]
+            ],
         }
 
-    def record_env_step_ms(self, env_step_ms):
+    def record_env_step_ms(self, env_step_ms, observation=None, reward=None, done=None, info=None):
         self.env_step_latency_sum += float(env_step_ms)
         if self.current_step_records:
             self.current_step_records[-1]["env_step_ms"] = float(env_step_ms)
+            signals = extract_simulator_signals(observation, info)
+            self.current_step_records[-1]["reward"] = "" if reward is None else float(reward)
+            self.current_step_records[-1]["done"] = "" if done is None else int(bool(done))
+            self.current_step_records[-1]["simulator_signals_json"] = json.dumps(
+                signals,
+                sort_keys=True,
+            )
+            if self.current_trace_scalars:
+                self.current_trace_scalars[-1].update(
+                    {
+                        "env_step_ms": float(env_step_ms),
+                        "reward": "" if reward is None else float(reward),
+                        "done": "" if done is None else int(bool(done)),
+                        "simulator_signals_json": json.dumps(signals, sort_keys=True),
+                    }
+                )
+            if self.current_plan_trace_scalars:
+                self.current_plan_trace_scalars[-1].update(
+                    {
+                        "env_step_ms": float(env_step_ms),
+                        "reward": "" if reward is None else float(reward),
+                        "done": "" if done is None else int(bool(done)),
+                        "simulator_signals_json": json.dumps(signals, sort_keys=True),
+                    }
+                )
 
     def finish_episode(self, task, env, success, steps, args):
         records = list(self.current_step_records)
@@ -789,6 +1999,17 @@ class ModelWrapper:
             return float(np.percentile(vals, q)) if vals else 0.0
 
         full_count = sum(1 for r in records if r.get("mode") == "full")
+        if self.lrnode_every_step_filter is not None and full_count != len(records):
+            raise RuntimeError(
+                "Every-step latent filtering requires exactly one full Seer call "
+                f"per policy step; full_steps={full_count}, policy_steps={len(records)}"
+            )
+        if self.lrnode_every_step_filter is not None and any(
+            int(r.get("full_forward_called", 0)) != 1 for r in records
+        ):
+            raise RuntimeError(
+                "Every-step latent filter trace contains a step without a full forward"
+            )
         stepwise_count = sum(1 for r in records if r.get("mode") in {"lrnode_update", "stepwise"})
         no_delta_count = sum(1 for r in records if r.get("mode") == "no_delta")
         update_count = stepwise_count + no_delta_count
@@ -797,10 +2018,114 @@ class ModelWrapper:
         chunk_token_count = sum(1 for r in records if r.get("mode") == "seer_token_chunk")
         hold_count = hold_action_count + hold_latent_count
         skip_step_count = max(0, len(records) - full_count)
+        if self.latentloop_segment_executor is not None:
+            invalid_full_offsets = [
+                int(record.get("segment_offset", -1))
+                for record in records
+                if record.get("mode") == "full"
+                and int(record.get("segment_offset", -1)) != 0
+            ]
+            if invalid_full_offsets:
+                raise RuntimeError(
+                    "LatentLoop full Seer call occurred outside segment offset 0: "
+                    f"{invalid_full_offsets}"
+                )
+            if update_count != skip_step_count:
+                raise RuntimeError(
+                    "LatentLoop updater must execute at every intermediate step: "
+                    f"updates={update_count}, intermediate_steps={skip_step_count}"
+                )
+            cache_advances = sum(
+                int(record.get("observation_cache_advanced", 0))
+                for record in records
+            )
+            if cache_advances != len(records):
+                raise RuntimeError(
+                    "LatentLoop observation cache must advance at every environment "
+                    f"step: advances={cache_advances}, steps={len(records)}"
+                )
         episode_wallclock = (
             time.perf_counter() - self.current_episode_start_time
             if self.current_episode_start_time is not None else 0.0
         )
+        action_rows = [
+            [float(record.get(f"action_{index}", 0.0)) for index in range(7)]
+            for record in records
+        ]
+        actions = np.asarray(action_rows, dtype=np.float64).reshape(-1, 7)
+        continuity = action_second_differences(actions) if len(actions) else {
+            "translation": np.asarray([]),
+            "rotation": np.asarray([]),
+            "arm": np.asarray([]),
+        }
+        gripper_metrics = gripper_summary(actions) if len(actions) else {
+            "gripper_switch_count": 0.0,
+            "gripper_switches_per_100_steps": 0.0,
+            "gripper_close_count": 0.0,
+            "gripper_open_count": 0.0,
+            "gripper_reverse_within_1_count": 0.0,
+            "gripper_reverse_within_2_count": 0.0,
+            "gripper_reverse_within_5_count": 0.0,
+            "gripper_reverse_within_1_per_100_steps": 0.0,
+            "gripper_reverse_within_2_per_100_steps": 0.0,
+            "gripper_reverse_within_5_per_100_steps": 0.0,
+        }
+        feedback_records = [
+            record
+            for record in records
+            if int(record.get("latentloop_segment_grid_enabled", 0)) == 1
+            and record.get("feedback_mask", "") != ""
+        ]
+        episode_feedback_mask = [
+            int(record["feedback_mask"]) for record in feedback_records
+        ]
+        observation_conditioned_count = sum(
+            int(record.get("observation_conditioned_update_called", 0))
+            for record in records
+        )
+        zero_feature_count = sum(
+            int(record.get("zero_feature_update_called", 0))
+            for record in records
+        )
+        feedback_denominator = observation_conditioned_count + zero_feature_count
+        actual_feedback_density = (
+            float(observation_conditioned_count) / float(feedback_denominator)
+            if feedback_denominator
+            else None
+        )
+        offset_metrics = {}
+        for offset in sorted(
+            {
+                int(record["segment_offset"])
+                for record in feedback_records
+            }
+        ):
+            offset_rows = [
+                record
+                for record in feedback_records
+                if int(record["segment_offset"]) == offset
+            ]
+
+            def offset_mean(key):
+                offset_values = [
+                    float(record[key])
+                    for record in offset_rows
+                    if record.get(key, "") not in ("", None)
+                ]
+                return float(np.mean(offset_values)) if offset_values else None
+
+            offset_metrics[str(offset)] = {
+                "count": len(offset_rows),
+                "feedback_density": float(
+                    np.mean([int(record["feedback_mask"]) for record in offset_rows])
+                ),
+                "update_norm": offset_mean("update_norm"),
+                "gate_mean": offset_mean("gate_mean"),
+                "latent_norm": offset_mean("z_norm"),
+                "current_observation_feature_norm": offset_mean("u_delta_norm"),
+                "shadow_latent_mse": offset_mean("shadow_latent_mse"),
+                "shadow_latent_cos": offset_mean("shadow_latent_cos"),
+            }
         control_hz = _eval_control_hz()
         settle_steps = _settle_steps(control_hz)
         metrics = {
@@ -817,8 +2142,52 @@ class ModelWrapper:
             "env_horizon": int(_env_horizon(args.libero_eval_max_steps, settle_steps)),
             "scale_max_steps_with_hz": int(_env_flag("EVAL_SCALE_MAX_STEPS_WITH_HZ", "1")),
             "lrnode_enabled": int(self.use_lrnode_latent_update),
+            "every_step_filter_mode": self.lrnode_every_step_filter_mode,
+            "every_step_filter_alpha": self.lrnode_every_step_filter_alpha,
+            "every_step_filter_beta": self.lrnode_every_step_filter_beta,
+            "every_step_filter_diagnostics": int(
+                self.lrnode_every_step_filter_diagnostics
+            ),
+            "query_reduction_claim_allowed": int(
+                self.lrnode_every_step_filter is None
+            ),
             "eval_skip_full_forward": int(self.lrnode_eval_skip_full_forward),
             "query_interval": int(self.lrnode_query_interval),
+            "segment_length": int(self.lrnode_query_interval),
+            "latentloop_segment_grid_enabled": int(
+                self.latentloop_segment_executor is not None
+            ),
+            "feedback_schedule": (
+                self.latentloop_feedback_schedule
+                if self.latentloop_segment_executor is not None
+                else "not_applicable"
+            ),
+            "planned_feedback_density": (
+                ""
+                if self.latentloop_segment_executor is None
+                or self.latentloop_segment_executor.plan.density is None
+                else float(self.latentloop_segment_executor.plan.density)
+            ),
+            "actual_feedback_density": (
+                "" if actual_feedback_density is None else actual_feedback_density
+            ),
+            "feedback_mask_json": json.dumps(episode_feedback_mask),
+            "feedback_offsets_json": json.dumps(
+                [int(record["segment_offset"]) for record in feedback_records]
+            ),
+            "segment_offset_metrics_json": json.dumps(
+                offset_metrics, sort_keys=True
+            ),
+            "observation_conditioned_updater_calls": int(
+                observation_conditioned_count
+            ),
+            "zero_feature_updater_calls": int(zero_feature_count),
+            "observation_cache_advance_calls": int(
+                sum(
+                    int(record.get("observation_cache_advanced", 0))
+                    for record in records
+                )
+            ),
             "ablation_mode": self.lrnode_eval_ablation_mode,
             "no_delta_mode": self.lrnode_no_delta_mode,
             "chunk_token_policy": self.lrnode_chunk_token_policy,
@@ -843,7 +2212,19 @@ class ModelWrapper:
             "avg_fast_encoder_ms": mean("fast_encoder_ms"),
             "avg_node_update_ms": mean("node_update_ms"),
             "avg_action_head_ms": mean("action_head_ms"),
+            "avg_filter_prior_ms": mean("filter_prior_ms"),
+            "avg_filter_fusion_ms": mean("filter_fusion_ms"),
+            "avg_filter_action_head_ms": mean("filter_action_head_ms"),
+            "avg_filter_diagnostic_ms": mean("filter_diagnostic_ms"),
             "avg_policy_step_ms": mean("total_policy_ms"),
+            "avg_protocol_policy_ms": mean("protocol_policy_ms"),
+            "avg_causal_executed_policy_ms": mean(
+                "causal_executed_policy_ms"
+            ),
+            "avg_diagnostic_full_forward_ms": mean(
+                "diagnostic_full_forward_ms"
+            ),
+            "avg_total_diagnostic_only_ms": mean("total_diagnostic_only_ms"),
             "avg_env_step_ms": mean("env_step_ms"),
             "episode_wallclock_sec": float(episode_wallclock),
             "avg_gate": mean("gate_mean"),
@@ -851,6 +2232,50 @@ class ModelWrapper:
             "avg_image_diff_primary": mean("image_diff_primary_l1"),
             "avg_image_diff_wrist": mean("image_diff_wrist_l1"),
             "avg_update_norm": mean("update_norm"),
+            "avg_latent_prior_vs_full_l2": mean(
+                "latent_prior_vs_full_l2"
+            ),
+            "avg_latent_prior_vs_full_cosine": mean(
+                "latent_prior_vs_full_cosine"
+            ),
+            "avg_latent_filter_vs_full_l2": mean(
+                "latent_filter_vs_full_l2"
+            ),
+            "avg_latent_correction_l2": mean("latent_correction_l2"),
+            "recurrent_prior_path_length": sum(
+                values("latent_prior_step_l2")
+            ),
+            "full_latent_path_length": sum(values("latent_full_step_l2")),
+            "filtered_latent_path_length": sum(
+                values("latent_filter_step_l2")
+            ),
+            "latent_prior_second_difference_mean": mean(
+                "latent_prior_second_difference_l2"
+            ),
+            "latent_full_second_difference_mean": mean(
+                "latent_full_second_difference_l2"
+            ),
+            "latent_filter_second_difference_mean": mean(
+                "latent_filter_second_difference_l2"
+            ),
+            "filter_diagnostics_rng_failures": sum(
+                1
+                for record in records
+                if not int(record.get("filter_diagnostics_rng_preserved", 1))
+            ),
+            **{
+                f"avg_latent_token{token_index}_{name}": mean(
+                    f"latent_token{token_index}_{name}"
+                )
+                for token_index in range(self.action_pred_steps)
+                for name in (
+                    "full_norm",
+                    "prior_norm",
+                    "filter_norm",
+                    "prior_vs_full_l2",
+                    "filter_vs_full_l2",
+                )
+            },
             "avg_action_norm": mean("action_norm"),
             "avg_action_delta_l2": mean("action_delta_norm"),
             "p95_action_delta_l2": percentile("action_delta_norm", 95),
@@ -862,6 +2287,22 @@ class ModelWrapper:
             "trans_action_jerk": mean("trans_action_jerk"),
             "rot_action_jerk": mean("rot_action_jerk"),
             "gripper_switch_rate": mean("gripper_switch"),
+            "arm_jerk_normalized_mean": float(np.mean(continuity["arm"])) if len(actions) else 0.0,
+            "translation_jerk_normalized_mean": (
+                float(np.mean(continuity["translation"])) if len(actions) else 0.0
+            ),
+            "translation_jerk_normalized_p95": (
+                float(np.percentile(continuity["translation"], 95))
+                if len(actions) else 0.0
+            ),
+            "rotation_jerk_normalized_mean": (
+                float(np.mean(continuity["rotation"])) if len(actions) else 0.0
+            ),
+            "rotation_jerk_normalized_p95": (
+                float(np.percentile(continuity["rotation"], 95))
+                if len(actions) else 0.0
+            ),
+            **gripper_metrics,
             "failure_episode_id": int(getattr(env, "exp_id", 0)) if not success else "",
             "step_failed_or_timeout": int(steps) if not success else "",
             "avg_gate_before_failure": mean("gate_mean") if not success else "",
@@ -872,6 +2313,71 @@ class ModelWrapper:
             "last_full_forward_step": max([int(r["timestep"]) for r in records if r.get("mode") == "full"] or [-1]),
         }
         self.episode_metrics.append(metrics)
+        if self._trace_enabled_for_current_episode() and self.current_trace_scalars:
+            for row in self.current_trace_scalars:
+                row["episode_success"] = int(success)
+            rank = int(torch.distributed.get_rank()) if torch.distributed.is_initialized() else 0
+            ckpt_tag = _safe_name(os.environ.get("CKPT_TAG", "ckpt"))
+            episode_key = (
+                f"{ckpt_tag}_task{int(getattr(env, 'task_id', -1)):02d}_"
+                f"episode{int(getattr(env, 'exp_id', 0)):03d}_rank{rank}"
+            )
+            save_trace_episode(
+                self._trace_output_path(),
+                episode_key,
+                self.current_trace_scalars,
+                self.current_trace_tensors,
+                {
+                    "checkpoint_id": os.environ.get("BASELINE_CKPT_ID", ""),
+                    "adapter_id": os.environ.get("OURS_CKPT_ID", ""),
+                    "checkpoint_tag": os.environ.get("CKPT_TAG", ""),
+                    "task_id": int(getattr(env, "task_id", -1)),
+                    "task_name": getattr(task, "name", getattr(env, "task_name", "")),
+                    "episode_id": int(getattr(env, "exp_id", 0)),
+                    "seed": int(getattr(args, "seed", 0)),
+                    "success": int(success),
+                    "steps": int(steps),
+                    "query_interval": int(self.lrnode_query_interval),
+                    "temporal_ensemble": int(self.use_ensembling),
+                    "counterfactual_mode": self.lrnode_counterfactual_mode,
+                    "counterfactual_mix_stage": self.lrnode_counterfactual_mix_stage,
+                    "every_step_filter_mode": self.lrnode_every_step_filter_mode,
+                    "every_step_filter_alpha": self.lrnode_every_step_filter_alpha,
+                    "every_step_filter_beta": self.lrnode_every_step_filter_beta,
+                    "every_step_filter_diagnostics": int(
+                        self.lrnode_every_step_filter_diagnostics
+                    ),
+                },
+            )
+            self.trace_episode_count += 1
+        if self.latentloop_plan_trace and self.current_plan_trace_scalars:
+            for row in self.current_plan_trace_scalars:
+                row["episode_success"] = int(success)
+            rank = int(torch.distributed.get_rank()) if torch.distributed.is_initialized() else 0
+            episode_key = (
+                f"{_safe_name(self.latentloop_plan_trace_row_id or 'row')}_"
+                f"task{int(getattr(env, 'task_id', -1)):02d}_"
+                f"episode{int(getattr(env, 'exp_id', 0)):03d}_rank{rank}"
+            )
+            save_plan_trace_episode(
+                self._plan_trace_output_path(),
+                episode_key,
+                self.current_plan_trace_scalars,
+                self.current_plan_trace_tensors,
+                {
+                    "row_id": self.latentloop_plan_trace_row_id,
+                    "paired_group": self.latentloop_plan_trace_paired_group,
+                    "task_id": int(getattr(env, "task_id", -1)),
+                    "task_name": getattr(task, "name", getattr(env, "task_name", "")),
+                    "episode_id": int(getattr(env, "exp_id", 0)),
+                    "success": int(success),
+                    "steps": int(steps),
+                    "query_interval": int(self.lrnode_query_interval),
+                    "feedback_source": self.latentloop_feedback_source,
+                    "plan_adapter_mode": self.latentloop_plan_adapter_mode,
+                    "temporal_ensemble": int(self.use_ensembling),
+                },
+            )
         if self.lrnode_eval_step_log:
             self._save_step_log(task, env, args, records)
         return metrics
@@ -895,6 +2401,42 @@ class ModelWrapper:
     def step(self, obs, goal, timestep, frames=None, video_stride: int = 1):
         policy_t0 = time.perf_counter()
         preprocess_t0 = time.perf_counter()
+        every_step_filter = self.lrnode_every_step_filter
+        previous_cached_latent = None
+        if (
+            self.lrnode_cached_latent is not None
+            and (
+                self.lrnode_mechanism_trace
+                or self.lrnode_counterfactual_mode != "standard"
+                or every_step_filter is not None
+            )
+        ):
+            previous_cached_latent = self.lrnode_cached_latent.detach().clone()
+        shadow = None
+        lrnode_debug = {}
+        z_prior = None
+        z_full = None
+        z_filter = None
+        full_action_seq = None
+        prior_action_seq = None
+        filter_action_seq = None
+        executed_probability = None
+        shadow_executed_probability = None
+        shadow_env_action = None
+        ensemble_candidate_count = 0
+        shadow_ensemble_candidate_count = 0
+        shadow_diagnostic_ms = 0.0
+        refresh_diagnostic_ms = 0.0
+        filter_diagnostic_ms = 0.0
+        shadow_ensemble_ms = 0.0
+        arm_source = "full"
+        gripper_source = "full"
+        segment_decision = None
+        if self.latentloop_segment_executor is not None:
+            segment_decision = self.latentloop_segment_executor.decision(
+                timestep,
+                has_latent_cache=self.lrnode_cached_latent is not None,
+            )
         step_record = {
             "timestep": int(timestep),
             "mode": "full",
@@ -902,6 +2444,33 @@ class ModelWrapper:
             "skip_age": 0,
             "token_idx_used": "",
             "query_interval": int(self.lrnode_query_interval),
+            "latentloop_segment_grid_enabled": int(
+                self.latentloop_segment_executor is not None
+            ),
+            "segment_length": int(self.lrnode_query_interval),
+            "segment_offset": (
+                "" if segment_decision is None else int(segment_decision.segment_offset)
+            ),
+            "feedback_schedule": (
+                "not_applicable"
+                if segment_decision is None
+                else self.latentloop_feedback_schedule
+            ),
+            "feedback_mask": (
+                ""
+                if segment_decision is None
+                or segment_decision.feedback_enabled is None
+                else int(segment_decision.feedback_enabled)
+            ),
+            "planned_feedback_density": (
+                ""
+                if segment_decision is None
+                or segment_decision.planned_feedback_density is None
+                else float(segment_decision.planned_feedback_density)
+            ),
+            "observation_conditioned_update_called": 0,
+            "zero_feature_update_called": 0,
+            "observation_cache_advanced": 0,
             "ablation_mode": self.lrnode_eval_ablation_mode,
             "no_delta_mode": self.lrnode_no_delta_mode,
             "chunk_token_policy": self.lrnode_chunk_token_policy,
@@ -924,9 +2493,39 @@ class ModelWrapper:
             "update_norm": 0.0,
             "z_norm": 0.0,
             "full_refresh_reason": "",
+            "task_id": int(self.current_task_id),
+            "task_name": self.current_task_name,
+            "episode_id": int(self.current_episode_id),
+            "checkpoint_id": os.environ.get("BASELINE_CKPT_ID", ""),
+            "adapter_id": os.environ.get("OURS_CKPT_ID", ""),
+            "counterfactual_mode": self.lrnode_counterfactual_mode,
+            "counterfactual_mix_stage": self.lrnode_counterfactual_mix_stage,
+            "temporal_ensemble_enabled": int(self.use_ensembling),
+            "every_step_filter_mode": self.lrnode_every_step_filter_mode,
+            "every_step_filter_alpha": self.lrnode_every_step_filter_alpha,
+            "every_step_filter_beta": self.lrnode_every_step_filter_beta,
+            "every_step_filter_diagnostics": int(
+                self.lrnode_every_step_filter_diagnostics
+            ),
+            "filter_prior_called": 0,
+            "filter_prior_ms": 0.0,
+            "filter_fusion_ms": 0.0,
+            "filter_action_head_called": 0,
+            "filter_action_head_ms": 0.0,
+            "filter_diagnostic_action_head_calls": 0,
+            "filter_diagnostic_ms": 0.0,
+            "filter_diagnostics_rng_preserved": 1,
+            "query_reduction_claim_allowed": int(every_step_filter is None),
         }
         # preprocess image
         image = obs["agentview_image"]
+        raw_primary_for_trace = None
+        raw_wrist_for_trace = None
+        if self.latentloop_plan_trace:
+            raw_primary_for_trace = np.asarray(image, dtype=np.float32)
+            raw_wrist_for_trace = np.asarray(
+                obs["robot0_eye_in_hand_image"], dtype=np.float32
+            )
         if frames is not None and (video_stride <= 1 or (timestep % int(video_stride) == 0)):
             try:
                 primary = np.array(image, copy=True)
@@ -971,6 +2570,24 @@ class ModelWrapper:
         else:
             state = torch.from_numpy(np.concatenate([state_pos, state_ori, obs['robot0_gripper_qpos']])).to(
                 dtype=self.cast_type).unsqueeze(0).unsqueeze(0)  # [1, 1, 8]
+        raw_proprio_for_trace = None
+        if self.latentloop_plan_trace:
+            raw_proprio_for_trace = state.detach().float().cpu().numpy()[0, 0]
+            step_record["primary_raw_change_l1"] = (
+                0.0
+                if self.previous_raw_primary is None
+                else float(np.mean(np.abs(raw_primary_for_trace - self.previous_raw_primary)))
+            )
+            step_record["wrist_raw_change_l1"] = (
+                0.0
+                if self.previous_raw_wrist is None
+                else float(np.mean(np.abs(raw_wrist_for_trace - self.previous_raw_wrist)))
+            )
+            step_record["proprio_delta_l2"] = (
+                0.0
+                if self.previous_raw_proprio is None
+                else float(np.linalg.norm(raw_proprio_for_trace - self.previous_raw_proprio))
+            )
 
         with torch.no_grad():
             device = 'cuda'
@@ -1008,12 +2625,129 @@ class ModelWrapper:
             preprocess_ms = (time.perf_counter() - preprocess_t0) * 1000.0
             step_record["preprocess_ms"] = preprocess_ms
 
+            self._run_same_input_stochasticity_sanity(
+                input_image_primary,
+                input_image_wrist,
+                input_state,
+                input_text_token,
+                self._selected_step(num_step),
+                timestep,
+            )
+
             direct_env_action = None
-            if self._should_use_lrnode(timestep):
+            use_lrnode_step = self._should_use_lrnode(timestep)
+            if segment_decision is not None:
+                expected_skip = not segment_decision.full_refresh
+                if use_lrnode_step != expected_skip:
+                    raise RuntimeError(
+                        "LatentLoop segment schedule disagrees with the existing "
+                        f"periodic skip path at timestep={timestep}: "
+                        f"expected_skip={expected_skip}, actual_skip={use_lrnode_step}"
+                    )
+            diagnostic_refresh_debug = None
+            if (
+                every_step_filter is not None
+                and every_step_filter.requires_recurrent_prior(
+                    has_previous=self.lrnode_cached_latent is not None
+                )
+            ):
+                prior_t0 = time.perf_counter()
+                with preserve_rng_state(include_cuda=True):
+                    _, lrnode_debug = self._update_from_lrnode_cache(
+                        image_x,
+                        gripper,
+                        state,
+                        use_zero_delta=False,
+                        compute_hold_action=False,
+                        commit_cache=False,
+                        decode_action=False,
+                        timestep=timestep,
+                    )
+                prior_ms = (time.perf_counter() - prior_t0) * 1000.0
+                z_prior = lrnode_debug["z_pred"].detach()
+                self.lrnode_update_calls += 1
+                self.fast_encoder_calls += int(
+                    lrnode_debug.get("fast_encoder_called", 0)
+                )
+                self.lrnode_latency_sum += prior_ms / 1000.0
+                self.fast_encoder_latency_sum += float(
+                    lrnode_debug.get("fast_encoder_ms", 0.0)
+                )
+                self.node_update_latency_sum += float(
+                    lrnode_debug.get("node_update_ms", 0.0)
+                )
+                self.every_step_filter_prior_calls += 1
+                self.every_step_filter_prior_latency_sum += prior_ms / 1000.0
+                step_record.update(
+                    {
+                        "lrnode_update_called": 1,
+                        "fast_encoder_called": int(
+                            lrnode_debug.get("fast_encoder_called", 0)
+                        ),
+                        "fast_encoder_ms": float(
+                            lrnode_debug.get("fast_encoder_ms", 0.0)
+                        ),
+                        "node_update_ms": float(
+                            lrnode_debug.get("node_update_ms", 0.0)
+                        ),
+                        "filter_prior_called": 1,
+                        "filter_prior_ms": prior_ms,
+                        "cache_age": int(lrnode_debug.get("cache_age", 1)),
+                        "u_delta_norm": float(
+                            lrnode_debug.get("u_delta_norm", 0.0)
+                        ),
+                        "image_diff_primary_l1": float(
+                            lrnode_debug.get("image_diff_primary_l1", 0.0)
+                        ),
+                        "image_diff_wrist_l1": float(
+                            lrnode_debug.get("image_diff_wrist_l1", 0.0)
+                        ),
+                        "update_norm": float(
+                            lrnode_debug.get("update_norm", 0.0)
+                        ),
+                        "gate_mean": float(lrnode_debug.get("gate_mean", 0.0)),
+                        "gate_max": float(lrnode_debug.get("gate_max", 0.0)),
+                    }
+                )
+            if (
+                every_step_filter is None
+                and
+                not use_lrnode_step
+                and self.lrnode_cached_latent is not None
+                and (
+                    self.lrnode_mechanism_trace
+                    or self.lrnode_counterfactual_mode != "standard"
+                )
+            ):
+                refresh_diagnostic_t0 = time.perf_counter()
+                with preserve_rng_state(include_cuda=True):
+                    _, diagnostic_refresh_debug = self._update_from_lrnode_cache(
+                        image_x,
+                        gripper,
+                        state,
+                        use_zero_delta=False,
+                        compute_hold_action=False,
+                        commit_cache=False,
+                        timestep=timestep,
+                    )
+                refresh_diagnostic_ms = (
+                    time.perf_counter() - refresh_diagnostic_t0
+                ) * 1000.0
+            if use_lrnode_step:
                 self._sync_cuda()
                 t0 = time.perf_counter()
                 mode = self.lrnode_eval_ablation_mode
-                if mode == "hold_action":
+                if self.latentloop_plan_adapter_mode == "action_correction":
+                    mode = "action_correction"
+                    action_seq, lrnode_debug = self._update_action_correction_cache(
+                        image_x, gripper, state, timestep
+                    )
+                elif self.latentloop_plan_adapter_mode == "anchor_bridge":
+                    mode = "anchor_bridge"
+                    action_seq, lrnode_debug = self._update_anchor_bridge_cache(
+                        image_x, gripper, state, timestep
+                    )
+                elif mode == "hold_action":
                     if self.lrnode_cached_env_action is None:
                         raise RuntimeError("hold_action ablation requested before an executed full-step action was cached")
                     self.lrnode_cached_age += 1
@@ -1035,27 +2769,35 @@ class ModelWrapper:
                         "image_diff_wrist_l1": 0.0,
                         "update_norm": 0.0,
                         "z_norm": 0.0,
+                        "feature_source_step": -1,
+                        "action_pred": self.lrnode_cached_action_tokens,
+                        "action_pred_gripper_logit": self.lrnode_cached_gripper_logit,
+                        "action_pred_gripper_probability": (
+                            None
+                            if self.lrnode_cached_action_tokens is None
+                            else self.lrnode_cached_action_tokens[..., 6:]
+                        ),
                     }
                 elif mode == "hold_latent":
                     action_seq, lrnode_debug = self._decode_from_cached_latent()
                 elif mode == "seer_token_chunk":
                     direct_env_action, lrnode_debug = self._cached_chunk_token_action(timestep)
                     action_seq = None
-                elif mode == "no_delta":
-                    action_seq, lrnode_debug = self._update_from_lrnode_cache(
-                        image_x,
-                        gripper,
-                        state,
-                        use_zero_delta=True,
-                        compute_hold_action=self.lrnode_eval_shadow_full_forward,
-                    )
                 else:
+                    use_zero_delta = mode == "no_delta"
+                    if segment_decision is not None:
+                        if segment_decision.feedback_enabled is None:
+                            raise RuntimeError(
+                                "Intermediate LatentLoop step has no feedback decision"
+                            )
+                        use_zero_delta = segment_decision.use_zero_feature
                     action_seq, lrnode_debug = self._update_from_lrnode_cache(
                         image_x,
                         gripper,
                         state,
-                        use_zero_delta=False,
+                        use_zero_delta=use_zero_delta,
                         compute_hold_action=self.lrnode_eval_shadow_full_forward,
+                        timestep=timestep,
                     )
                 self._sync_cuda()
                 skip_ms = (time.perf_counter() - t0) * 1000.0
@@ -1066,6 +2808,20 @@ class ModelWrapper:
                 self.lrnode_update_calls += lrnode_update_called
                 self.fast_encoder_calls += fast_encoder_called
                 self.action_head_calls += action_head_called
+                observation_conditioned_called = int(
+                    lrnode_debug.get("observation_conditioned_update_called", 0)
+                )
+                zero_feature_called = int(
+                    lrnode_debug.get("zero_feature_update_called", 0)
+                )
+                observation_cache_advanced = int(
+                    lrnode_debug.get("observation_cache_advanced", 0)
+                )
+                self.observation_conditioned_update_calls += (
+                    observation_conditioned_called
+                )
+                self.zero_feature_update_calls += zero_feature_called
+                self.observation_cache_advance_calls += observation_cache_advanced
                 if lrnode_update_called:
                     self.lrnode_latency_sum += skip_ms / 1000.0
                 self.fast_encoder_latency_sum += float(lrnode_debug.get("fast_encoder_ms", 0.0))
@@ -1088,6 +2844,11 @@ class ModelWrapper:
                         "lrnode_update_called": lrnode_update_called,
                         "fast_encoder_called": fast_encoder_called,
                         "action_head_called": action_head_called,
+                        "observation_conditioned_update_called": (
+                            observation_conditioned_called
+                        ),
+                        "zero_feature_update_called": zero_feature_called,
+                        "observation_cache_advanced": observation_cache_advanced,
                         "fast_encoder_ms": float(lrnode_debug.get("fast_encoder_ms", 0.0)),
                         "node_update_ms": float(lrnode_debug.get("node_update_ms", 0.0)),
                         "action_head_ms": float(lrnode_debug.get("action_head_ms", 0.0)),
@@ -1095,33 +2856,42 @@ class ModelWrapper:
                         "gate_mean": float(lrnode_debug.get("gate_mean", 0.0)),
                         "gate_max": float(lrnode_debug.get("gate_max", 0.0)),
                         "u_delta_norm": float(lrnode_debug.get("u_delta_norm", 0.0)),
+                        "feature_source_step": int(
+                            lrnode_debug.get("feature_source_step", timestep)
+                        ),
+                        "feedback_source": lrnode_debug.get(
+                            "feedback_source", self.latentloop_feedback_source
+                        ),
+                        "time_shift_initialized_with_zero": int(
+                            lrnode_debug.get("time_shift_initialized_with_zero", 0)
+                        ),
                         "image_diff_primary_l1": float(lrnode_debug.get("image_diff_primary_l1", 0.0)),
                         "image_diff_wrist_l1": float(lrnode_debug.get("image_diff_wrist_l1", 0.0)),
+                        "proprio_delta_l2": float(
+                            lrnode_debug.get(
+                                "proprio_delta_l2",
+                                step_record.get("proprio_delta_l2", 0.0),
+                            )
+                        ),
                         "update_norm": float(lrnode_debug.get("update_norm", 0.0)),
                         "z_norm": float(lrnode_debug.get("z_norm", 0.0)),
                     }
                 )
                 if self.lrnode_eval_shadow_full_forward and "action_pred" in lrnode_debug:
+                    shadow_diagnostic_t0 = time.perf_counter()
                     selected_step = self._selected_step(num_step)
-                    self._sync_cuda()
-                    shadow_t0 = time.perf_counter()
-                    shadow_outputs = self.model(
-                        image_primary=input_image_primary,
-                        image_wrist=input_image_wrist,
-                        state=input_state,
-                        text_token=input_text_token,
-                        action=torch.zeros(1, self.history_len, 7).to(input_state.device),
-                        return_action_latent=True,
+                    shadow = self._run_shadow_full_forward(
+                        input_image_primary,
+                        input_image_wrist,
+                        input_state,
+                        input_text_token,
+                        selected_step,
                     )
-                    self._sync_cuda()
-                    shadow_ms = (time.perf_counter() - shadow_t0) * 1000.0
-                    shadow_arm = shadow_outputs["arm_pred_action"][:, selected_step]
-                    shadow_gripper = shadow_outputs["gripper_pred_action"][:, selected_step]
-                    shadow_action = torch.cat([shadow_arm, shadow_gripper], dim=-1).detach().float()
-                    shadow_latent = shadow_outputs["action_latent"][:, selected_step].detach().float()
                     pred_action = lrnode_debug["action_pred"].detach().float()
                     hold_action = lrnode_debug["action_hold"].detach().float()
                     pred_latent = lrnode_debug["z_pred"].detach().float()
+                    shadow_latent = shadow["latent"].detach().float()
+                    shadow_action = shadow["action"].detach().float()
                     latent_mse = F.mse_loss(pred_latent, shadow_latent).item()
                     latent_cos = F.cosine_similarity(
                         pred_latent.reshape(-1, pred_latent.shape[-1]),
@@ -1142,7 +2912,7 @@ class ModelWrapper:
                     age_stats["action_l1_sum"] += action_l1
                     age_stats["action_hold_l1_sum"] += action_hold_l1
                     self.shadow_full_forward_calls += 1
-                    self.shadow_full_forward_latency_sum += shadow_ms
+                    self.shadow_full_forward_latency_sum += shadow["latency_ms"]
                     self.shadow_latent_mse_sum += latent_mse
                     self.shadow_latent_cos_sum += latent_cos
                     self.shadow_action_l1_sum += action_l1
@@ -1150,7 +2920,7 @@ class ModelWrapper:
                     self.shadow_action_hold_l1_sum += action_hold_l1
                     step_record.update(
                         {
-                            "shadow_full_forward_ms": shadow_ms,
+                            "shadow_full_forward_ms": shadow["latency_ms"],
                             "shadow_latent_mse": latent_mse,
                             "shadow_latent_cos": latent_cos,
                             "shadow_action_l1": action_l1,
@@ -1159,6 +2929,33 @@ class ModelWrapper:
                             "shadow_pred_vs_hold_improvement": improvement,
                         }
                     )
+                    (
+                        action_seq,
+                        executed_latent,
+                        arm_source,
+                        gripper_source,
+                        counterfactual_extra,
+                    ) = self._apply_skip_counterfactual(
+                        timestep,
+                        action_seq,
+                        lrnode_debug,
+                        shadow,
+                    )
+                    lrnode_debug["executed_latent"] = (
+                        None if executed_latent is None else executed_latent.detach()
+                    )
+                    lrnode_debug.update(counterfactual_extra)
+                    step_record["arm_source"] = arm_source
+                    step_record["gripper_source"] = gripper_source
+                    step_record["learned_delta_norm"] = float(
+                        counterfactual_extra.get("learned_delta_norm", 0.0)
+                    )
+                    step_record["random_delta_norm"] = float(
+                        counterfactual_extra.get("random_delta_norm", 0.0)
+                    )
+                    shadow_diagnostic_ms = (
+                        time.perf_counter() - shadow_diagnostic_t0
+                    ) * 1000.0
             else:
                 self._sync_cuda()
                 t0 = time.perf_counter()
@@ -1168,7 +2965,9 @@ class ModelWrapper:
                     state=input_state,
                     text_token=input_text_token,
                     action=torch.zeros(1, self.history_len, 7).to(input_state.device),
-                    return_action_latent=self.use_lrnode_latent_update,
+                    return_action_latent=(
+                        self.use_lrnode_latent_update or self.latentloop_plan_trace
+                    ),
                 )
                 self._sync_cuda()
                 full_ms = (time.perf_counter() - t0) * 1000.0
@@ -1182,6 +2981,23 @@ class ModelWrapper:
                 self.full_non_action_head_latency_sum += full_non_action_head_ms / 1000.0
                 self.full_forward_calls += 1
                 self.lrnode_episode_full_forward_calls += 1
+                fastv_runtime = getattr(
+                    self._base_model().transformer_backbone,
+                    "last_fastv_stats",
+                    None,
+                )
+                runtime_enabled = bool(
+                    fastv_runtime and fastv_runtime.get("enabled", False)
+                )
+                if runtime_enabled != self.fastv_enabled:
+                    self.fastv_runtime_mismatches += 1
+                    raise RuntimeError(
+                        "FastV runtime/config mismatch: "
+                        f"configured={self.fastv_enabled}, runtime={fastv_runtime}"
+                    )
+                if self.fastv_enabled:
+                    self.fastv_runtime_calls += 1
+                    self.fastv_last_runtime_stats = dict(fastv_runtime)
                 step_record.update(
                     {
                         "mode": "full",
@@ -1193,7 +3009,7 @@ class ModelWrapper:
                     }
                 )
 
-                if self.use_lrnode_latent_update:
+                if self.use_lrnode_latent_update or self.latentloop_plan_trace:
                     arm_action = model_outputs["arm_pred_action"]
                     gripper_action = model_outputs["gripper_pred_action"]
                     action_latent = model_outputs["action_latent"]
@@ -1202,6 +3018,365 @@ class ModelWrapper:
                     action_latent = None
                 selected_step = self._selected_step(num_step)
                 action_seq = torch.concat((arm_action[:, selected_step], gripper_action[:, selected_step]), dim=-1)
+                cache_latent = None if action_latent is None else action_latent[:, selected_step].detach()
+                full_action_seq = action_seq.detach()
+                z_full = cache_latent
+                full_diagnostics = None
+                if (
+                    every_step_filter is None
+                    and action_latent is not None
+                    and (
+                    self.lrnode_eval_shadow_full_forward or self.lrnode_mechanism_trace
+                    or self.latentloop_plan_trace
+                    or self.latentloop_plan_adapter_mode != "off"
+                    )
+                ):
+                    full_diagnostics = self._base_model().decode_action_diagnostics_from_latent(
+                        cache_latent
+                    )
+                    shadow = {
+                        "latent": cache_latent,
+                        "action": torch.cat(
+                            [
+                                full_diagnostics["arm"],
+                                full_diagnostics["gripper_probability"],
+                            ],
+                            dim=-1,
+                        ).detach(),
+                        "arm": full_diagnostics["arm"].detach(),
+                        "gripper_logit": full_diagnostics["gripper_logit"].detach(),
+                        "gripper_probability": full_diagnostics[
+                            "gripper_probability"
+                        ].detach(),
+                        "latency_ms": 0.0,
+                    }
+                    lrnode_debug.update(
+                        {
+                            "action_pred": shadow["action"],
+                            "action_pred_gripper_logit": shadow["gripper_logit"],
+                            "action_pred_gripper_probability": shadow[
+                                "gripper_probability"
+                            ],
+                            "z_pred": cache_latent,
+                            "feature_source_step": int(timestep),
+                        }
+                    )
+                if every_step_filter is not None:
+                    if cache_latent is None:
+                        raise RuntimeError(
+                            "Every-step latent filtering requires a full Seer action latent"
+                        )
+                    self._sync_cuda()
+                    fusion_t0 = time.perf_counter()
+                    filter_selection = every_step_filter.select(
+                        z_full=cache_latent,
+                        z_previous=previous_cached_latent,
+                        z_prior=z_prior,
+                    )
+                    self._sync_cuda()
+                    fusion_ms = (time.perf_counter() - fusion_t0) * 1000.0
+                    z_filter = filter_selection.latent
+                    cache_latent = z_filter
+                    step_record["filter_fusion_ms"] = fusion_ms
+                    self.every_step_filter_fusion_latency_sum += fusion_ms / 1000.0
+                    if (
+                        not filter_selection.initialized_from_full
+                        and not filter_selection.reused_full_action
+                        and self.lrnode_every_step_filter_mode
+                        in {"fixed_filter", "full_latent_ema"}
+                    ):
+                        self.every_step_filter_fusion_calls += 1
+
+                    if filter_selection.reused_full_action:
+                        action_seq = full_action_seq
+                        filter_action_seq = full_action_seq
+                    else:
+                        self._sync_cuda()
+                        filter_head_t0 = time.perf_counter()
+                        filter_arm, filter_gripper = (
+                            self._base_model().decode_action_from_latent(z_filter)
+                        )
+                        self._sync_cuda()
+                        filter_head_ms = (
+                            time.perf_counter() - filter_head_t0
+                        ) * 1000.0
+                        action_seq = torch.cat(
+                            [filter_arm, filter_gripper],
+                            dim=-1,
+                        )
+                        filter_action_seq = action_seq.detach()
+                        self.every_step_filter_action_head_calls += 1
+                        self.every_step_filter_action_head_latency_sum += (
+                            filter_head_ms / 1000.0
+                        )
+                        step_record.update(
+                            {
+                                "filter_action_head_called": 1,
+                                "filter_action_head_ms": filter_head_ms,
+                            }
+                        )
+
+                    if z_prior is not None and z_filter is z_prior:
+                        prior_action_seq = filter_action_seq
+
+                    self._sync_cuda()
+                    diagnostic_t0 = time.perf_counter()
+                    rng_before = capture_rng_state(include_cuda=True)
+                    diagnostic_head_calls = 0
+                    with preserve_rng_state(include_cuda=True):
+                        latent_metrics = every_step_filter.diagnostics(
+                            selection=filter_selection,
+                            z_full=z_full,
+                            z_prior=z_prior,
+                        )
+                        filter_diagnostics = None
+                        full_filter_diagnostics = None
+                        prior_diagnostics = None
+                        if self.lrnode_every_step_filter_diagnostics:
+                            full_filter_diagnostics = (
+                                self._base_model().decode_action_diagnostics_from_latent(
+                                    z_full
+                                )
+                            )
+                            diagnostic_head_calls += 1
+                            filter_diagnostics = (
+                                full_filter_diagnostics
+                                if filter_selection.reused_full_action
+                                else self._base_model().decode_action_diagnostics_from_latent(
+                                    z_filter
+                                )
+                            )
+                            if not filter_selection.reused_full_action:
+                                diagnostic_head_calls += 1
+                            if z_prior is not None:
+                                if z_filter is z_prior:
+                                    prior_diagnostics = filter_diagnostics
+                                else:
+                                    prior_diagnostics = (
+                                        self._base_model().decode_action_diagnostics_from_latent(
+                                            z_prior
+                                        )
+                                    )
+                                    diagnostic_head_calls += 1
+                        latent_metrics[
+                            "full_raw_first_token_gripper_probability"
+                        ] = float(
+                            full_action_seq[0, 0, 6].detach().float().item()
+                        )
+                        latent_metrics[
+                            "filter_raw_first_token_gripper_probability"
+                        ] = float(
+                            filter_action_seq[0, 0, 6].detach().float().item()
+                        )
+                        prior_probability_source = (
+                            prior_diagnostics["gripper_probability"]
+                            if prior_diagnostics is not None
+                            else prior_action_seq
+                        )
+                        if prior_probability_source is not None:
+                            latent_metrics[
+                                "prior_raw_first_token_gripper_probability"
+                            ] = float(
+                                prior_probability_source[0, 0, -1]
+                                .detach()
+                                .float()
+                                .item()
+                            )
+                        if full_filter_diagnostics is not None:
+                            latent_metrics[
+                                "full_raw_first_token_gripper_logit"
+                            ] = float(
+                                full_filter_diagnostics["gripper_logit"][
+                                    0, 0, 0
+                                ]
+                                .detach()
+                                .float()
+                                .item()
+                            )
+                        if filter_diagnostics is not None:
+                            latent_metrics[
+                                "filter_raw_first_token_gripper_logit"
+                            ] = float(
+                                filter_diagnostics["gripper_logit"][0, 0, 0]
+                                .detach()
+                                .float()
+                                .item()
+                            )
+                        if prior_diagnostics is not None:
+                            latent_metrics[
+                                "prior_raw_first_token_gripper_logit"
+                            ] = float(
+                                prior_diagnostics["gripper_logit"][0, 0, 0]
+                                .detach()
+                                .float()
+                                .item()
+                            )
+                    self._sync_cuda()
+                    rng_after = capture_rng_state(include_cuda=True)
+                    rng_preserved = rng_states_equal(rng_before, rng_after)
+                    filter_diagnostic_ms = (
+                        time.perf_counter() - diagnostic_t0
+                    ) * 1000.0
+                    self.every_step_filter_diagnostic_latency_sum += (
+                        filter_diagnostic_ms / 1000.0
+                    )
+                    self.every_step_filter_diagnostic_action_head_calls += (
+                        diagnostic_head_calls
+                    )
+                    self.every_step_filter_rng_checks += 1
+                    self.every_step_filter_rng_failures += int(not rng_preserved)
+                    step_record.update(latent_metrics)
+                    step_record.update(
+                        {
+                            "filter_diagnostic_action_head_calls": diagnostic_head_calls,
+                            "filter_diagnostic_ms": filter_diagnostic_ms,
+                            "filter_diagnostics_rng_preserved": int(rng_preserved),
+                            "executed_latent_source": self.lrnode_every_step_filter_mode,
+                            "full_forward_role": (
+                                "executed_candidate"
+                                if (
+                                    filter_selection.initialized_from_full
+                                    or self.lrnode_every_step_filter_mode == "raw_full"
+                                    or (
+                                        self.lrnode_every_step_filter_mode == "fixed_filter"
+                                        and self.lrnode_every_step_filter_alpha > 0.0
+                                    )
+                                    or (
+                                        self.lrnode_every_step_filter_mode == "full_latent_ema"
+                                        and self.lrnode_every_step_filter_beta > 0.0
+                                    )
+                                )
+                                else "diagnostic_only"
+                            ),
+                        }
+                    )
+                    arm_source = self.lrnode_every_step_filter_mode
+                    gripper_source = self.lrnode_every_step_filter_mode
+                    lrnode_debug.update(
+                        {
+                            "z_prior": z_prior,
+                            "z_filter": z_filter.detach(),
+                            "executed_latent": z_filter.detach(),
+                            "action_filter": filter_action_seq,
+                            "action_full": full_action_seq,
+                        }
+                    )
+                    if prior_action_seq is not None:
+                        lrnode_debug["action_prior"] = prior_action_seq.detach()
+                    if self.lrnode_every_step_filter_diagnostics:
+                        if prior_diagnostics is not None:
+                            prior_action_seq = torch.cat(
+                                [
+                                    prior_diagnostics["arm"],
+                                    prior_diagnostics["gripper_probability"],
+                                ],
+                                dim=-1,
+                            ).detach()
+                            lrnode_debug["action_prior"] = prior_action_seq
+                        if filter_diagnostics is not None:
+                            lrnode_debug[
+                                "counterfactual_gripper_logit"
+                            ] = filter_diagnostics["gripper_logit"].detach()
+                            lrnode_debug[
+                                "counterfactual_gripper_probability"
+                            ] = filter_diagnostics[
+                                "gripper_probability"
+                            ].detach()
+                        if full_filter_diagnostics is not None:
+                            lrnode_debug[
+                                "full_gripper_logit"
+                            ] = full_filter_diagnostics[
+                                "gripper_logit"
+                            ].detach()
+                    step_record["arm_source"] = arm_source
+                    step_record["gripper_source"] = gripper_source
+                if diagnostic_refresh_debug is not None and cache_latent is not None:
+                    z_lr_candidate = diagnostic_refresh_debug["z_pred"].detach()
+                    if self.lrnode_counterfactual_mode in {
+                        "full_arm_full_gripper",
+                        "lr_arm_lr_gripper",
+                        "lr_arm_full_gripper",
+                        "full_arm_lr_gripper",
+                    }:
+                        action_seq, arm_source, gripper_source = mix_action_tokens(
+                            diagnostic_refresh_debug["action_pred"],
+                            shadow["action"],
+                            self.lrnode_counterfactual_mode,
+                        )
+                        if arm_source == "lr":
+                            self.counterfactual_arm_lr_steps += 1
+                        else:
+                            self.counterfactual_arm_full_steps += 1
+                        if gripper_source == "lr":
+                            self.counterfactual_gripper_lr_steps += 1
+                        else:
+                            self.counterfactual_gripper_full_steps += 1
+                    elif self.lrnode_counterfactual_mode == "latent_fusion":
+                        cache_latent = fuse_latents(
+                            z_lr_candidate,
+                            cache_latent,
+                            self.lrnode_latent_fusion_alpha,
+                        )
+                        action_seq, fused_diagnostics = self._decode_diagnostic_latent(
+                            cache_latent
+                        )
+                        diagnostic_refresh_debug[
+                            "counterfactual_gripper_logit"
+                        ] = fused_diagnostics["gripper_logit"].detach()
+                        diagnostic_refresh_debug[
+                            "counterfactual_gripper_probability"
+                        ] = fused_diagnostics["gripper_probability"].detach()
+                        self.counterfactual_latent_fusion_steps += 1
+                        arm_source = "fusion"
+                        gripper_source = "fusion"
+                    elif self.lrnode_counterfactual_mode == "matched_random":
+                        seed = deterministic_step_seed(
+                            self.lrnode_matched_random_seed,
+                            self.current_task_id,
+                            self.current_episode_id,
+                            timestep,
+                        )
+                        cache_latent, learned_delta, random_delta = matched_random_latent(
+                            z_lr_candidate,
+                            cache_latent,
+                            seed=seed,
+                            norm_mode=self.lrnode_matched_random_norm_mode,
+                        )
+                        action_seq, random_diagnostics = self._decode_diagnostic_latent(
+                            cache_latent
+                        )
+                        diagnostic_refresh_debug.update(
+                            {
+                                "matched_random_seed": seed,
+                                "learned_delta": learned_delta.detach(),
+                                "random_delta": random_delta.detach(),
+                                "learned_delta_norm": float(
+                                    learned_delta.detach().float().norm().item()
+                                ),
+                                "random_delta_norm": float(
+                                    random_delta.detach().float().norm().item()
+                                ),
+                                "counterfactual_gripper_logit": random_diagnostics[
+                                    "gripper_logit"
+                                ].detach(),
+                                "counterfactual_gripper_probability": random_diagnostics[
+                                    "gripper_probability"
+                                ].detach(),
+                            }
+                        )
+                        self.counterfactual_matched_random_steps += 1
+                        arm_source = "random"
+                        gripper_source = "random"
+                    diagnostic_refresh_debug["executed_latent"] = cache_latent.detach()
+                    lrnode_debug = diagnostic_refresh_debug
+                    step_record["arm_source"] = arm_source
+                    step_record["gripper_source"] = gripper_source
+                    step_record["learned_delta_norm"] = float(
+                        diagnostic_refresh_debug.get("learned_delta_norm", 0.0)
+                    )
+                    step_record["random_delta_norm"] = float(
+                        diagnostic_refresh_debug.get("random_delta_norm", 0.0)
+                    )
                 self._cache_full_forward_state(
                     action_latent,
                     selected_step,
@@ -1209,11 +3384,41 @@ class ModelWrapper:
                     gripper,
                     state,
                     action_tokens=action_seq,
+                    action_arm=(
+                        None if full_diagnostics is None else full_diagnostics["arm"]
+                    ),
+                    gripper_logit=(
+                        None
+                        if full_diagnostics is None
+                        else full_diagnostics["gripper_logit"]
+                    ),
                     timestep=timestep,
                 )
+                if self.latentloop_segment_executor is not None:
+                    step_record["observation_cache_advanced"] = 1
+                    self.observation_cache_advance_calls += 1
+                if cache_latent is not None:
+                    self.lrnode_cached_latent = cache_latent.detach()
 
+            if shadow is not None:
+                shadow_ensemble_t0 = time.perf_counter()
+                (
+                    shadow_env_action,
+                    shadow_executed_probability,
+                    shadow_ensemble_candidate_count,
+                ) = self._shadow_action_sequence_to_env_action(
+                    shadow["action"],
+                    timestep,
+                )
+                shadow_ensemble_ms = (
+                    time.perf_counter() - shadow_ensemble_t0
+                ) * 1000.0
             if direct_env_action is None:
-                action = self._action_sequence_to_env_action(action_seq, timestep)
+                (
+                    action,
+                    executed_probability,
+                    ensemble_candidate_count,
+                ) = self._action_sequence_to_env_action(action_seq, timestep)
             else:
                 action = np.asarray(direct_env_action, dtype=np.float32)
             if step_record.get("mode") == "full":
@@ -1225,29 +3430,292 @@ class ModelWrapper:
                 if self.last_action_delta is None
                 else action_delta - self.last_action_delta
             )
+            transition_type = classify_transition(
+                self.previous_step_was_full,
+                step_record.get("mode") == "full",
+            )
+            arm_jerk = action_jerk[:6]
+            executed_gripper_probability = (
+                float(executed_probability[0, 6].detach().float().item())
+                if executed_probability is not None
+                else float((action_float[-1] + 1.0) / 2.0)
+            )
+            executed_gripper_logit = ""
+            if gripper_source == "full" and shadow is not None:
+                executed_gripper_logit = float(
+                    shadow["gripper_logit"][0, 0, 0].detach().float().item()
+                )
+            elif "counterfactual_gripper_logit" in lrnode_debug:
+                executed_gripper_logit = float(
+                    lrnode_debug["counterfactual_gripper_logit"][0, 0, 0]
+                    .detach()
+                    .float()
+                    .item()
+                )
+            elif lrnode_debug.get("action_pred_gripper_logit") is not None:
+                executed_gripper_logit = float(
+                    lrnode_debug["action_pred_gripper_logit"][0, 0, 0]
+                    .detach()
+                    .float()
+                    .item()
+                )
+            elif shadow is not None and step_record.get("mode") == "full":
+                executed_gripper_logit = float(
+                    shadow["gripper_logit"][0, 0, 0].detach().float().item()
+                )
             step_record.update(
                 {
                     "action_norm": float(np.linalg.norm(action_float)),
                     "action_delta_norm": float(np.linalg.norm(action_delta)),
                     "action_delta_l2": float(np.linalg.norm(action_delta)),
-                    "action_jerk": float(np.linalg.norm(action_jerk)),
-                    "action_jerk_l2": float(np.linalg.norm(action_jerk)),
-                    "arm_action_jerk": float(np.linalg.norm(action_jerk[:6])),
+                    "action_jerk": float(np.linalg.norm(arm_jerk)),
+                    "action_jerk_l2": float(np.linalg.norm(arm_jerk)),
+                    "arm_action_jerk": float(np.linalg.norm(arm_jerk)),
                     "trans_action_jerk": float(np.linalg.norm(action_jerk[:3])),
                     "rot_action_jerk": float(np.linalg.norm(action_jerk[3:6])),
                     "gripper_switch": float(
                         0.0 if self.last_action is None else abs(float(action_float[-1] != self.last_action[-1]))
                     ),
+                    "gripper_probability": executed_gripper_probability,
+                    "gripper_logit": executed_gripper_logit,
+                    "gripper_thresholded": float(action_float[-1]),
+                    "ensemble_candidate_count": int(ensemble_candidate_count),
+                    "shadow_ensemble_candidate_count": int(
+                        shadow_ensemble_candidate_count
+                    ),
+                    "transition_type": transition_type,
+                    "arm_source": step_record.get("arm_source", arm_source),
+                    "gripper_source": step_record.get("gripper_source", gripper_source),
+                    **{
+                        f"action_{index}": float(action_float[index])
+                        for index in range(7)
+                    },
                 }
             )
             self.last_action = action_float.copy()
             self.last_action_delta = action_delta.copy()
-            total_policy_ms = (time.perf_counter() - policy_t0) * 1000.0
-            step_record["total_policy_ms"] = total_policy_ms
-            self.policy_step_latency_sum += total_policy_ms
+            self.previous_step_was_full = step_record.get("mode") == "full"
+            policy_wall_ms = (time.perf_counter() - policy_t0) * 1000.0
+            is_full_step = step_record.get("mode") == "full"
+            requires_skip_shadow = (
+                not is_full_step
+                and counterfactual_requires_skip_shadow(
+                    self.lrnode_counterfactual_mode,
+                    self.lrnode_latent_fusion_mode,
+                )
+            )
+            if not requires_skip_shadow:
+                logging_only_shadow_ms = (
+                    shadow_diagnostic_ms
+                    + shadow_ensemble_ms
+                    + filter_diagnostic_ms
+                )
+                if self.lrnode_counterfactual_mode == "standard":
+                    logging_only_shadow_ms += refresh_diagnostic_ms
+            else:
+                required_shadow_forward_ms = (
+                    0.0 if shadow is None else float(shadow.get("latency_ms", 0.0))
+                )
+                logging_only_shadow_ms = (
+                    max(0.0, shadow_diagnostic_ms - required_shadow_forward_ms)
+                    + shadow_ensemble_ms
+                    + filter_diagnostic_ms
+                )
+            executed_policy_ms = max(0.0, policy_wall_ms - logging_only_shadow_ms)
+            diagnostic_full_forward_ms = (
+                float(step_record.get("full_forward_ms", 0.0))
+                if step_record.get("full_forward_role") == "diagnostic_only"
+                else 0.0
+            )
+            causal_executed_policy_ms = max(
+                0.0,
+                executed_policy_ms - diagnostic_full_forward_ms,
+            )
+            step_record["policy_wall_ms"] = policy_wall_ms
+            step_record["shadow_diagnostic_ms"] = shadow_diagnostic_ms
+            step_record["refresh_diagnostic_ms"] = refresh_diagnostic_ms
+            step_record["filter_diagnostic_ms"] = filter_diagnostic_ms
+            step_record["shadow_ensemble_ms"] = shadow_ensemble_ms
+            step_record["logging_only_shadow_ms"] = logging_only_shadow_ms
+            step_record["total_policy_ms"] = executed_policy_ms
+            step_record["protocol_policy_ms"] = executed_policy_ms
+            step_record["diagnostic_full_forward_ms"] = diagnostic_full_forward_ms
+            step_record["causal_executed_policy_ms"] = causal_executed_policy_ms
+            step_record["total_diagnostic_only_ms"] = (
+                logging_only_shadow_ms + diagnostic_full_forward_ms
+            )
+            self.policy_step_latency_sum += executed_policy_ms
             self.num_policy_steps += 1
             self.current_step_records.append(step_record)
+            if self._trace_enabled_for_current_episode():
+                trace_scalar = dict(step_record)
+                trace_scalar.update(
+                    {
+                        "full_refresh_flag": int(step_record.get("mode") == "full"),
+                        "shadow_action_available": int(shadow is not None),
+                        "shadow_gripper_probability": (
+                            ""
+                            if shadow is None
+                            else float(
+                                shadow["gripper_probability"][0, 0, 0]
+                                .detach()
+                                .float()
+                                .item()
+                            )
+                        ),
+                        "shadow_gripper_logit": (
+                            ""
+                            if shadow is None
+                            else float(
+                                shadow["gripper_logit"][0, 0, 0]
+                                .detach()
+                                .float()
+                                .item()
+                            )
+                        ),
+                    }
+                )
+                trace_tensors = {
+                    "z_previous": previous_cached_latent,
+                    "z_lr": lrnode_debug.get(
+                        "z_pred",
+                        None if shadow is None else shadow["latent"],
+                    ),
+                    "z_prior": z_prior,
+                    "z_full": z_full if z_full is not None else (
+                        None if shadow is None else shadow["latent"]
+                    ),
+                    "z_filter": z_filter,
+                    "z_executed": lrnode_debug.get(
+                        "executed_latent",
+                        self.lrnode_cached_latent,
+                    ),
+                    "lr_gate": lrnode_debug.get("lrnode_gate"),
+                    "lr_update": lrnode_debug.get("lrnode_update"),
+                    "u_delta": lrnode_debug.get("u_delta"),
+                    "a_lr_raw": lrnode_debug.get(
+                        "action_pred",
+                        None if shadow is None else shadow["action"],
+                    ),
+                    "a_prior_raw": prior_action_seq,
+                    "a_full_raw": full_action_seq if full_action_seq is not None else (
+                        None if shadow is None else shadow["action"]
+                    ),
+                    "a_filter_raw": filter_action_seq,
+                    "a_executed_raw": action_seq,
+                    "a_executed_final": action_float,
+                    "a_lr_executed": action_float,
+                    "a_full_shadow_executed": shadow_env_action,
+                    "a_lr_post_ensemble": executed_probability,
+                    "a_full_post_ensemble": shadow_executed_probability,
+                    "learned_delta": lrnode_debug.get("learned_delta"),
+                    "random_delta": lrnode_debug.get("random_delta"),
+                }
+                if not self.lrnode_trace_save_latents:
+                    for key in (
+                        "z_previous",
+                        "z_lr",
+                        "z_prior",
+                        "z_full",
+                        "z_filter",
+                        "z_executed",
+                    ):
+                        trace_tensors.pop(key, None)
+                self.current_trace_scalars.append(trace_scalar)
+                self.current_trace_tensors.append(trace_tensors)
 
+            if self.latentloop_plan_trace:
+                raw_horizon = lrnode_debug.get("action_pred", action_seq)
+                raw_logit = lrnode_debug.get("action_pred_gripper_logit")
+                raw_probability = lrnode_debug.get(
+                    "action_pred_gripper_probability"
+                )
+                if raw_horizon is None:
+                    raise RuntimeError(
+                        "Plan trace requires a raw P-token horizon before ensembling"
+                    )
+                if raw_probability is None:
+                    raw_probability = raw_horizon[..., 6:]
+                if raw_logit is None:
+                    raise RuntimeError(
+                        "Plan trace requires the pre-sigmoid gripper logit"
+                    )
+                if raw_horizon.shape != (1, self.action_pred_steps, 7):
+                    raise RuntimeError(
+                        "Plan trace raw horizon must be [1,P,7], got "
+                        f"{tuple(raw_horizon.shape)}"
+                    )
+                if direct_env_action is not None:
+                    post_probability = torch.as_tensor(action_float).float()
+                    post_probability[-1] = (post_probability[-1] + 1.0) / 2.0
+                else:
+                    post_probability = executed_probability.detach().float().cpu()[0]
+                plan_scalar = {
+                    "row_id": self.latentloop_plan_trace_row_id,
+                    "paired_group": self.latentloop_plan_trace_paired_group,
+                    "task_id": int(self.current_task_id),
+                    "episode_id": int(self.current_episode_id),
+                    "timestep": int(timestep),
+                    "mode": step_record.get("mode", ""),
+                    "cache_age": int(step_record.get("cache_age", 0)),
+                    "feature_source_step": int(
+                        step_record.get("feature_source_step", timestep)
+                    ),
+                    "full_refresh_flag": int(step_record.get("mode") == "full"),
+                    "primary_raw_change_l1": float(
+                        step_record.get("primary_raw_change_l1", 0.0)
+                    ),
+                    "wrist_raw_change_l1": float(
+                        step_record.get("wrist_raw_change_l1", 0.0)
+                    ),
+                    "primary_preprocessed_change_l1": float(
+                        step_record.get("image_diff_primary_l1", 0.0)
+                    ),
+                    "wrist_preprocessed_change_l1": float(
+                        step_record.get("image_diff_wrist_l1", 0.0)
+                    ),
+                    "proprio_delta_l2": float(
+                        step_record.get("proprio_delta_l2", 0.0)
+                    ),
+                    "u_delta_norm": float(step_record.get("u_delta_norm", 0.0)),
+                    "feedback_source": step_record.get(
+                        "feedback_source", self.latentloop_feedback_source
+                    ),
+                    "time_shift_initialized_with_zero": int(
+                        step_record.get("time_shift_initialized_with_zero", 0)
+                    ),
+                    "replay_execution_token_idx": step_record.get(
+                        "token_idx_used", ""
+                    ),
+                }
+                plan_tensors = {
+                    "raw_action_arm": raw_horizon.detach().float().cpu()[0, :, :6],
+                    "raw_gripper_logit": raw_logit.detach().float().cpu()[0],
+                    "raw_gripper_probability": raw_probability.detach().float().cpu()[0],
+                    "raw_gripper_thresholded": (
+                        raw_probability.detach().float().cpu()[0] > 0.5
+                    ).float(),
+                    "post_ensemble_probability": post_probability,
+                    "executed_action": torch.as_tensor(action_float).float(),
+                    "proprio_delta": torch.as_tensor(
+                        np.zeros_like(raw_proprio_for_trace)
+                        if self.previous_raw_proprio is None
+                        else raw_proprio_for_trace - self.previous_raw_proprio
+                    ).float(),
+                    "u_delta": lrnode_debug.get("u_delta"),
+                    "action_latent": lrnode_debug.get(
+                        "executed_latent", lrnode_debug.get("z_pred")
+                    ),
+                }
+                if not self.latentloop_plan_trace_save_latents:
+                    plan_tensors.pop("action_latent", None)
+                self.current_plan_trace_scalars.append(plan_scalar)
+                self.current_plan_trace_tensors.append(plan_tensors)
+
+        if self.latentloop_plan_trace:
+            self.previous_raw_primary = raw_primary_for_trace.copy()
+            self.previous_raw_wrist = raw_wrist_for_trace.copy()
+            self.previous_raw_proprio = raw_proprio_for_trace.copy()
         self.gripper_state = np.array([action[-1]])
         return action
 
@@ -1256,6 +3724,7 @@ def evaluate_libero_task(task, env, obs, args, model):
     steps = 0
     success = 0
     model.reset()
+    model.set_episode_context(task, env)
     goal = task.language
 
     save_video_flag = bool(int(os.environ.get("SAVE_VIDEO", "0"))) or bool(getattr(args, "save_video", False))
@@ -1288,7 +3757,13 @@ def evaluate_libero_task(task, env, obs, args, model):
 
             env_t0 = time.perf_counter()
             obs, reward, done, info = env.step(action)
-            model.record_env_step_ms((time.perf_counter() - env_t0) * 1000.0)
+            model.record_env_step_ms(
+                (time.perf_counter() - env_t0) * 1000.0,
+                observation=obs,
+                reward=reward,
+                done=done,
+                info=info,
+            )
             if done:
                 success = 1
                 break
@@ -1329,29 +3804,37 @@ def evaluate_policy_ddp(args, model):
     control_hz = _eval_control_hz()
     settle_steps = _settle_steps(control_hz)
     env_horizon = _env_horizon(args.libero_eval_max_steps, settle_steps)
-    if "libero" in args.finetune_type:
-        if args.finetune_type == "libero_10":
-            global num_eval_episodes
-            global task_num
-            num_eval_episodes = int(os.environ.get("EVAL_NUM_EPISODES_PER_TASK", "20"))
-            task_num = int(os.environ.get("EVAL_NUM_TASKS", "10"))
-            if num_eval_episodes <= 0:
-                raise ValueError(f"EVAL_NUM_EPISODES_PER_TASK must be positive, got {num_eval_episodes}")
-            if task_num <= 0 or task_num > 10:
-                raise ValueError(f"EVAL_NUM_TASKS must be in [1, 10], got {task_num}")
+    supported_libero_suites = {
+        "libero_spatial",
+        "libero_object",
+        "libero_goal",
+        "libero_10",
+    }
+    if args.finetune_type in supported_libero_suites:
+        global num_eval_episodes
+        global task_num
+        num_eval_episodes = int(os.environ.get("EVAL_NUM_EPISODES_PER_TASK", "20"))
+        task_num = int(os.environ.get("EVAL_NUM_TASKS", "10"))
+        suite_task_count = int(task_suite.get_num_tasks())
+        if num_eval_episodes <= 0:
+            raise ValueError(f"EVAL_NUM_EPISODES_PER_TASK must be positive, got {num_eval_episodes}")
+        if task_num <= 0 or task_num > suite_task_count:
+            raise ValueError(
+                f"EVAL_NUM_TASKS must be in [1, {suite_task_count}] for "
+                f"{args.finetune_type}, got {task_num}"
+            )
 
-            NUM_SEQUENCES = num_eval_episodes * task_num
-            eval_sequences = list(range(NUM_SEQUENCES))
-            interval_len = int(np.ceil(NUM_SEQUENCES / device_num))
-            eval_sequences = eval_sequences[
-                device_id * interval_len:min((device_id + 1) * interval_len, NUM_SEQUENCES)
-            ]
-            eval_sequence_ids = list(eval_sequences)
-            eval_sequences = tqdm(eval_sequence_ids)
-        else:
-            raise NotImplementedError
+        NUM_SEQUENCES = num_eval_episodes * task_num
+        eval_sequences = list(range(NUM_SEQUENCES))
+        interval_len = int(np.ceil(NUM_SEQUENCES / device_num))
+        eval_sequences = eval_sequences[
+            device_id * interval_len:min((device_id + 1) * interval_len, NUM_SEQUENCES)
+        ]
+        eval_sequence_ids = list(eval_sequences)
+        eval_sequences = tqdm(eval_sequence_ids)
     else:
         raise NotImplementedError
+    progress_started_at_unix_s = time.time()
     for eval_id in eval_sequences:
         task_id = eval_id // num_eval_episodes
         exp_id = eval_id % num_eval_episodes
@@ -1364,7 +3847,7 @@ def evaluate_policy_ddp(args, model):
             "bddl_file_name": task_bddl_file,
             "camera_heights": args.libero_img_size,
             "camera_widths": args.libero_img_size,
-            "render_gpu_device_id": device_id,
+            "render_gpu_device_id": _renderer_gpu_device_id(device_id),
             "control_freq": int(round(control_hz)),
             "horizon": env_horizon,
         }
@@ -1380,6 +3863,7 @@ def evaluate_policy_ddp(args, model):
         env.task_name = task_name
         env.task_suite_name = args.finetune_type
         env.reset()
+        verify_renderer_backend(env, env_args["render_gpu_device_id"])
         env.seed(args.seed)
 
         # set initial state
@@ -1403,6 +3887,7 @@ def evaluate_policy_ddp(args, model):
             total_sequences=NUM_SEQUENCES,
             local_assigned=len(eval_sequence_ids),
             last_eval_id=eval_id,
+            started_at_unix_s=progress_started_at_unix_s,
         )
 
     def merge_multi_list(res):
@@ -1417,6 +3902,9 @@ def evaluate_policy_ddp(args, model):
     local_lrnode_stats = model.get_lrnode_stats()
     all_lrnode_stats = [None for _ in range(device_num)] if torch.distributed.get_rank() == 0 else None
     torch.distributed.gather_object(local_lrnode_stats, all_lrnode_stats, dst=0)
+    local_renderer_metadata = get_renderer_backend_metadata()
+    all_renderer_metadata = [None for _ in range(device_num)] if torch.distributed.get_rank() == 0 else None
+    torch.distributed.gather_object(local_renderer_metadata, all_renderer_metadata, dst=0)
     all_episode_metrics = [None for _ in range(device_num)] if torch.distributed.get_rank() == 0 else None
     torch.distributed.gather_object(local_episode_metrics, all_episode_metrics, dst=0)
 
@@ -1425,7 +3913,14 @@ def evaluate_policy_ddp(args, model):
         res_tup_list.sort(key=lambda x: x[1])
         episode_metrics_list = merge_multi_list(all_episode_metrics)
         print_and_save(res_tup_list, task_suite)
-        save_eval_json(args, res_tup_list, task_suite, all_lrnode_stats, episode_metrics_list)
+        save_eval_json(
+            args,
+            res_tup_list,
+            task_suite,
+            all_lrnode_stats,
+            episode_metrics_list,
+            all_renderer_metadata,
+        )
 
 
 def print_and_save(result_list, task_suite):
@@ -1441,6 +3936,33 @@ def print_and_save(result_list, task_suite):
 
 
 def merge_lrnode_stats(stats_list):
+    def merge_matrix(target, incoming, operation):
+        if not incoming:
+            return target
+        normalized = [[int(value) for value in row] for row in incoming]
+        if not target:
+            return normalized
+        if len(target) != len(normalized) or any(
+            len(left) != len(right) for left, right in zip(target, normalized)
+        ):
+            raise RuntimeError("FastV retention matrix shape differs across ranks")
+        if operation == "sum":
+            return [
+                [left + right for left, right in zip(left_row, right_row)]
+                for left_row, right_row in zip(target, normalized)
+            ]
+        if operation == "min":
+            return [
+                [min(left, right) for left, right in zip(left_row, right_row)]
+                for left_row, right_row in zip(target, normalized)
+            ]
+        if operation == "max":
+            return [
+                [max(left, right) for left, right in zip(left_row, right_row)]
+                for left_row, right_row in zip(target, normalized)
+            ]
+        raise ValueError(f"Unknown matrix merge operation: {operation}")
+
     merged = {
         "num_env_steps": 0,
         "full_forward_calls": 0,
@@ -1451,6 +3973,13 @@ def merge_lrnode_stats(stats_list):
         "hold_latent_steps": 0,
         "chunk_token_steps": 0,
         "no_delta_steps": 0,
+        "latentloop_segment_grid_enabled": 0,
+        "segment_length": 1,
+        "feedback_schedule": "not_applicable",
+        "planned_feedback_density": None,
+        "observation_conditioned_update_calls": 0,
+        "zero_feature_update_calls": 0,
+        "observation_cache_advance_calls": 0,
         "num_fallback_full_calls": 0,
         "full_forward_latency_sum": 0.0,
         "full_action_head_latency_sum": 0.0,
@@ -1469,6 +3998,51 @@ def merge_lrnode_stats(stats_list):
         "shadow_action_l2_sum": 0.0,
         "shadow_action_hold_l1_sum": 0.0,
         "shadow_by_age": {},
+        "counterfactual_arm_lr_steps": 0,
+        "counterfactual_arm_full_steps": 0,
+        "counterfactual_gripper_lr_steps": 0,
+        "counterfactual_gripper_full_steps": 0,
+        "counterfactual_latent_fusion_steps": 0,
+        "counterfactual_matched_random_steps": 0,
+        "counterfactual_mode": "standard",
+        "counterfactual_mix_stage": "pre_ensemble",
+        "every_step_filter_mode": "off",
+        "every_step_filter_alpha": 0.5,
+        "every_step_filter_beta": 0.5,
+        "every_step_filter_diagnostics": 0,
+        "every_step_filter_prior_calls": 0,
+        "every_step_filter_fusion_calls": 0,
+        "every_step_filter_action_head_calls": 0,
+        "every_step_filter_diagnostic_action_head_calls": 0,
+        "every_step_filter_prior_latency_sum": 0.0,
+        "every_step_filter_fusion_latency_sum": 0.0,
+        "every_step_filter_action_head_latency_sum": 0.0,
+        "every_step_filter_diagnostic_latency_sum": 0.0,
+        "every_step_filter_rng_checks": 0,
+        "every_step_filter_rng_failures": 0,
+        "query_reduction_claim_allowed": 1,
+        "fastv_enabled": 0,
+        "fastv_retention_diagnostics": 0,
+        "fastv_runtime_calls": 0,
+        "fastv_runtime_mismatches": 0,
+        "fastv_prune_layer": -1,
+        "fastv_prune_ratio": 0.0,
+        "fastv_tokens_before_pruning": 0,
+        "fastv_tokens_after_pruning": 0,
+        "fastv_visual_tokens_before_pruning": 0,
+        "fastv_visual_tokens_after_pruning": 0,
+        "fastv_pruned_transformer_layers": 0,
+        "fastv_score_layer_count": 0,
+        "fastv_score_mode": "last_token_at_l",
+        "fastv_score_query_indices": [],
+        "fastv_selection_scope": "global_visual",
+        "fastv_camera_names": [],
+        "fastv_original_visual_tokens_by_timestep_camera": [],
+        "fastv_retention_calls": 0,
+        "fastv_retained_token_sum_by_timestep_camera": [],
+        "fastv_zero_retention_calls_by_timestep_camera": [],
+        "fastv_min_retained_tokens_by_timestep_camera": [],
+        "fastv_max_retained_tokens_by_timestep_camera": [],
     }
     for item in stats_list:
         if item is None:
@@ -1479,6 +4053,12 @@ def merge_lrnode_stats(stats_list):
         fast_encoder_calls = int(item.get("fast_encoder_calls", 0))
         action_head_calls = int(item.get("action_head_calls", 0))
         shadow_calls = int(item.get("shadow_full_forward_calls", 0))
+        filter_prior_calls = int(
+            item.get("every_step_filter_prior_calls", 0)
+        )
+        filter_action_head_calls = int(
+            item.get("every_step_filter_action_head_calls", 0)
+        )
         merged["num_env_steps"] += env_steps
         merged["full_forward_calls"] += full_calls
         merged["lrnode_update_calls"] += lrnode_calls
@@ -1488,6 +4068,192 @@ def merge_lrnode_stats(stats_list):
         merged["hold_latent_steps"] += int(item.get("hold_latent_steps", 0))
         merged["chunk_token_steps"] += int(item.get("chunk_token_steps", 0))
         merged["no_delta_steps"] += int(item.get("no_delta_steps", 0))
+        merged["latentloop_segment_grid_enabled"] = max(
+            merged["latentloop_segment_grid_enabled"],
+            int(item.get("latentloop_segment_grid_enabled", 0)),
+        )
+        merged["segment_length"] = int(
+            item.get("segment_length", merged["segment_length"])
+        )
+        merged["feedback_schedule"] = item.get(
+            "feedback_schedule", merged["feedback_schedule"]
+        )
+        if item.get("planned_feedback_density") is not None:
+            merged["planned_feedback_density"] = float(
+                item["planned_feedback_density"]
+            )
+        merged["observation_conditioned_update_calls"] += int(
+            item.get("observation_conditioned_update_calls", 0)
+        )
+        merged["zero_feature_update_calls"] += int(
+            item.get("zero_feature_update_calls", 0)
+        )
+        merged["observation_cache_advance_calls"] += int(
+            item.get("observation_cache_advance_calls", 0)
+        )
+        merged["every_step_filter_mode"] = item.get(
+            "every_step_filter_mode",
+            merged["every_step_filter_mode"],
+        )
+        merged["every_step_filter_alpha"] = float(
+            item.get(
+                "every_step_filter_alpha",
+                merged["every_step_filter_alpha"],
+            )
+        )
+        merged["every_step_filter_beta"] = float(
+            item.get(
+                "every_step_filter_beta",
+                merged["every_step_filter_beta"],
+            )
+        )
+        merged["every_step_filter_diagnostics"] = int(
+            item.get("every_step_filter_diagnostics", 0)
+        )
+        merged["every_step_filter_prior_calls"] += filter_prior_calls
+        merged["every_step_filter_fusion_calls"] += int(
+            item.get("every_step_filter_fusion_calls", 0)
+        )
+        merged["every_step_filter_action_head_calls"] += (
+            filter_action_head_calls
+        )
+        merged["every_step_filter_diagnostic_action_head_calls"] += int(
+            item.get("every_step_filter_diagnostic_action_head_calls", 0)
+        )
+        merged["every_step_filter_rng_checks"] += int(
+            item.get("every_step_filter_rng_checks", 0)
+        )
+        merged["every_step_filter_rng_failures"] += int(
+            item.get("every_step_filter_rng_failures", 0)
+        )
+        merged["query_reduction_claim_allowed"] = min(
+            merged["query_reduction_claim_allowed"],
+            int(item.get("query_reduction_claim_allowed", 1)),
+        )
+        merged["fastv_enabled"] = max(
+            merged["fastv_enabled"], int(item.get("fastv_enabled", 0))
+        )
+        retention_diagnostics = int(
+            item.get("fastv_retention_diagnostics", 0)
+        )
+        merged["fastv_retention_diagnostics"] = max(
+            merged["fastv_retention_diagnostics"], retention_diagnostics
+        )
+        merged["fastv_runtime_calls"] += int(
+            item.get("fastv_runtime_calls", 0)
+        )
+        merged["fastv_runtime_mismatches"] += int(
+            item.get("fastv_runtime_mismatches", 0)
+        )
+        for key in (
+            "fastv_prune_layer",
+            "fastv_tokens_before_pruning",
+            "fastv_tokens_after_pruning",
+            "fastv_visual_tokens_before_pruning",
+            "fastv_visual_tokens_after_pruning",
+            "fastv_pruned_transformer_layers",
+            "fastv_score_layer_count",
+        ):
+            merged[key] = int(item.get(key, merged[key]))
+        merged["fastv_prune_ratio"] = float(
+            item.get("fastv_prune_ratio", merged["fastv_prune_ratio"])
+        )
+        merged["fastv_score_mode"] = str(
+            item.get("fastv_score_mode", merged["fastv_score_mode"])
+        )
+        score_query_indices = [
+            int(index) for index in item.get("fastv_score_query_indices", [])
+        ]
+        if merged["fastv_score_query_indices"]:
+            if score_query_indices != merged["fastv_score_query_indices"]:
+                raise RuntimeError(
+                    "FastV score-query indices differ across evaluation ranks"
+                )
+        else:
+            merged["fastv_score_query_indices"] = score_query_indices
+        selection_scope = str(
+            item.get("fastv_selection_scope", merged["fastv_selection_scope"])
+        )
+        if (
+            merged["fastv_retention_calls"] > 0
+            and selection_scope != merged["fastv_selection_scope"]
+        ):
+            raise RuntimeError("FastV selection scope differs across evaluation ranks")
+        merged["fastv_selection_scope"] = selection_scope
+        camera_names = list(item.get("fastv_camera_names", []))
+        if camera_names:
+            if merged["fastv_camera_names"] and camera_names != merged["fastv_camera_names"]:
+                raise RuntimeError("FastV camera names differ across evaluation ranks")
+            merged["fastv_camera_names"] = camera_names
+        original_matrix = item.get(
+            "fastv_original_visual_tokens_by_timestep_camera", []
+        )
+        if original_matrix:
+            normalized_original = [
+                [int(value) for value in row] for row in original_matrix
+            ]
+            if (
+                merged["fastv_original_visual_tokens_by_timestep_camera"]
+                and normalized_original
+                != merged["fastv_original_visual_tokens_by_timestep_camera"]
+            ):
+                raise RuntimeError(
+                    "FastV original visual-token topology differs across ranks"
+                )
+            merged["fastv_original_visual_tokens_by_timestep_camera"] = (
+                normalized_original
+            )
+        retention_calls = int(item.get("fastv_retention_calls", 0))
+        if (
+            int(item.get("fastv_enabled", 0))
+            and retention_diagnostics
+            and retention_calls != full_calls
+        ):
+            raise RuntimeError(
+                "FastV retention diagnostics did not cover every local full forward"
+            )
+        if not retention_diagnostics and retention_calls:
+            raise RuntimeError(
+                "FastV retention counts exist while diagnostics are disabled"
+            )
+        merged["fastv_retention_calls"] += retention_calls
+        merged["fastv_retained_token_sum_by_timestep_camera"] = merge_matrix(
+            merged["fastv_retained_token_sum_by_timestep_camera"],
+            item.get("fastv_retained_token_sum_by_timestep_camera", []),
+            "sum",
+        )
+        merged["fastv_zero_retention_calls_by_timestep_camera"] = merge_matrix(
+            merged["fastv_zero_retention_calls_by_timestep_camera"],
+            item.get("fastv_zero_retention_calls_by_timestep_camera", []),
+            "sum",
+        )
+        merged["fastv_min_retained_tokens_by_timestep_camera"] = merge_matrix(
+            merged["fastv_min_retained_tokens_by_timestep_camera"],
+            item.get("fastv_min_retained_tokens_by_timestep_camera", []),
+            "min",
+        )
+        merged["fastv_max_retained_tokens_by_timestep_camera"] = merge_matrix(
+            merged["fastv_max_retained_tokens_by_timestep_camera"],
+            item.get("fastv_max_retained_tokens_by_timestep_camera", []),
+            "max",
+        )
+        for key in (
+            "counterfactual_arm_lr_steps",
+            "counterfactual_arm_full_steps",
+            "counterfactual_gripper_lr_steps",
+            "counterfactual_gripper_full_steps",
+            "counterfactual_latent_fusion_steps",
+            "counterfactual_matched_random_steps",
+        ):
+            merged[key] += int(item.get(key, 0))
+        merged["counterfactual_mode"] = item.get(
+            "counterfactual_mode",
+            merged["counterfactual_mode"],
+        )
+        merged["counterfactual_mix_stage"] = item.get(
+            "counterfactual_mix_stage",
+            merged["counterfactual_mix_stage"],
+        )
         merged["num_fallback_full_calls"] += int(item.get("num_fallback_full_calls", 0))
         merged["full_forward_latency_sum"] += float(item.get("avg_full_forward_latency_sec", 0.0)) * full_calls
         merged["full_action_head_latency_sum"] += (
@@ -1502,6 +4268,32 @@ def merge_lrnode_stats(stats_list):
         merged["action_head_latency_sum"] += float(item.get("avg_action_head_latency_sec", 0.0)) * action_head_calls
         merged["policy_step_latency_sum"] += float(item.get("avg_policy_step_latency_sec", 0.0)) * env_steps
         merged["env_step_latency_sum"] += float(item.get("avg_env_step_latency_sec", 0.0)) * env_steps
+        merged["every_step_filter_prior_latency_sum"] += (
+            float(item.get("avg_every_step_filter_prior_latency_sec", 0.0))
+            * filter_prior_calls
+        )
+        merged["every_step_filter_fusion_latency_sum"] += (
+            float(item.get("avg_every_step_filter_fusion_latency_sec", 0.0))
+            * env_steps
+        )
+        merged["every_step_filter_action_head_latency_sum"] += (
+            float(
+                item.get(
+                    "avg_every_step_filter_action_head_latency_sec",
+                    0.0,
+                )
+            )
+            * filter_action_head_calls
+        )
+        merged["every_step_filter_diagnostic_latency_sum"] += (
+            float(
+                item.get(
+                    "avg_every_step_filter_diagnostic_latency_sec",
+                    0.0,
+                )
+            )
+            * env_steps
+        )
         merged["shadow_full_forward_calls"] += shadow_calls
         merged["shadow_full_forward_latency_sum"] += float(item.get("shadow_avg_full_forward_latency_sec", 0.0)) * shadow_calls
         merged["shadow_latent_mse_sum"] += float(item.get("shadow_latent_mse", 0.0)) * shadow_calls
@@ -1524,7 +4316,9 @@ def merge_lrnode_stats(stats_list):
     # also executes the shared action head once.
     merged["skip_action_head_calls"] = merged["action_head_calls"]
     merged["total_action_head_calls"] = (
-        merged["full_forward_calls"] + merged["skip_action_head_calls"]
+        merged["full_forward_calls"]
+        + merged["skip_action_head_calls"]
+        + merged["every_step_filter_action_head_calls"]
     )
     merged["avg_full_forward_latency_sec"] = (
         merged["full_forward_latency_sum"] / merged["full_forward_calls"]
@@ -1571,7 +4365,11 @@ def merge_lrnode_stats(stats_list):
         if merged["num_env_steps"]
         else 0.0
     )
-    merged["effective_query_reduction"] = merged["lrnode_update_calls"] / total_calls if total_calls else 0.0
+    merged["effective_query_reduction"] = (
+        merged["lrnode_update_calls"] / total_calls
+        if total_calls and merged["query_reduction_claim_allowed"]
+        else 0.0
+    )
     merged["full_query_reduction_ratio"] = (
         1.0 - (merged["full_forward_calls"] / merged["num_env_steps"])
         if merged["num_env_steps"]
@@ -1581,6 +4379,38 @@ def merge_lrnode_stats(stats_list):
         merged["num_env_steps"] / merged["full_forward_calls"]
         if merged["full_forward_calls"]
         else 0.0
+    )
+    merged["full_forward_calls_per_policy_step"] = (
+        merged["full_forward_calls"] / merged["num_env_steps"]
+        if merged["num_env_steps"] else 0.0
+    )
+    feedback_call_count = (
+        merged["observation_conditioned_update_calls"]
+        + merged["zero_feature_update_calls"]
+    )
+    merged["actual_feedback_density"] = (
+        merged["observation_conditioned_update_calls"] / feedback_call_count
+        if feedback_call_count else None
+    )
+    merged["avg_every_step_filter_prior_latency_sec"] = (
+        merged["every_step_filter_prior_latency_sum"]
+        / merged["every_step_filter_prior_calls"]
+        if merged["every_step_filter_prior_calls"] else 0.0
+    )
+    merged["avg_every_step_filter_fusion_latency_sec"] = (
+        merged["every_step_filter_fusion_latency_sum"]
+        / merged["num_env_steps"]
+        if merged["num_env_steps"] else 0.0
+    )
+    merged["avg_every_step_filter_action_head_latency_sec"] = (
+        merged["every_step_filter_action_head_latency_sum"]
+        / merged["every_step_filter_action_head_calls"]
+        if merged["every_step_filter_action_head_calls"] else 0.0
+    )
+    merged["avg_every_step_filter_diagnostic_latency_sec"] = (
+        merged["every_step_filter_diagnostic_latency_sum"]
+        / merged["num_env_steps"]
+        if merged["num_env_steps"] else 0.0
     )
     merged["shadow_avg_full_forward_latency_sec"] = (
         merged["shadow_full_forward_latency_sum"] / merged["shadow_full_forward_calls"]
@@ -1634,7 +4464,15 @@ def _write_latency_profile(path, episode_metrics):
         "fast_delta_encoder_ms": "avg_fast_encoder_ms",
         "node_update_ms": "avg_node_update_ms",
         "skip_action_head_ms": "avg_action_head_ms",
+        "filter_prior_ms": "avg_filter_prior_ms",
+        "filter_fusion_ms": "avg_filter_fusion_ms",
+        "filter_action_head_ms": "avg_filter_action_head_ms",
+        "filter_diagnostic_ms": "avg_filter_diagnostic_ms",
         "policy_total_ms": "avg_policy_step_ms",
+        "protocol_policy_ms": "avg_protocol_policy_ms",
+        "causal_executed_policy_ms": "avg_causal_executed_policy_ms",
+        "diagnostic_full_forward_ms": "avg_diagnostic_full_forward_ms",
+        "diagnostic_only_total_ms": "avg_total_diagnostic_only_ms",
         "env_step_ms": "avg_env_step_ms",
         "e2e_step_ms": "avg_policy_step_ms",
         "action_delta_l2": "avg_action_delta_l2",
@@ -1643,11 +4481,17 @@ def _write_latency_profile(path, episode_metrics):
     profile = {}
     for out_key, metric_key in key_map.items():
         profile[out_key] = _profile_values([item.get(metric_key, 0.0) for item in episode_metrics])
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(profile, f, indent=2)
+    _atomic_write_json(Path(path), profile)
 
 
-def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_metrics=None):
+def save_eval_json(
+    args,
+    result_list,
+    task_suite,
+    lrnode_stats_list,
+    episode_metrics=None,
+    renderer_metadata_list=None,
+):
     log_dir = os.environ.get("LOG_DIR")
     if log_dir:
         output_dir = os.path.join(log_dir, "analysis")
@@ -1658,6 +4502,17 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
     success_rate = float(np.mean(valid_results)) if valid_results else 0.0
     lrnode_stats = merge_lrnode_stats(lrnode_stats_list)
     episode_metrics = episode_metrics or []
+    renderer_metadata_list = [
+        item for item in (renderer_metadata_list or []) if item is not None
+    ]
+    renderer_metadata_list.sort(key=lambda item: int(item.get("process_rank", -1)))
+    renderer_backend = get_renderer_backend_metadata()
+    renderer_backend["rank_contexts"] = renderer_metadata_list
+    renderer_backend["all_ranks_actual_context_verified"] = bool(
+        renderer_metadata_list
+        and len(renderer_metadata_list) == torch.distributed.get_world_size()
+        and all(item.get("actual_context_verified") for item in renderer_metadata_list)
+    )
     control_hz = _eval_control_hz()
     settle_steps = _settle_steps(control_hz)
     env_horizon = _env_horizon(args.libero_eval_max_steps, settle_steps)
@@ -1694,6 +4549,43 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
             }
         )
 
+    retention_calls = int(lrnode_stats.get("fastv_retention_calls", 0))
+    retention_sum = lrnode_stats.get(
+        "fastv_retained_token_sum_by_timestep_camera", []
+    )
+    retention_original = lrnode_stats.get(
+        "fastv_original_visual_tokens_by_timestep_camera", []
+    )
+    if retention_calls:
+        retention_mean = [
+            [float(value) / retention_calls for value in row]
+            for row in retention_sum
+        ]
+        retention_fraction = [
+            [
+                (
+                    float(retained)
+                    / (retention_calls * float(original))
+                    if original
+                    else 0.0
+                )
+                for retained, original in zip(retained_row, original_row)
+            ]
+            for retained_row, original_row in zip(
+                retention_sum, retention_original
+            )
+        ]
+        zero_retention_fraction = [
+            [float(value) / retention_calls for value in row]
+            for row in lrnode_stats.get(
+                "fastv_zero_retention_calls_by_timestep_camera", []
+            )
+        ]
+    else:
+        retention_mean = []
+        retention_fraction = []
+        zero_retention_fraction = []
+
     payload = {
         "run_name": args.run_name,
         "suite": args.finetune_type,
@@ -1702,6 +4594,13 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
         "lrnode_no_delta_mode": getattr(args, "lrnode_no_delta_mode", "zero"),
         "lrnode_chunk_token_policy": getattr(args, "lrnode_chunk_token_policy", "skip_only"),
         "lrnode_query_interval": query_interval,
+        "segment_length": int(lrnode_stats.get("segment_length", query_interval)),
+        "feedback_schedule": lrnode_stats.get(
+            "feedback_schedule", "not_applicable"
+        ),
+        "actual_feedback_density": lrnode_stats.get(
+            "actual_feedback_density"
+        ),
         "control_freq": int(round(control_hz)),
         "num_env_steps": int(lrnode_stats.get("num_env_steps", 0)),
         "num_full_forward_calls": int(lrnode_stats.get("full_forward_calls", 0)),
@@ -1710,10 +4609,19 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
         "num_action_head_calls": int(lrnode_stats.get("action_head_calls", 0)),
         "num_skip_action_head_calls": int(lrnode_stats.get("skip_action_head_calls", 0)),
         "num_total_action_head_calls": int(lrnode_stats.get("total_action_head_calls", 0)),
+        "num_filter_action_head_calls": int(
+            lrnode_stats.get("every_step_filter_action_head_calls", 0)
+        ),
         "num_hold_action_steps": int(lrnode_stats.get("hold_action_steps", 0)),
         "num_hold_latent_steps": int(lrnode_stats.get("hold_latent_steps", 0)),
         "num_chunk_token_steps": int(lrnode_stats.get("chunk_token_steps", 0)),
         "num_no_delta_steps": int(lrnode_stats.get("no_delta_steps", 0)),
+        "num_observation_conditioned_updater_calls": int(
+            lrnode_stats.get("observation_conditioned_update_calls", 0)
+        ),
+        "num_zero_feature_updater_calls": int(
+            lrnode_stats.get("zero_feature_update_calls", 0)
+        ),
         "full_query_reduction_ratio": float(lrnode_stats.get("full_query_reduction_ratio", 0.0)),
         "effective_full_query_hz": effective_full_query_hz,
         "effective_lrnode_update_hz": effective_lrnode_update_hz,
@@ -1730,6 +4638,45 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
         "avg_fast_encoder_latency_ms": float(lrnode_stats.get("avg_fast_encoder_latency_sec", 0.0)) * 1000.0,
         "avg_action_head_latency_ms": float(lrnode_stats.get("avg_action_head_latency_sec", 0.0)) * 1000.0,
         "avg_skip_action_head_latency_ms": float(lrnode_stats.get("avg_action_head_latency_sec", 0.0)) * 1000.0,
+        "avg_filter_prior_latency_ms": (
+            float(
+                lrnode_stats.get(
+                    "avg_every_step_filter_prior_latency_sec",
+                    0.0,
+                )
+            )
+            * 1000.0
+        ),
+        "avg_filter_fusion_latency_ms": (
+            float(
+                lrnode_stats.get(
+                    "avg_every_step_filter_fusion_latency_sec",
+                    0.0,
+                )
+            )
+            * 1000.0
+        ),
+        "avg_filter_action_head_latency_ms": (
+            float(
+                lrnode_stats.get(
+                    "avg_every_step_filter_action_head_latency_sec",
+                    0.0,
+                )
+            )
+            * 1000.0
+        ),
+        "avg_filter_diagnostic_latency_ms": (
+            float(
+                lrnode_stats.get(
+                    "avg_every_step_filter_diagnostic_latency_sec",
+                    0.0,
+                )
+            )
+            * 1000.0
+        ),
+        "query_reduction_claim_allowed": bool(
+            lrnode_stats.get("query_reduction_claim_allowed", 1)
+        ),
         "action_delta_l2_mean": float(np.mean([m.get("avg_action_delta_l2", 0.0) for m in episode_metrics]))
         if episode_metrics else 0.0,
         "action_delta_l2_p95": float(np.mean([m.get("p95_action_delta_l2", 0.0) for m in episode_metrics]))
@@ -1753,6 +4700,83 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
                 os.environ.get("EVAL_SCALE_MAX_STEPS_WITH_HZ", "1"),
             ),
         },
+        "fastv": {
+            "enabled": bool(lrnode_stats.get("fastv_enabled", 0)),
+            "retention_diagnostics_enabled": bool(
+                lrnode_stats.get("fastv_retention_diagnostics", 0)
+            ),
+            "prune_layer": int(lrnode_stats.get("fastv_prune_layer", -1)),
+            "prune_ratio": float(lrnode_stats.get("fastv_prune_ratio", 0.0)),
+            "score_mode": str(
+                lrnode_stats.get("fastv_score_mode", "last_token_at_l")
+            ),
+            "score_layer_count": int(
+                lrnode_stats.get("fastv_score_layer_count", 0)
+            ),
+            "score_query_indices": list(
+                lrnode_stats.get("fastv_score_query_indices", [])
+            ),
+            "runtime_calls": int(lrnode_stats.get("fastv_runtime_calls", 0)),
+            "runtime_mismatches": int(
+                lrnode_stats.get("fastv_runtime_mismatches", 0)
+            ),
+            "runtime_verified": bool(
+                not int(lrnode_stats.get("fastv_runtime_mismatches", 0))
+                and (
+                    not bool(lrnode_stats.get("fastv_enabled", 0))
+                    or int(lrnode_stats.get("fastv_runtime_calls", 0))
+                    == int(lrnode_stats.get("full_forward_calls", 0))
+                )
+            ),
+            "tokens_before_pruning": int(
+                lrnode_stats.get("fastv_tokens_before_pruning", 0)
+            ),
+            "tokens_after_pruning": int(
+                lrnode_stats.get("fastv_tokens_after_pruning", 0)
+            ),
+            "visual_tokens_before_pruning": int(
+                lrnode_stats.get("fastv_visual_tokens_before_pruning", 0)
+            ),
+            "visual_tokens_after_pruning": int(
+                lrnode_stats.get("fastv_visual_tokens_after_pruning", 0)
+            ),
+            "pruned_transformer_layers": int(
+                lrnode_stats.get("fastv_pruned_transformer_layers", 0)
+            ),
+            "selection_scope": str(
+                lrnode_stats.get("fastv_selection_scope", "global_visual")
+            ),
+            "retention_diagnostics": {
+                "enabled": bool(
+                    lrnode_stats.get("fastv_retention_diagnostics", 0)
+                ),
+                "aggregation": (
+                    "all_full_forward_calls_across_all_ranks"
+                    if bool(lrnode_stats.get("fastv_retention_diagnostics", 0))
+                    else "disabled"
+                ),
+                "camera_names": list(
+                    lrnode_stats.get(
+                        "fastv_camera_names", ["primary", "wrist"]
+                    )
+                ),
+                "timestep_indices": list(range(len(retention_original))),
+                "calls": retention_calls,
+                "original_tokens_by_timestep_camera": retention_original,
+                "retained_token_sum_by_timestep_camera": retention_sum,
+                "mean_retained_tokens_by_timestep_camera": retention_mean,
+                "retained_fraction_by_timestep_camera": retention_fraction,
+                "zero_retention_call_fraction_by_timestep_camera": (
+                    zero_retention_fraction
+                ),
+                "min_retained_tokens_by_timestep_camera": lrnode_stats.get(
+                    "fastv_min_retained_tokens_by_timestep_camera", []
+                ),
+                "max_retained_tokens_by_timestep_camera": lrnode_stats.get(
+                    "fastv_max_retained_tokens_by_timestep_camera", []
+                ),
+            },
+        },
         "lrnode": {
             "enabled": bool(args.use_lrnode_latent_update),
             "eval_skip_full_forward": bool(args.lrnode_eval_skip_full_forward),
@@ -1772,6 +4796,57 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
             "effective_lrnode_update_hz": effective_lrnode_update_hz,
             "effective_action_head_hz": effective_action_head_hz,
             "profile_full_action_head": bool(getattr(args, "lrnode_eval_profile_full_action_head", 0)),
+            "segment_grid": {
+                "enabled": bool(
+                    getattr(args, "latentloop_segment_grid_enable", 0)
+                ),
+                "segment_length": int(
+                    lrnode_stats.get("segment_length", query_interval)
+                ),
+                "feedback_schedule": lrnode_stats.get(
+                    "feedback_schedule", "not_applicable"
+                ),
+                "planned_feedback_density": lrnode_stats.get(
+                    "planned_feedback_density"
+                ),
+                "actual_feedback_density": lrnode_stats.get(
+                    "actual_feedback_density"
+                ),
+                "observation_conditioned_updater_calls": int(
+                    lrnode_stats.get(
+                        "observation_conditioned_update_calls", 0
+                    )
+                ),
+                "zero_feature_updater_calls": int(
+                    lrnode_stats.get("zero_feature_update_calls", 0)
+                ),
+                "observation_cache_advance_calls": int(
+                    lrnode_stats.get("observation_cache_advance_calls", 0)
+                ),
+            },
+            "every_step_filter": {
+                "mode": getattr(args, "lrnode_every_step_filter_mode", "off"),
+                "alpha": float(
+                    getattr(args, "lrnode_every_step_filter_alpha", 0.5)
+                ),
+                "beta": float(
+                    getattr(args, "lrnode_every_step_filter_beta", 0.5)
+                ),
+                "diagnostics": bool(
+                    getattr(
+                        args,
+                        "lrnode_every_step_filter_diagnostics",
+                        0,
+                    )
+                ),
+                "full_forward_every_step": (
+                    getattr(args, "lrnode_every_step_filter_mode", "off")
+                    != "off"
+                ),
+                "query_reduction_claim_allowed": bool(
+                    lrnode_stats.get("query_reduction_claim_allowed", 1)
+                ),
+            },
             "detach_input_latent": bool(args.lrnode_detach_input_latent),
             "detach_teacher_latent": bool(args.lrnode_detach_teacher_latent),
             "freeze_action_head_for_lrnode": bool(args.lrnode_freeze_action_head_for_lrnode),
@@ -1792,9 +4867,21 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
             "num_hold_latent_steps": int(lrnode_stats.get("hold_latent_steps", 0)),
             "num_chunk_token_steps": int(lrnode_stats.get("chunk_token_steps", 0)),
             "num_no_delta_steps": int(lrnode_stats.get("no_delta_steps", 0)),
+            "num_observation_conditioned_updater_calls": int(
+                lrnode_stats.get("observation_conditioned_update_calls", 0)
+            ),
+            "num_zero_feature_updater_calls": int(
+                lrnode_stats.get("zero_feature_update_calls", 0)
+            ),
             "num_fallback_full_calls": int(lrnode_stats.get("num_fallback_full_calls", 0)),
             "full_query_reduction_ratio": float(lrnode_stats.get("full_query_reduction_ratio", 0.0)),
             "effective_query_interval": float(lrnode_stats.get("effective_query_interval", 0.0)),
+            "query_reduction_claim_allowed": bool(
+                lrnode_stats.get("query_reduction_claim_allowed", 1)
+            ),
+            "full_forward_calls_per_policy_step": float(
+                lrnode_stats.get("full_forward_calls_per_policy_step", 0.0)
+            ),
         },
         "shadow_full_forward": {
             "enabled": bool(getattr(args, "lrnode_eval_shadow_full_forward", 0)),
@@ -1838,16 +4925,15 @@ def save_eval_json(args, result_list, task_suite, lrnode_stats_list, episode_met
             "stride": int(os.environ.get("VIDEO_STRIDE", getattr(args, "video_stride", 1))),
         },
         "task_results": task_results,
+        "renderer_backend": renderer_backend,
     }
     safe_run_name = args.run_name.replace("/", "_")
     ckpt_tag = os.environ.get("CKPT_TAG", "").strip()
     tag = f"_{ckpt_tag}" if ckpt_tag else ""
     json_path = os.path.join(output_dir, f"{safe_run_name}_{args.finetune_type}{tag}_eval.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    _atomic_write_json(Path(json_path), payload)
     summary_path = os.path.join(output_dir, "eval_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    _atomic_write_json(Path(summary_path), payload)
     episode_csv_path = os.path.join(output_dir, "eval_episode_metrics.csv")
     _write_episode_metrics_csv(episode_csv_path, episode_metrics)
     latency_profile_path = os.path.join(output_dir, "eval_latency_profile.json")
@@ -1925,5 +5011,35 @@ def eval_one_epoch_libero_ddp(args, model, image_processor, tokenizer):
         lrnode_eval_max_full_forwards_per_episode=args.lrnode_eval_max_full_forwards_per_episode,
         lrnode_eval_ablation_mode=args.lrnode_eval_ablation_mode,
         lrnode_no_delta_mode=args.lrnode_no_delta_mode,
-        lrnode_chunk_token_policy=args.lrnode_chunk_token_policy)
+        lrnode_chunk_token_policy=args.lrnode_chunk_token_policy,
+        lrnode_mechanism_trace=args.lrnode_mechanism_trace,
+        lrnode_trace_save_latents=args.lrnode_trace_save_latents,
+        lrnode_trace_episode_limit=args.lrnode_trace_episode_limit,
+        lrnode_trace_output_dir=args.lrnode_trace_output_dir,
+        lrnode_counterfactual_mode=args.lrnode_counterfactual_mode,
+        lrnode_counterfactual_mix_stage=args.lrnode_counterfactual_mix_stage,
+        lrnode_latent_fusion_alpha=args.lrnode_latent_fusion_alpha,
+        lrnode_latent_fusion_mode=args.lrnode_latent_fusion_mode,
+        lrnode_matched_random_seed=args.lrnode_matched_random_seed,
+        lrnode_matched_random_norm_mode=args.lrnode_matched_random_norm_mode,
+        lrnode_every_step_filter_mode=args.lrnode_every_step_filter_mode,
+        lrnode_every_step_filter_alpha=args.lrnode_every_step_filter_alpha,
+        lrnode_every_step_filter_beta=args.lrnode_every_step_filter_beta,
+        lrnode_every_step_filter_diagnostics=args.lrnode_every_step_filter_diagnostics,
+        latentloop_segment_grid_enable=args.latentloop_segment_grid_enable,
+        latentloop_feedback_schedule=args.latentloop_feedback_schedule,
+        latentloop_same_input_stochasticity_repeats=(
+            args.latentloop_same_input_stochasticity_repeats
+        ),
+        latentloop_same_input_stochasticity_output=(
+            args.latentloop_same_input_stochasticity_output
+        ),
+        latentloop_plan_trace=args.latentloop_plan_trace,
+        latentloop_plan_trace_save_latents=args.latentloop_plan_trace_save_latents,
+        latentloop_plan_trace_output_dir=args.latentloop_plan_trace_output_dir,
+        latentloop_plan_trace_row_id=args.latentloop_plan_trace_row_id,
+        latentloop_plan_trace_paired_group=args.latentloop_plan_trace_paired_group,
+        latentloop_feedback_source=args.latentloop_feedback_source,
+        latentloop_plan_adapter_mode=args.latentloop_plan_adapter_mode,
+    )
     evaluate_policy_ddp(args, wrapped_model)

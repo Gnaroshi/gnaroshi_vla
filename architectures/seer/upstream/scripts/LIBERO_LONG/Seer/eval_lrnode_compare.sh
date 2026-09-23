@@ -22,6 +22,14 @@ set -euo pipefail
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+export LIBERO_GL_BACKEND="${LIBERO_GL_BACKEND:-osmesa}"
+if [[ "${LIBERO_GL_BACKEND}" != "osmesa" && "${LIBERO_GL_BACKEND}" != "egl" ]]; then
+    echo "[ERROR] LIBERO_GL_BACKEND must be 'osmesa' or 'egl'; got ${LIBERO_GL_BACKEND}" >&2
+    exit 1
+fi
+export MUJOCO_GL="${LIBERO_GL_BACKEND}"
+export PYOPENGL_PLATFORM="${LIBERO_GL_BACKEND}"
+export LIBERO_GL_REQUIRE_ACTUAL="${LIBERO_GL_REQUIRE_ACTUAL:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UPSTREAM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -46,6 +54,7 @@ safe_tag() {
 
 which_server="${WHICH_SERVER:-sd1}"
 dataset="${DATASET:-libero_10_converted}"
+eval_suite="${EVAL_SUITE:-libero_10}"
 libero_path="${LIBERO_PATH:-}"
 vit_checkpoint_path="${VIT_CHECKPOINT_PATH:-${UPSTREAM_DIR}/checkpoints/vit_mae/mae_pretrain_vit_base.pth}"
 save_checkpoint_path="${SAVE_CHECKPOINT_PATH:-${REPO_ROOT}/checkpoints/seer}"
@@ -62,7 +71,7 @@ if [[ ! -f "${vit_checkpoint_path}" ]]; then
     echo "[ERROR] Set VIT_CHECKPOINT_PATH explicitly." >&2
     exit 1
 fi
-export PYTHONPATH="${libero_path}:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}:${UPSTREAM_DIR}:${libero_path}:${PYTHONPATH:-}"
 
 # Baseline definition. By default this uses the latest current-repo scratch.sh
 # output. Set BASELINE_CKPT explicitly to evaluate any other checkpoint.
@@ -149,6 +158,11 @@ node_num="${NODE_NUM:-4}"
 master_port="${MASTER_PORT:-12452}"
 
 EVAL_CONTROL_HZ="${EVAL_CONTROL_HZ:-20}"
+FASTV_ENABLED="${FASTV_ENABLED:-0}"
+FASTV_PRUNE_LAYER="${FASTV_PRUNE_LAYER:-2}"
+FASTV_PRUNE_RATIO="${FASTV_PRUNE_RATIO:-0.5}"
+FASTV_SCORE_MODE="${FASTV_SCORE_MODE:-last_token_at_l}"
+FASTV_RETENTION_DIAGNOSTICS="${FASTV_RETENTION_DIAGNOSTICS:-0}"
 
 # LR-NODE architecture/config flags must match the trained checkpoint.
 LRNODE_HIDDEN_DIM="${LRNODE_HIDDEN_DIM:-256}"
@@ -174,6 +188,40 @@ LRNODE_EVAL_SHADOW_FULL_FORWARD="${LRNODE_EVAL_SHADOW_FULL_FORWARD:-0}"
 LRNODE_EVAL_REFRESH_POLICY="${LRNODE_EVAL_REFRESH_POLICY:-periodic}"
 LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE="${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE:-1}"
 LRNODE_EVAL_PROFILE_FULL_ACTION_HEAD="${LRNODE_EVAL_PROFILE_FULL_ACTION_HEAD:-1}"
+LRNODE_MECHANISM_TRACE="${LRNODE_MECHANISM_TRACE:-0}"
+LRNODE_TRACE_SAVE_LATENTS="${LRNODE_TRACE_SAVE_LATENTS:-0}"
+LRNODE_TRACE_EPISODE_LIMIT="${LRNODE_TRACE_EPISODE_LIMIT:-0}"
+LRNODE_TRACE_OUTPUT_DIR="${LRNODE_TRACE_OUTPUT_DIR:-}"
+LRNODE_COUNTERFACTUAL_MODE="${LRNODE_COUNTERFACTUAL_MODE:-standard}"
+LRNODE_COUNTERFACTUAL_MIX_STAGE="${LRNODE_COUNTERFACTUAL_MIX_STAGE:-pre_ensemble}"
+LRNODE_LATENT_FUSION_ALPHA="${LRNODE_LATENT_FUSION_ALPHA:-0.0}"
+LRNODE_LATENT_FUSION_MODE="${LRNODE_LATENT_FUSION_MODE:-every_step}"
+LRNODE_MATCHED_RANDOM_SEED="${LRNODE_MATCHED_RANDOM_SEED:-20260724}"
+LRNODE_MATCHED_RANDOM_NORM_MODE="${LRNODE_MATCHED_RANDOM_NORM_MODE:-per_token}"
+LRNODE_EVERY_STEP_FILTER_MODE="${LRNODE_EVERY_STEP_FILTER_MODE:-off}"
+LRNODE_EVERY_STEP_FILTER_ALPHA="${LRNODE_EVERY_STEP_FILTER_ALPHA:-0.5}"
+LRNODE_EVERY_STEP_FILTER_BETA="${LRNODE_EVERY_STEP_FILTER_BETA:-0.5}"
+LRNODE_EVERY_STEP_FILTER_DIAGNOSTICS="${LRNODE_EVERY_STEP_FILTER_DIAGNOSTICS:-0}"
+LRNODE_EVAL_ABLATION_MODE="${LRNODE_EVAL_ABLATION_MODE:-stepwise}"
+LRNODE_NO_DELTA_MODE="${LRNODE_NO_DELTA_MODE:-zero}"
+LRNODE_CHUNK_TOKEN_POLICY="${LRNODE_CHUNK_TOKEN_POLICY:-skip_only}"
+LATENTLOOP_SEGMENT_GRID_ENABLE="${LATENTLOOP_SEGMENT_GRID_ENABLE:-0}"
+LATENTLOOP_FEEDBACK_SCHEDULE="${LATENTLOOP_FEEDBACK_SCHEDULE:-dense}"
+LATENTLOOP_SAME_INPUT_STOCHASTICITY_REPEATS="${LATENTLOOP_SAME_INPUT_STOCHASTICITY_REPEATS:-0}"
+LATENTLOOP_SAME_INPUT_STOCHASTICITY_OUTPUT="${LATENTLOOP_SAME_INPUT_STOCHASTICITY_OUTPUT:-}"
+LATENTLOOP_PLAN_TRACE="${LATENTLOOP_PLAN_TRACE:-0}"
+LATENTLOOP_PLAN_TRACE_SAVE_LATENTS="${LATENTLOOP_PLAN_TRACE_SAVE_LATENTS:-0}"
+LATENTLOOP_PLAN_TRACE_OUTPUT_DIR="${LATENTLOOP_PLAN_TRACE_OUTPUT_DIR:-}"
+LATENTLOOP_PLAN_TRACE_ROW_ID="${LATENTLOOP_PLAN_TRACE_ROW_ID:-}"
+LATENTLOOP_PLAN_TRACE_PAIRED_GROUP="${LATENTLOOP_PLAN_TRACE_PAIRED_GROUP:-}"
+LATENTLOOP_FEEDBACK_SOURCE="${LATENTLOOP_FEEDBACK_SOURCE:-current}"
+LATENTLOOP_PLAN_ADAPTER_MODE="${LATENTLOOP_PLAN_ADAPTER_MODE:-off}"
+LATENTLOOP_PLAN_ADAPTER_HIDDEN_DIM="${LATENTLOOP_PLAN_ADAPTER_HIDDEN_DIM:-0}"
+LATENTLOOP_PLAN_PARAMETER_MATCH_TOLERANCE="${LATENTLOOP_PLAN_PARAMETER_MATCH_TOLERANCE:-0.05}"
+LATENTLOOP_COMPARISON_PROTOCOL="${LATENTLOOP_COMPARISON_PROTOCOL:-0}"
+EVAL_LIBERO_ENSEMBLING="${EVAL_LIBERO_ENSEMBLING:-1}"
+EVAL_SEED="${EVAL_SEED:-42}"
+LIBERO_EVAL_MAX_STEPS="${LIBERO_EVAL_MAX_STEPS:-600}"
 
 common_eval_args=(
     --traj_cons
@@ -188,23 +236,34 @@ common_eval_args=(
     --lr_scheduler cosine
     --save_every_iter 50000
     --num_epochs 20
-    --seed 42
+    --seed "${EVAL_SEED}"
     --batch_size 64
     --precision fp32
     --weight_decay 1e-4
     --num_resampler_query 6
     --transformer_layers 24
     --phase "evaluate"
-    --finetune_type "libero_10"
+    --finetune_type "${eval_suite}"
     --save_checkpoint_path "${save_checkpoint_path}"
     --action_pred_steps 3
     --future_steps 3
     --sequence_length 7
     --obs_pred
     --gripper_width
-    --eval_libero_ensembling
     --multi_step_action 1
+    --libero_eval_max_steps "${LIBERO_EVAL_MAX_STEPS}"
+    --fastv_enabled "${FASTV_ENABLED}"
+    --fastv_prune_layer "${FASTV_PRUNE_LAYER}"
+    --fastv_prune_ratio "${FASTV_PRUNE_RATIO}"
+    --fastv_score_mode "${FASTV_SCORE_MODE}"
+    --fastv_retention_diagnostics "${FASTV_RETENTION_DIAGNOSTICS}"
 )
+if [[ "${EVAL_LIBERO_ENSEMBLING}" == "1" ]]; then
+    common_eval_args+=(--eval_libero_ensembling)
+elif [[ "${EVAL_LIBERO_ENSEMBLING}" != "0" ]]; then
+    echo "[ERROR] EVAL_LIBERO_ENSEMBLING must be 0 or 1" >&2
+    exit 1
+fi
 
 run_eval() {
     local label="$1"
@@ -241,6 +300,8 @@ run_eval() {
     export CKPT_TAG="${ckpt_tag}"
     export EVAL_CONTROL_HZ="${EVAL_CONTROL_HZ}"
     export EFFECTIVE_QUERY_HZ="${effective_query_hz}"
+    local trace_output_dir="${LRNODE_TRACE_OUTPUT_DIR:-${log_dir}/analysis/mechanism_trace}"
+    local plan_trace_output_dir="${LATENTLOOP_PLAN_TRACE_OUTPUT_DIR:-${log_dir}/analysis/plan_trace}"
 
     local lrnode_args=(
         --use_lrnode_latent_update "${use_lrnode}"
@@ -266,6 +327,37 @@ run_eval() {
         --lrnode_eval_profile_full_action_head "${LRNODE_EVAL_PROFILE_FULL_ACTION_HEAD}"
         --lrnode_eval_refresh_policy "${LRNODE_EVAL_REFRESH_POLICY}"
         --lrnode_eval_max_full_forwards_per_episode "${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE}"
+        --lrnode_mechanism_trace "${LRNODE_MECHANISM_TRACE}"
+        --lrnode_trace_save_latents "${LRNODE_TRACE_SAVE_LATENTS}"
+        --lrnode_trace_episode_limit "${LRNODE_TRACE_EPISODE_LIMIT}"
+        --lrnode_trace_output_dir "${trace_output_dir}"
+        --lrnode_counterfactual_mode "${LRNODE_COUNTERFACTUAL_MODE}"
+        --lrnode_counterfactual_mix_stage "${LRNODE_COUNTERFACTUAL_MIX_STAGE}"
+        --lrnode_latent_fusion_alpha "${LRNODE_LATENT_FUSION_ALPHA}"
+        --lrnode_latent_fusion_mode "${LRNODE_LATENT_FUSION_MODE}"
+        --lrnode_matched_random_seed "${LRNODE_MATCHED_RANDOM_SEED}"
+        --lrnode_matched_random_norm_mode "${LRNODE_MATCHED_RANDOM_NORM_MODE}"
+        --lrnode_every_step_filter_mode "${LRNODE_EVERY_STEP_FILTER_MODE}"
+        --lrnode_every_step_filter_alpha "${LRNODE_EVERY_STEP_FILTER_ALPHA}"
+        --lrnode_every_step_filter_beta "${LRNODE_EVERY_STEP_FILTER_BETA}"
+        --lrnode_every_step_filter_diagnostics "${LRNODE_EVERY_STEP_FILTER_DIAGNOSTICS}"
+        --lrnode_eval_ablation_mode "${LRNODE_EVAL_ABLATION_MODE}"
+        --lrnode_no_delta_mode "${LRNODE_NO_DELTA_MODE}"
+        --lrnode_chunk_token_policy "${LRNODE_CHUNK_TOKEN_POLICY}"
+        --latentloop_segment_grid_enable "${LATENTLOOP_SEGMENT_GRID_ENABLE}"
+        --latentloop_feedback_schedule "${LATENTLOOP_FEEDBACK_SCHEDULE}"
+        --latentloop_same_input_stochasticity_repeats "${LATENTLOOP_SAME_INPUT_STOCHASTICITY_REPEATS}"
+        --latentloop_same_input_stochasticity_output "${LATENTLOOP_SAME_INPUT_STOCHASTICITY_OUTPUT}"
+        --latentloop_plan_trace "${LATENTLOOP_PLAN_TRACE}"
+        --latentloop_plan_trace_save_latents "${LATENTLOOP_PLAN_TRACE_SAVE_LATENTS}"
+        --latentloop_plan_trace_output_dir "${plan_trace_output_dir}"
+        --latentloop_plan_trace_row_id "${LATENTLOOP_PLAN_TRACE_ROW_ID:-${label}}"
+        --latentloop_plan_trace_paired_group "${LATENTLOOP_PLAN_TRACE_PAIRED_GROUP}"
+        --latentloop_feedback_source "${LATENTLOOP_FEEDBACK_SOURCE}"
+        --latentloop_plan_adapter_mode "${LATENTLOOP_PLAN_ADAPTER_MODE}"
+        --latentloop_plan_adapter_hidden_dim "${LATENTLOOP_PLAN_ADAPTER_HIDDEN_DIM}"
+        --latentloop_plan_parameter_match_tolerance "${LATENTLOOP_PLAN_PARAMETER_MATCH_TOLERANCE}"
+        --latentloop_comparison_protocol "${LATENTLOOP_COMPARISON_PROTOCOL}"
     )
     local base_ckpt_args=()
     if [[ "${use_lrnode}" -eq 1 && -n "${LRNODE_EVAL_BASE_CKPT}" ]]; then
@@ -285,22 +377,33 @@ run_eval() {
     fi
     echo "[RUN] ckpt_tag=${ckpt_tag}"
     echo "[RUN] use_lrnode=${use_lrnode}, skip_full=${skip_full}, K=${query_interval}, full_query_hz=${effective_query_hz}"
+    echo "[RUN] fastv_enabled=${FASTV_ENABLED}, layer=${FASTV_PRUNE_LAYER}, ratio=${FASTV_PRUNE_RATIO}, score_mode=${FASTV_SCORE_MODE}"
     echo "[RUN] refresh_policy=${LRNODE_EVAL_REFRESH_POLICY}, max_full_per_episode=${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE}"
+    echo "[RUN] mechanism_trace=${LRNODE_MECHANISM_TRACE}, counterfactual=${LRNODE_COUNTERFACTUAL_MODE}, ensemble=${EVAL_LIBERO_ENSEMBLING}"
+    echo "[RUN] every_step_filter=${LRNODE_EVERY_STEP_FILTER_MODE}, alpha=${LRNODE_EVERY_STEP_FILTER_ALPHA}, beta=${LRNODE_EVERY_STEP_FILTER_BETA}, diagnostics=${LRNODE_EVERY_STEP_FILTER_DIAGNOSTICS}"
+    echo "[RUN] ablation=${LRNODE_EVAL_ABLATION_MODE}, segment_grid=${LATENTLOOP_SEGMENT_GRID_ENABLE}, feedback=${LATENTLOOP_FEEDBACK_SCHEDULE}"
+    echo "[RUN] renderer backend=${LIBERO_GL_BACKEND}, strict_actual=${LIBERO_GL_REQUIRE_ACTUAL}"
     echo "[RUN] video SAVE_VIDEO=${SAVE_VIDEO}, success=${SAVE_VIDEO_SUCC}, fail=${SAVE_VIDEO_FAIL}, all_ranks=${SAVE_VIDEO_ALL_RANKS}, stride=${VIDEO_STRIDE}"
     echo "[RUN] log_dir=${log_dir}"
     echo "[RUN] live_progress=${log_dir}/analysis/eval_progress.json"
     echo "------------------------------------------------------------"
 
-    python -m torch.distributed.run \
-        --nnodes="${node}" \
-        --nproc_per_node="${node_num}" \
-        --master_port="${master_port}" \
-        eval_libero.py \
-        "${common_eval_args[@]}" \
-        --run_name "${run_name}" \
-        "${lrnode_args[@]}" \
-        "${base_ckpt_args[@]}" \
-        --resume_from_checkpoint "${ckpt_path}" | tee "${logfile}"
+    # eval_libero.py and several upstream resources are resolved relative to
+    # the Seer source root. The comparison wrapper may be called from the
+    # gnaroshi_vla repository root, so make that working directory explicit.
+    (
+        cd "${UPSTREAM_DIR}"
+        python -m torch.distributed.run \
+            --nnodes="${node}" \
+            --nproc_per_node="${node_num}" \
+            --master_port="${master_port}" \
+            eval_libero.py \
+            "${common_eval_args[@]}" \
+            --run_name "${run_name}" \
+            "${lrnode_args[@]}" \
+            "${base_ckpt_args[@]}" \
+            --resume_from_checkpoint "${ckpt_path}"
+    ) | tee "${logfile}"
 
     for required in \
         "${log_dir}/analysis/eval_summary.json" \
@@ -357,6 +460,40 @@ LRNODE_ASSERT_ONLY_LRNODE_TRAINABLE=${LRNODE_ASSERT_ONLY_LRNODE_TRAINABLE}
 LRNODE_EVAL_BASE_CKPT=${LRNODE_EVAL_BASE_CKPT}
 LRNODE_EVAL_REFRESH_POLICY=${LRNODE_EVAL_REFRESH_POLICY}
 LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE=${LRNODE_EVAL_MAX_FULL_FORWARDS_PER_EPISODE}
+LRNODE_EVAL_SHADOW_FULL_FORWARD=${LRNODE_EVAL_SHADOW_FULL_FORWARD}
+LRNODE_MECHANISM_TRACE=${LRNODE_MECHANISM_TRACE}
+LRNODE_TRACE_SAVE_LATENTS=${LRNODE_TRACE_SAVE_LATENTS}
+LRNODE_TRACE_EPISODE_LIMIT=${LRNODE_TRACE_EPISODE_LIMIT}
+LRNODE_COUNTERFACTUAL_MODE=${LRNODE_COUNTERFACTUAL_MODE}
+LRNODE_COUNTERFACTUAL_MIX_STAGE=${LRNODE_COUNTERFACTUAL_MIX_STAGE}
+LRNODE_LATENT_FUSION_ALPHA=${LRNODE_LATENT_FUSION_ALPHA}
+LRNODE_LATENT_FUSION_MODE=${LRNODE_LATENT_FUSION_MODE}
+LRNODE_MATCHED_RANDOM_SEED=${LRNODE_MATCHED_RANDOM_SEED}
+LRNODE_MATCHED_RANDOM_NORM_MODE=${LRNODE_MATCHED_RANDOM_NORM_MODE}
+LRNODE_EVERY_STEP_FILTER_MODE=${LRNODE_EVERY_STEP_FILTER_MODE}
+LRNODE_EVERY_STEP_FILTER_ALPHA=${LRNODE_EVERY_STEP_FILTER_ALPHA}
+LRNODE_EVERY_STEP_FILTER_BETA=${LRNODE_EVERY_STEP_FILTER_BETA}
+LRNODE_EVERY_STEP_FILTER_DIAGNOSTICS=${LRNODE_EVERY_STEP_FILTER_DIAGNOSTICS}
+LRNODE_EVAL_ABLATION_MODE=${LRNODE_EVAL_ABLATION_MODE}
+LRNODE_NO_DELTA_MODE=${LRNODE_NO_DELTA_MODE}
+LRNODE_CHUNK_TOKEN_POLICY=${LRNODE_CHUNK_TOKEN_POLICY}
+LATENTLOOP_SEGMENT_GRID_ENABLE=${LATENTLOOP_SEGMENT_GRID_ENABLE}
+LATENTLOOP_FEEDBACK_SCHEDULE=${LATENTLOOP_FEEDBACK_SCHEDULE}
+LATENTLOOP_SAME_INPUT_STOCHASTICITY_REPEATS=${LATENTLOOP_SAME_INPUT_STOCHASTICITY_REPEATS}
+LATENTLOOP_SAME_INPUT_STOCHASTICITY_OUTPUT=${LATENTLOOP_SAME_INPUT_STOCHASTICITY_OUTPUT}
+LATENTLOOP_PLAN_TRACE=${LATENTLOOP_PLAN_TRACE}
+LATENTLOOP_PLAN_TRACE_SAVE_LATENTS=${LATENTLOOP_PLAN_TRACE_SAVE_LATENTS}
+LATENTLOOP_PLAN_TRACE_ROW_ID=${LATENTLOOP_PLAN_TRACE_ROW_ID}
+LATENTLOOP_PLAN_TRACE_PAIRED_GROUP=${LATENTLOOP_PLAN_TRACE_PAIRED_GROUP}
+LATENTLOOP_FEEDBACK_SOURCE=${LATENTLOOP_FEEDBACK_SOURCE}
+LATENTLOOP_PLAN_ADAPTER_MODE=${LATENTLOOP_PLAN_ADAPTER_MODE}
+LATENTLOOP_COMPARISON_PROTOCOL=${LATENTLOOP_COMPARISON_PROTOCOL}
+EVAL_LIBERO_ENSEMBLING=${EVAL_LIBERO_ENSEMBLING}
+EVAL_SUITE=${eval_suite}
+EVAL_SEED=${EVAL_SEED}
+LIBERO_EVAL_MAX_STEPS=${LIBERO_EVAL_MAX_STEPS}
+EVAL_NUM_EPISODES_PER_TASK=${EVAL_NUM_EPISODES_PER_TASK:-20}
+EVAL_NUM_TASKS=${EVAL_NUM_TASKS:-10}
 SAVE_VIDEO=${SAVE_VIDEO}
 SAVE_VIDEO_SUCC=${SAVE_VIDEO_SUCC}
 SAVE_VIDEO_FAIL=${SAVE_VIDEO_FAIL}
@@ -364,14 +501,24 @@ SAVE_VIDEO_ALL_RANKS=${SAVE_VIDEO_ALL_RANKS}
 VIDEO_FPS=${VIDEO_FPS}
 VIDEO_STRIDE=${VIDEO_STRIDE}
 EVAL_CONTROL_HZ=${EVAL_CONTROL_HZ}
+FASTV_ENABLED=${FASTV_ENABLED}
+FASTV_PRUNE_LAYER=${FASTV_PRUNE_LAYER}
+FASTV_PRUNE_RATIO=${FASTV_PRUNE_RATIO}
+FASTV_SCORE_MODE=${FASTV_SCORE_MODE}
+FASTV_RETENTION_DIAGNOSTICS=${FASTV_RETENTION_DIAGNOSTICS}
 NODE_NUM=${node_num}
 MASTER_PORT=${master_port}
+LIBERO_GL_BACKEND=${LIBERO_GL_BACKEND}
+MUJOCO_GL=${MUJOCO_GL}
+PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM}
+LIBERO_GL_REQUIRE_ACTUAL=${LIBERO_GL_REQUIRE_ACTUAL}
 EOF
 
 echo "[EXPERIMENT] result_root=${result_root}"
 echo "[EXPERIMENT] baseline_name=${BASELINE_NAME}, baseline_run=${BASELINE_RUN_NAME}, baseline_ckpt=${BASELINE_CKPT}"
 echo "[EXPERIMENT] ours_name=${OURS_NAME}, method=${METHOD_TAG}, ours_run=${OURS_RUN_NAME}, ours_ckpt=${OURS_CKPT}"
 echo "[EXPERIMENT] run_baseline=${RUN_BASELINE}, run_ours_full=${RUN_OURS_FULL}, K intervals=${LRNODE_QUERY_INTERVALS[*]}"
+echo "[EXPERIMENT] renderer backend=${LIBERO_GL_BACKEND}, strict_actual=${LIBERO_GL_REQUIRE_ACTUAL}"
 echo "[EXPERIMENT] video SAVE_VIDEO=${SAVE_VIDEO}, success=${SAVE_VIDEO_SUCC}, fail=${SAVE_VIDEO_FAIL}, all_ranks=${SAVE_VIDEO_ALL_RANKS}, fps=${VIDEO_FPS}, stride=${VIDEO_STRIDE}"
 echo "[EXPERIMENT] config saved: ${result_root}/experiment_config.env"
 
@@ -448,6 +595,7 @@ for path in sorted(root.glob("*/analysis/eval_summary.json")):
     lr = data.get("lrnode", {})
     qr = data.get("query_reduction", {})
     smooth = data.get("action_smoothness", {})
+    renderer = data.get("renderer_backend", {})
     success_videos, fail_videos = count_videos(run_dir)
     is_baseline = run_dir.name.startswith("baseline_")
     rows.append({
@@ -462,6 +610,11 @@ for path in sorted(root.glob("*/analysis/eval_summary.json")):
         "ours_ckpt": os.environ["OURS_CKPT"],
         "run_dir": run_dir.name,
         "run_type": "baseline" if is_baseline else "ours",
+        "renderer_backend": renderer.get("effective_backend"),
+        "renderer_classification": renderer.get("backend_classification"),
+        "gl_vendor": renderer.get("actual_gl_vendor"),
+        "gl_renderer": renderer.get("actual_gl_renderer"),
+        "render_gpu_device_id": renderer.get("render_gpu_device_id"),
         "success_rate_pct": round(float(data.get("success_rate", 0.0)) * 100.0, 3),
         "lrnode_enabled": lr.get("enabled"),
         "skip_full_forward": lr.get("eval_skip_full_forward"),

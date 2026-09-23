@@ -91,13 +91,14 @@ fi
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+export PYTHONPATH="${REPO_ROOT}:${UPSTREAM_DIR}:${libero_path}:${PYTHONPATH:-}"
 master_port="${MASTER_PORT:-12423}"
 node=1
 node_num="${NODE_NUM:-4}"
 
 LRNODE_EXTRA_ARGS=(
     --use_lrnode_latent_update 1
-    --lrnode_train_latent_distill 1
+    --lrnode_train_latent_distill "${LRNODE_TRAIN_LATENT_DISTILL:-1}"
     --lrnode_teacher_target_mode "${LRNODE_TEACHER_TARGET_MODE:-shifted_context}"
     --lrnode_context_selected_step "${LRNODE_CONTEXT_SELECTED_STEP:--1}"
     --lrnode_train_protocol adapter
@@ -116,31 +117,84 @@ LRNODE_EXTRA_ARGS=(
     --lrnode_use_post_layernorm "${LRNODE_USE_POST_LAYERNORM:-0}"
     --lrnode_multistep_train "${LRNODE_MULTISTEP_TRAIN:-0}"
     --lrnode_train_max_horizon "${LRNODE_TRAIN_MAX_HORIZON:-2}"
+    --lrnode_runtime_aligned_train "${LRNODE_RUNTIME_ALIGNED_TRAIN:-0}"
+    --lrnode_runtime_horizon "${LRNODE_RUNTIME_HORIZON:-3}"
+    --lrnode_runtime_age3_weight "${LRNODE_RUNTIME_AGE3_WEIGHT:-2.0}"
+    --lrnode_frozen_teacher_eval_mode "${LRNODE_FROZEN_TEACHER_EVAL_MODE:-0}"
+    --lrnode_gripper_distill_weight "${LRNODE_GRIPPER_DISTILL_WEIGHT:-0.0}"
+    --lrnode_overlap_weight "${LRNODE_OVERLAP_WEIGHT:-0.0}"
+    --lrnode_ensemble_weight "${LRNODE_ENSEMBLE_WEIGHT:-0.0}"
+    --lrnode_gripper_switch_weight "${LRNODE_GRIPPER_SWITCH_WEIGHT:-0.0}"
+    --lrnode_runtime_ensemble_temp "${LRNODE_RUNTIME_ENSEMBLE_TEMP:-0.01}"
     --lrnode_log_sanity "${LRNODE_LOG_SANITY:-1}"
     --lrnode_gate_init_bias "${LRNODE_GATE_INIT_BIAS:--4.0}"
     --lrnode_trace "${LRNODE_TRACE:-0}"
     --lrnode_debug_artifact_interval "${LRNODE_DEBUG_ARTIFACT_INTERVAL:-1000}"
+    --latentloop_plan_adapter_mode "${LATENTLOOP_PLAN_ADAPTER_MODE:-off}"
+    --latentloop_plan_adapter_hidden_dim "${LATENTLOOP_PLAN_ADAPTER_HIDDEN_DIM:-0}"
+    --latentloop_plan_parameter_match_tolerance "${LATENTLOOP_PLAN_PARAMETER_MATCH_TOLERANCE:-0.05}"
+    --latentloop_plan_arm_weight "${LATENTLOOP_PLAN_ARM_WEIGHT:-1.0}"
+    --latentloop_plan_gripper_weight "${LATENTLOOP_PLAN_GRIPPER_WEIGHT:-1.0}"
+    --latentloop_plan_latent_weight "${LATENTLOOP_PLAN_LATENT_WEIGHT:-1.0}"
+    --latentloop_comparison_protocol "${LATENTLOOP_COMPARISON_PROTOCOL:-0}"
+    --latentloop_comparison_offset_schedule "${LATENTLOOP_COMPARISON_OFFSET_SCHEDULE:-adjacent}"
+    --latentloop_comparison_split_role "${LATENTLOOP_COMPARISON_SPLIT_ROLE:-full}"
+    --latentloop_comparison_validation_fraction "${LATENTLOOP_COMPARISON_VALIDATION_FRACTION:-0.05}"
+    --latentloop_comparison_validation_seed "${LATENTLOOP_COMPARISON_VALIDATION_SEED:-20260805}"
+    --latentloop_comparison_target_microbatches "${LATENTLOOP_COMPARISON_TARGET_MICROBATCHES:-0}"
+    --latentloop_comparison_warmup_microbatches "${LATENTLOOP_COMPARISON_WARMUP_MICROBATCHES:-0}"
+    --latentloop_comparison_checkpoint_microbatches "${LATENTLOOP_COMPARISON_CHECKPOINT_MICROBATCHES:-0}"
+    --latentloop_action_arm_weight "${LATENTLOOP_ACTION_ARM_WEIGHT:-0.0}"
+    --latentloop_action_gripper_weight "${LATENTLOOP_ACTION_GRIPPER_WEIGHT:-0.0}"
+    --latentloop_action_exec_weight "${LATENTLOOP_ACTION_EXEC_WEIGHT:-0.0}"
+    --latentloop_action_reg_weight "${LATENTLOOP_ACTION_REG_WEIGHT:-0.0}"
+    --latentloop_nonrecurrent_latent_weight "${LATENTLOOP_NONRECURRENT_LATENT_WEIGHT:-0.0}"
+    --latentloop_nonrecurrent_action_weight "${LATENTLOOP_NONRECURRENT_ACTION_WEIGHT:-0.0}"
+    --latentloop_nonrecurrent_smooth_weight "${LATENTLOOP_NONRECURRENT_SMOOTH_WEIGHT:-0.0}"
+    --latentloop_comparison_selection_metric "${LATENTLOOP_COMPARISON_SELECTION_METRIC:-validation_total_loss}"
+    --latentloop_cqpc_weight "${LATENTLOOP_CQPC_WEIGHT:-0.0}"
+    --latentloop_cqpc_gamma "${LATENTLOOP_CQPC_GAMMA:-0.0}"
+    --latentloop_cqpc_arm_weight "${LATENTLOOP_CQPC_ARM_WEIGHT:-1.0}"
+    --latentloop_cqpc_gripper_weight "${LATENTLOOP_CQPC_GRIPPER_WEIGHT:-1.0}"
+    --latentloop_cqpc_log_teacher_disagreement "${LATENTLOOP_CQPC_LOG_TEACHER_DISAGREEMENT:-0}"
 )
 
+if [[ -n "${LRNODE_INIT_ADAPTER_CKPT:-}" ]]; then
+    LRNODE_EXTRA_ARGS+=(--lrnode_init_adapter_ckpt "${LRNODE_INIT_ADAPTER_CKPT}")
+fi
+
+WANDB_ARGS=()
+if [[ "${REPORT_TO_WANDB:-1}" == "1" ]]; then
+    WANDB_ARGS+=(--report_to_wandb)
+fi
+
+DATASET_INFO_ARGS=()
+if [[ -n "${LIBERO_DATASET_INFO_PATH:-}" ]]; then
+    DATASET_INFO_ARGS+=(--libero_dataset_info_path "${LIBERO_DATASET_INFO_PATH}")
+fi
+
+cd "${UPSTREAM_DIR}"
 torchrun --nnodes=${node} --nproc_per_node=${node_num} --master_port=${master_port} train.py \
     --traj_cons \
     --rgb_pad 10 \
     --gripper_pad 4 \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-8}" \
     --bf16_module "vision_encoder" \
     --vit_checkpoint_path "${vit_checkpoint_path}" \
     --calvin_dataset "${calvin_dataset_path}" \
-    --workers 4 \
+    --workers "${WORKERS:-4}" \
     --lr_scheduler cosine \
     --save_every_iter 100000 \
     --num_epochs "${num_epochs}" \
     --seed "${SEED:-42}" \
-    --batch_size 16 \
+    --batch_size "${BATCH_SIZE:-16}" \
     --precision fp32 \
     --learning_rate "${LEARNING_RATE:-1e-3}" \
     --save_checkpoint \
     --finetune_from_pretrained_ckpt "${BASELINE_CKPT}" \
     --finetune_type libero_finetune \
+    --libero_dataset_name "${dataset}" \
+    "${DATASET_INFO_ARGS[@]}" \
     --root_dir "${root_dir}" \
     --wandb_project "${WANDB_PROJECT:-seer}" \
     --weight_decay 1e-4 \
@@ -159,8 +213,8 @@ torchrun --nnodes=${node} --nproc_per_node=${node_num} --master_port=${master_po
     --gripper_width \
     --warmup_epochs "${WARMUP_EPOCHS:-2}" \
     --libero_path "${libero_path}" \
-    --report_to_wandb \
     --multi_step_action 1 \
+    "${WANDB_ARGS[@]}" \
     "${LRNODE_EXTRA_ARGS[@]}"
 
 mkdir -p "${latest_dir}"
@@ -173,6 +227,15 @@ LRNODE_JOINT=0
 LRNODE_BACKPROP_TO_SEER_FROM_LRNODE=0
 LRNODE_TEACHER_TARGET_MODE=${LRNODE_TEACHER_TARGET_MODE:-shifted_context}
 LRNODE_CONTEXT_SELECTED_STEP=${LRNODE_CONTEXT_SELECTED_STEP:--1}
+LRNODE_RUNTIME_ALIGNED_TRAIN=${LRNODE_RUNTIME_ALIGNED_TRAIN:-0}
+LRNODE_RUNTIME_HORIZON=${LRNODE_RUNTIME_HORIZON:-3}
+LRNODE_RUNTIME_AGE3_WEIGHT=${LRNODE_RUNTIME_AGE3_WEIGHT:-2.0}
+LRNODE_FROZEN_TEACHER_EVAL_MODE=${LRNODE_FROZEN_TEACHER_EVAL_MODE:-0}
+LRNODE_GRIPPER_DISTILL_WEIGHT=${LRNODE_GRIPPER_DISTILL_WEIGHT:-0.0}
+LRNODE_OVERLAP_WEIGHT=${LRNODE_OVERLAP_WEIGHT:-0.0}
+LRNODE_ENSEMBLE_WEIGHT=${LRNODE_ENSEMBLE_WEIGHT:-0.0}
+LRNODE_GRIPPER_SWITCH_WEIGHT=${LRNODE_GRIPPER_SWITCH_WEIGHT:-0.0}
+LRNODE_RUNTIME_ENSEMBLE_TEMP=${LRNODE_RUNTIME_ENSEMBLE_TEMP:-0.01}
 LRNODE_EXPERIMENT_TAG=${EXPERIMENT_TAG}
 LRNODE_RUN_NAME=${RUN_NAME}
 LRNODE_SAVE_CHECKPOINT_PATH=${save_checkpoint_path}
