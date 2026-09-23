@@ -38,6 +38,9 @@ from architectures.simvla.adapters.latentloop.native_v0_long_eval import (
 from architectures.simvla.adapters.latentloop.stability_alignment.checkpoint import (
     load_modules_from_checkpoint,
 )
+from architectures.simvla.adapters.latentloop.stability_alignment.v3_checkpoint import (
+    load_v3_modules,
+)
 from architectures.simvla.adapters.latentloop.stability_alignment.contracts import (
     BUNDLE_SCHEMA,
     GENERATION_NG3_FULL_INDICES,
@@ -385,7 +388,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         device=device,
     )
     freeze_module(model)
-    modules, payload = load_modules_from_checkpoint(checkpoint, device=device)
+    try:
+        modules, payload = load_modules_from_checkpoint(checkpoint, device=device)
+    except ValueError as error:
+        if "checkpoint format changed" not in str(error):
+            raise
+        modules, payload = load_v3_modules(checkpoint, device=device)
     from libero.libero import benchmark
 
     suite = benchmark.get_benchmark_dict()["libero_10"]()
