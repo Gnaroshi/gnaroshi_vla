@@ -1,131 +1,178 @@
 # Seer and LatentLoop real-world deployment
 
-This path deploys either the basketball Seer baseline or its paired LatentLoop
-adapter without changing the known-working 3DFlow-Seer GUI, camera, UR5e, or
-Robotiq implementation.
+The real-world path preserves the validated 3DFlow-Seer camera, UR5e, Robotiq,
+GUI, action-head, and temporal-ensemble behavior. LatentLoop changes only how
+the cached action condition is refreshed between full Seer queries.
 
-## Fixed protocol
+## Runtime contract
 
-- Task: `Pick up the red ball and place it in the basketball hoop`
-- Default pair: teacher `37.pth` + the adapter epoch `39.pth` trained from that
-  teacher
-- Alternative valid pairs: teacher `34.pth` + its adapter `39.pth`, and teacher
-  `35.pth` + its adapter `39.pth`
-- Baseline mode: the selected teacher only, full Seer every step (`K=1`)
-- LatentLoop mode: the same teacher plus its paired adapter (`K=4`)
-- Schedule: full Seer at steps `0, 4, 8, ...`; LatentLoop at the intervening
-  steps using fresh exterior image, wrist image, and proprioception
-- Action decoder and temporal ensemble: the existing Seer implementation
-- Default target control rate: `15 Hz` (`66.67 ms` period)
-- Optional target control rate: `40 Hz` (`25 ms` period)
-- Robot action limits: `max_rel_pos=0.02`, `max_rel_orn=0.05`
-- Model environment on the inference computer: the existing `conda activate seer`
+- Baseline: the selected Seer teacher with full inference at every step.
+- LatentLoop: the same teacher and its teacher-specific adapter.
+- Default LatentLoop schedule: full Seer at steps `0, 4, 8, ...`, with a fresh
+  exterior image, wrist image, and proprioceptive state at every intermediate
+  update.
+- Environment on the inference computer: `conda activate seer`.
+- `control_freq` is a requested loop rate, not a guaranteed achieved rate. The
+  complete camera, policy, command, and sleep path must fit within `1000 / Hz`
+  milliseconds.
+- The launcher logs requested and achieved rates, policy latency, full/skip
+  counts, checkpoint hashes, source state, and command status separately for
+  baseline and LatentLoop.
 
-Teacher and adapter files are a strict pair. Baseline mode verifies only the
-teacher and shared ViT; LatentLoop mode additionally verifies the paired adapter
-and architecture before opening the robot or cameras.
+Teacher and adapter files are a strict pair. The preflight rejects a missing or
+mismatched artifact before cameras or robot control are initialized.
 
-## Repository layout
+## Source layout
 
-- `architectures/seer/adapters/latentloop_real_deploy/`: LatentLoop controller
-  and GUI integration
-- `architectures/seer/third_party/3dflow_real_deploy/`: byte-identical snapshot
-  of the real deployment source from `/home/jbr/3DFlow-Seer`
-- `architectures/seer/upstream/scripts/REAL/deploy_ll_gui.sh`: self-contained
-  deployment configuration and launcher
-- `artifacts/seer/real_world/basketball/baseline/`: teacher checkpoints
-- `artifacts/seer/real_world/basketball/latentloop/`: teacher-specific adapters
-- `artifacts/seer/real_world/basketball/shared/`: shared ViT checkpoint
-- `real_deploy_results/baseline/`: baseline logs and results
-- `real_deploy_results/latentloop/`: LatentLoop logs and results
+- `architectures/seer/adapters/latentloop_real_deploy/`: controller and GUI
+  integration.
+- `architectures/seer/third_party/3dflow_real_deploy/`: preserved deployment
+  dependency snapshot.
+- `architectures/seer/upstream/scripts/REAL/deploy_ll_gui_unified.sh`: the
+  single configurable entry point for Basketball, Doll and Cabinet, for both
+  baseline and LatentLoop. Earlier task-specific V2 launcher text is retained
+  only under `tests/fixtures/seer/deploy/` for argument-parity regression tests,
+  not as operational launchers. Use the unified file for new sessions.
+- `artifacts/seer/real_world/<task>/`: ignored local checkpoints and manifests.
+- `real_deploy_results_v2/<baseline|latentloop>/<task>/`: method- and
+  task-separated runtime evidence. Historical Basketball results directly
+  under the method folder are not moved or overwritten.
 
-The artifact directory ignores every file except its README, manifest, and
-`.gitignore`. Consequently, teacher, adapter, and ViT checkpoints cannot be
-added by a normal `git add`, while JSON deployment results can be shared.
+Rings and Stacking Cups adapters use the same training contract. Deployment
+launchers should be added only after each task's camera, instruction, checkpoint
+pair, and robot workspace have been validated.
 
-## Required artifact names
+## Configuration
 
-Copy the following files into
-`~/gnaroshi_vla/artifacts/seer/real_world/basketball/` on the inference computer:
-
-```text
-shared/mae_pretrain_vit_base.pth
-baseline/teacher_34.pth
-baseline/teacher_35.pth
-baseline/teacher_37.pth
-latentloop/teacher_34/teacher_34_adapter_39.pth
-latentloop/teacher_35/teacher_35_adapter_39.pth
-latentloop/teacher_37/teacher_37_adapter_39.pth
-```
-
-The expected sizes and SHA-256 values are tracked in
-`artifacts/seer/real_world/basketball/checkpoint_manifest.json`.
-
-## Inference-computer setup
-
-Clone the deployment branch, then activate the already validated environment:
+Edit the configuration block at the top of `deploy_ll_gui_unified.sh` rather
+than relying on persistent shell variables. Leave exactly one preset active:
 
 ```bash
-ssh -p 9000 jbr@210.107.197.121
-git clone --branch exp/seer-latentloop-real-deploy-20260814 \
-  https://github.com/Gnaroshi/gnaroshi_vla.git ~/gnaroshi_vla
-cd ~/gnaroshi_vla/architectures/seer/upstream
+deploy_presets=(
+    # "basketball_baseline"
+    # "basketball_latentloop"
+    "doll_baseline"
+    # "doll_latentloop"
+    # "cabinet_baseline"
+    # "cabinet_latentloop"
+)
+basketball_teacher_id=37       # 34, 35, or 37; Doll/Cabinet use teacher38
+adapter_id=39
+query_interval=4
+execution_mode="live"          # or read_only_profile
+camera_mode="sync"
+camera_fps=60
+control_freq=60
+preflight_only=0               # 1 for synthetic model checks, no hardware
+```
+
+The preset selects the matching Seer instruction, teacher, task-specific
+adapter, manifest and result folder. Multiple active presets are rejected.
+Baseline never loads an adapter. All presets use the existing Seer v2 action
+decoding, temporal ensembling and camera configuration. The task-specific home
+targets below apply equally to baseline and LatentLoop; the existing Seer home
+interpolation, duration and servo settings are unchanged. No PI0/PI0.5 action
+horizon or policy gripper threshold is imported.
+
+### Task-specific robot home
+
+The `home_pose_json` settings in the launcher's task selection contain six UR5e
+joint angles in radians, followed by a normalized gripper target (0 = open).
+They match the task targets used by `pi05_relative_deploy_vtp.py`, called from
+the reference `efficient_Seer-main/scripts/REAL/deploy_pi05_relative_vtp_baseline.sh`:
+
+| Task | Joint target (rad) | Gripper |
+| --- | --- | --- |
+| Basketball | `[3.14, -1.57, 1.57, -1.57, -1.57, -1.57]` | Open |
+| Doll | `[3.0502887, -1.6030570, 1.8191951, -1.8019783, -1.5417574, -1.6144441]` | Open |
+| Cabinet | `[2.9891653, -1.5753395, 1.8866094, -1.8454653, -1.5462163, -1.6641129]` | Open |
+
+Doll uses reference episode `0511_172010`; Cabinet uses `0507_203729`.
+The reference stores a measured gripper value of `0.0117647` for those tasks
+but its home routine explicitly commands fully open. Seer therefore uses `0.0`
+to match the commanded state, not the stored measurement.
+
+Previously all tasks inherited the Basketball home target. New sessions must
+use the unified launcher: a missing home setting or a task/manifest mismatch
+now fails before model or hardware creation. Home settings are printed at
+startup and saved in `launch_config.txt`, the session manifest, and result
+metadata. They apply to every existing home call, including rollout start and
+return-to-home. The reference image browser remains read-only; browsing another
+episode does not change the configured robot home.
+
+For baseline, `baseline_rollout_policy="full"` gives the paper baseline. The
+`hold_action` and `hold_latent` modes are mechanism controls and must not be
+reported as Seer K=1.
+
+## Preflight and launch
+
+From `architectures/seer/upstream` on the inference computer:
+
+```bash
 conda activate seer
+bash scripts/REAL/deploy_ll_gui_unified.sh --print-config
+bash scripts/REAL/deploy_ll_gui_unified.sh --preflight
+bash scripts/REAL/deploy_ll_gui_unified.sh
 ```
 
-Near the top of `deploy_ll_gui.sh`, select exactly one method and one target
-control rate by commenting one assignment and uncommenting the other:
+`--print-config` only resolves settings, without loading a model or connecting
+to hardware. `--preflight` loads/hashes the selected artifacts and runs
+synthetic inference, without opening cameras or connecting to the robot.
+The normal command opens the GUI; the existing live environment initialization
+and rollout behavior are unchanged. Synthetic checks do not validate new
+physical motions. GUI controls for frequency, K and baseline hold modes
+remain available as before.
 
-```bash
-# deployment_method="baseline"
-deployment_method="latentloop"
+## GUI Layout
 
-control_freq=15
-# control_freq=40
-```
+The live Primary/Wrist views sit directly above their training-start references.
+Start, Stop & home, outcome buttons and recent runtime measurements remain visible
+on the right. Session contains notes and result controls; Settings contains
+control frequency, query interval and policy selection; Details contains complete
+checkpoint paths, home configuration, camera IDs and the latest saved rollout.
+Settings are disabled during an active rollout. Record deletion requires confirmation.
 
-Run a model-only preflight first. It verifies and loads the selected artifacts
-but does not initialize the UR5e, gripper, cameras, or Tk GUI:
+`Stop & home` is the existing rollout stop-and-return-home command, not a hardware
+emergency stop. No motion, decoding or policy scheduling algorithm is changed by
+this layout.
 
-```bash
-bash scripts/REAL/deploy_ll_gui.sh --preflight
-```
+The dashboard's Command Hz uses up to 20 intervals between completed robot commands.
+Policy ms is the mean of up to 20 existing inference records, not simulator/camera
+time or the complete rollout average. Empty measurements are displayed as `--`.
 
-Run the real GUI with the same self-contained script:
+For legible antialiased text, the inference launcher's `gui_font_backend="system"`
+uses the installed system Tcl/Tk 8.6 libraries only in the GUI subprocess. It does
+not install or replace conda packages. Use `gui_font_backend="conda"` to retain the
+original Tk runtime. Model preflight and read-only profiling do not use this override.
 
-```bash
-bash scripts/REAL/deploy_ll_gui.sh
-```
+## Training-Start Reference Images
 
-No external experiment environment variables are required. To deploy another
-validated pair, edit only `teacher_id`; the manifest rejects a teacher/adapter
-mismatch.
+The V2 GUI shows a **Reference images** section directly below Camera previews.
+It follows the selected task's checkpoint manifest, for both baseline and
+LatentLoop. Basketball, Doll and Cabinet each have all 40 training-episode
+starts, with Primary and Wrist views from step `0000` shown together.
 
-`control_freq` is a target period for the complete loop consisting of camera and
-robot-state acquisition, policy inference, robot command, and any remaining
-sleep. Setting `40` requests a `25 ms` period but cannot guarantee 40 Hz when
-that complete work takes longer. Runtime summaries therefore record the target
-rate, measured inter-policy period, achieved rate, and strict deadline misses.
+- `<` / `>` move through episodes, wrapping at the ends.
+- The episode selector jumps directly to any of the 40 starts.
+- `Random` chooses a different episode without consuming the policy's RNG.
+- `Zoom` or clicking an image opens both views at a larger size.
+- Recorded episode name and step are shown below the images.
 
-## Logged evidence
+Images live under `artifacts/seer/real_world/<task>/reference_start_frames_all/`.
+Its manifest records source dataset, episode IDs and SHA-256 values. Images are
+byte-identical training JPEGs, without re-encoding, flipping or cropping.
+The viewer only reads images; it never sets the robot pose or feeds a reference
+image to the policy. Missing, mismatched or damaged collections show an error
+inside this section rather than silently displaying another task.
 
-Every launch writes the following under
-`real_deploy_results/<baseline|latentloop>/launch_logs/<profile>/<timestamp>/`:
+No new launcher arguments are needed. After finishing the current rollout,
+close and reopen the GUI to load this addition; an already-running GUI is not
+hot-reloaded. Keyboard focus inside the reference controls does not trigger
+rollout-start/restart shortcuts; the existing `X` stop shortcut remains active.
 
-- complete launch configuration
-- exact launcher snapshot and shell command
-- git commit and dirty state
-- checkpoint/manifest SHA-256 values
-- complete console output and exit code
+## Artifact policy
 
-Each GUI session is also stored under the selected method and profile. It records
-teacher/adapter/K/control-rate metadata, result JSON, rollout media, per-step
-full-vs-LatentLoop mode and latency, plus measured control cadence. Warm-up
-inference is excluded from rollout statistics.
-
-## Hugging Face consideration
-
-A private or gated Hugging Face artifact repository could later replace manual
-transfer and pin files by revision and SHA-256. It is intentionally not used in
-this deployment: no checkpoint has been uploaded, and the local ignored artifact
-directory remains the source of runtime files.
+Checkpoint binaries remain ignored by Git. A task artifact directory should
+contain a manifest with expected filename, byte size, SHA-256 hash, teacher ID,
+adapter ID, instruction, and training-dataset provenance. Runtime JSON and logs
+may be versioned separately after removing raw media and private machine data.

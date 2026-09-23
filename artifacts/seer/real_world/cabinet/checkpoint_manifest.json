@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "task": "cabinet_filtered_40p",
+  "latentloop_architecture": {
+    "hidden_dim": 256,
+    "motion_dim": 128,
+    "fast_encoder_type": "diffcnn",
+    "detach_input_latent": true,
+    "detach_teacher_latent": true,
+    "freeze_action_head": true,
+    "use_post_layernorm": false,
+    "gate_init_bias": -4.0
+  },
+  "vit": {
+    "filename": "mae_pretrain_vit_base.pth",
+    "sha256": "aec5f0b68e5f3193a00b07bc65a37440db549c15b36b8bea242606cc40c4bc5d",
+    "size_bytes": 343249461
+  },
+  "teachers": {
+    "38": {
+      "filename": "teacher_38.pth",
+      "checkpoint_epoch": 38,
+      "sha256": "fe642965f46a35ad6810f155bf7f62c1219e0a78fbe32fd2c3e1b5b95e563996",
+      "size_bytes": 809418674,
+      "adapters": {
+        "39": {
+          "filename": "teacher_38_adapter_39.pth",
+          "checkpoint_epoch": 39,
+          "sha256": "2f3e7f133570054fa6ad144e8af171269cd9f543da619d348cb0714d22a34cd6",
+          "size_bytes": 5731712
+        }
+      }
+    }
+  }
+}

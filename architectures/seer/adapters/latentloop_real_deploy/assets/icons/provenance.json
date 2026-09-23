@@ -1,0 +1,20 @@
+{
+  "library": "Lucide",
+  "version": "0.468.0",
+  "source": "https://github.com/lucide-icons/lucide",
+  "size_px": 18,
+  "icons": [
+    "play",
+    "square",
+    "check",
+    "x",
+    "rotate-ccw",
+    "save",
+    "trash-2",
+    "log-out",
+    "chevron-left",
+    "chevron-right",
+    "shuffle",
+    "expand"
+  ]
+}
