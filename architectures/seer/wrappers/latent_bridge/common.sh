@@ -9,7 +9,7 @@ LATENT_BRIDGE_OFFICIAL_SOURCE="${LATENT_BRIDGE_REPO_ROOT}/architectures/latent_b
 
 LATENT_BRIDGE_PUBLIC33="${LATENT_BRIDGE_PUBLIC33:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/checkpoints_Seer_LIBERO_LONG/Seer/33.pth}"
 LATENT_BRIDGE_VIT="${LATENT_BRIDGE_VIT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/vit_mae/mae_pretrain_vit_base.pth}"
-LATENT_BRIDGE_DATASET_ROOT="${LATENT_BRIDGE_DATASET_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/seer_node2/LIBERO_DATASETS/libero_10_converted}"
+LATENT_BRIDGE_DATASET_ROOT="${LATENT_BRIDGE_DATASET_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/LIBERO_DATASETS/libero_10_converted}"
 LATENT_BRIDGE_LIBERO_PATH="${LATENT_BRIDGE_LIBERO_PATH:-/home/mingyujung/private/LIBERO}"
 LATENT_BRIDGE_RESULT_ROOT="${LATENT_BRIDGE_RESULT_ROOT:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/latent_bridge/public33_libero_long}"
 LATENT_BRIDGE_RENDERER="${LATENT_BRIDGE_RENDERER:-osmesa}"
