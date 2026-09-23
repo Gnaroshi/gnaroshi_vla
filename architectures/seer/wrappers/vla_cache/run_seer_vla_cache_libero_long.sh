@@ -19,7 +19,7 @@ PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0}
 SAVE_VIDEO=${SAVE_VIDEO:-0}
 LIBERO_GL_BACKEND=${LIBERO_GL_BACKEND:-egl}
 
-PUBLIC33=${PUBLIC33:-/home/mingyujung/private/seer/checkpoints_Seer_LIBERO_LONG/Seer/33.pth}
+PUBLIC33=${PUBLIC33:-/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/artifacts/checkpoints/seer/paper/libero_long/teacher_public33.pth}
 PUBLIC33_SHA256=${PUBLIC33_SHA256:-a74f200bb91618a27cbb8e25bc6e1008647056ebe4155348095d63b658936646}
 VIT_CHECKPOINT_PATH=${VIT_CHECKPOINT_PATH:-/home/mingyujung/shared/nvme1/mingyujung/robotics/seer/vit_mae/mae_pretrain_vit_base.pth}
 VIT_SHA256=${VIT_SHA256:-aec5f0b68e5f3193a00b07bc65a37440db549c15b36b8bea242606cc40c4bc5d}
