@@ -24,6 +24,9 @@ AGENTS.md
 WORKSPACE_FILE_MANIFEST.txt
 architectures/*/results.md
 
+# Local manuscript and paper assets
+/paper_resources/
+
 # Generated runtime outputs
 outputs/
 wandb/
