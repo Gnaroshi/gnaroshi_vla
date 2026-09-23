@@ -51,11 +51,13 @@ from methods.latentloop_comparison.training_losses import (
     action_correction_loss,
     continuous_gripper_probability,
 )
-from tools.seer.evaluate_latentloop_comparison_offline import (
+from tools.seer_legacy.completed_experiments.evaluate_latentloop_comparison_offline import (
     _parse_legacy_seer_runtime_args,
     _run_with_seer_upstream_cwd,
 )
-from tools.seer.lock_latentloop_comparison_source import _runtime_dataset_path
+from tools.seer_legacy.completed_experiments.lock_latentloop_comparison_source import (
+    _runtime_dataset_path,
+)
 
 
 class TinyMatchedEncoder(nn.Module):
