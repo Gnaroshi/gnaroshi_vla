@@ -22,6 +22,9 @@ def expected_counts(row, queries):
 
 def attach_policy(replay, config, row, manifest):
     from tools.simvla.compile_audit import make_reference
+    if replay.native is not None:
+        from architectures.simvla.adapters.latentloop.efficient_multirate.efficient_delta import use_normalized_float_delta_inputs
+        use_normalized_float_delta_inputs(replay.native)
     if replay.hook is not None:
         replay.hook.close()
         replay.hook = None

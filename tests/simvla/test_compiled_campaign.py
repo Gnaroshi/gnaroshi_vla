@@ -65,3 +65,25 @@ def test_registry_unique_and_long_first():
     work = jobs(c)
     assert len(work) == len(set(work)) == 15
     assert all(suite == "libero_10" for suite, _, _ in work[:9])
+
+
+@pytest.mark.parametrize("kind", ["random", "black", "white"])
+def test_live_float_rgb_encoder_is_bitwise_equal_to_original(kind):
+    from copy import deepcopy
+    import torch
+    from methods.latentloop.modules.native_simvla_v0 import NativeV0DeltaEncoder, NativeV0ObservationPair
+    from architectures.simvla.adapters.latentloop.efficient_multirate.efficient_delta import (
+        install_exact_uint8_delta_path, use_normalized_float_delta_inputs,
+    )
+    torch.set_num_threads(1)
+    original = NativeV0DeltaEncoder().eval()
+    efficient = SimpleNamespace(delta_encoder=deepcopy(original))
+    raw = torch.randint(0, 256, (1, 2, 224, 224, 3), dtype=torch.uint8).float() / 255
+    if kind == "black": raw.zero_()
+    if kind == "white": raw.fill_(1)
+    pair = NativeV0ObservationPair(raw, raw.flip(2), torch.zeros(1, 8), torch.ones(1, 8))
+    install_exact_uint8_delta_path(efficient)
+    with pytest.raises(ValueError, match="RGB"): efficient.delta_encoder(pair)
+    use_normalized_float_delta_inputs(efficient)
+    with torch.inference_mode():
+        assert torch.equal(original(pair), efficient.delta_encoder(pair))
