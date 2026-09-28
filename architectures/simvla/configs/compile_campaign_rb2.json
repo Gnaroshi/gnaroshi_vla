@@ -1,0 +1,14 @@
+{
+  "output": "/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/compiled_paper/three_seed_v1",
+  "recorded_input": "/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/compile_benchmark/paired_long_inputs_v1",
+  "manifest_root": "/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/paper_four_suite_three_seed_v1/manifests",
+  "libero_root": "/home/mingyujung/private/gnaroshi_vla_storage/datasets/LIBERO",
+  "libero_config": "/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/reproduction/official_ckpt_mujoco237_official_norm_seed7_n50_r2/runtime/libero_config",
+  "long_rows": ["baseline", "naive_nfe3", "condition_naive3", "ours_kc2_ng3", "generation_ng3", "condition_nfe10", "latent_bridge_f2", "latent_bridge_f3", "latent_bridge_f4"],
+  "other_rows": ["baseline", "ours_kc2_ng3", "latent_bridge_f2", "latent_bridge_f3", "latent_bridge_f4"],
+  "other_suites": ["libero_spatial", "libero_object", "libero_goal"],
+  "seeds": ["seed01", "seed02", "seed03"],
+  "worker_timeout_seconds": 28800,
+  "smoke_actions": 40,
+  "videos_per_row": 2
+}
