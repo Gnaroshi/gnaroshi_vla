@@ -50,12 +50,24 @@ def source_identity(c):
         ROOT / "architectures/simvla/adapters/dcld", ROOT / "methods/latentloop",
         Path(c["upstream"]) / "models",
         Path(c["bridge_adapter_root"]) / "architectures/simvla/adapters/latent_bridge",
-        Path(c["vla_cache_adapter_root"]) / "architectures/simvla/adapters/vla_cache",
         Path(c["bridge_upstream"]) / "qcvla/model"]
     files = {str(p.resolve()): sha(p) for directory in directories for p in directory.rglob("*.py")}
-    for p in (Path(__file__), ROOT / "tools/simvla/compile_runtime.py"):
+    for p in (Path(__file__), ROOT / "tools/simvla/compile_runtime.py", ROOT / "tools/simvla/compile_checks.py",
+              ROOT / "tools/simvla/compile_audit.py", ROOT / "architectures/simvla/wrappers/run_compile_benchmark_rb2.sh"):
         files[str(p.resolve())] = sha(p)
     return files
+
+
+def model_asset_identity(c):
+    hub = Path(c["hf_home"]) / "hub"
+    base = hub / "models--YuankaiLuo--SimVLA-LIBERO/snapshots" / c["checkpoint_revision"]
+    processor_repo = hub / "models--HuggingFaceTB--SmolVLM-500M-Instruct"
+    revision = (processor_repo / "refs/main").read_text().strip()
+    processor = processor_repo / "snapshots" / revision
+    if not processor.is_dir():
+        raise FileNotFoundError(f"Missing processor snapshot: {processor}")
+    files = list(base.rglob("*")) + list(processor.rglob("*"))
+    return {str(p): sha(p) for p in sorted(files) if p.is_file()}
 
 
 def configure(c):
@@ -68,7 +80,7 @@ def configure(c):
             sys.path.insert(0, path)
     import architectures.simvla.adapters as adapters
     adapters.__path__ = list(adapters.__path__)
-    for key in ("bridge_adapter_root", "vla_cache_adapter_root"):
+    for key in ("bridge_adapter_root",):
         path = str(Path(c[key]) / "architectures/simvla/adapters")
         if path not in adapters.__path__:
             adapters.__path__.append(path)
@@ -77,7 +89,7 @@ def configure(c):
 def preflight(c):
     required = [c[key] for key in (
         "python", "upstream", "norm_stats", "condition_checkpoint", "generation_checkpoint",
-        "bridge_checkpoint", "bridge_adapter_root", "vla_cache_adapter_root", "bridge_upstream",
+        "bridge_checkpoint", "bridge_adapter_root", "bridge_upstream",
     )]
     required.append(str(Path(c["cache"]) / "manifest.json"))
     snapshot = Path(c["hf_home"]) / "hub/models--YuankaiLuo--SimVLA-LIBERO/snapshots" / c["checkpoint_revision"]
@@ -89,12 +101,37 @@ def preflight(c):
         raise RuntimeError("At least 10 GiB free storage is required for compiler caches")
     configure(c)
     from architectures.simvla.adapters.latent_bridge.checkpoint import load_bridge_checkpoint
-    from architectures.simvla.adapters.vla_cache.smolvlm_runtime import SimVLAVLACacheBackbone
     from architectures.simvla.adapters.latentloop.efficient_multirate.exact_teacher_cache import ExactTeacherSequenceDataset
     from tools.simvla.compile_runtime import Compiler
     import torch
     return {"verdict": "CPU_PREFLIGHT_PASS", "torch": torch.__version__,
             "checkpoint_snapshot": str(snapshot), "gpu_jobs_started": False}
+
+
+def verify_recorded_inputs(directory):
+    directory = Path(directory)
+    contract = read_json(directory / "input_contract.json")
+    if sha(directory / "recorded_inputs.pt") != contract["sha256"]:
+        raise RuntimeError("Recorded input bytes differ from input_contract.json")
+    if contract["queries_per_sample"] != 4 or contract["samples"] <= 0:
+        raise RuntimeError("Unsupported recorded input shape")
+    return contract
+
+
+def verify_result_artifacts(directory, *, row, mode, input_sha256, run_identity_sha256):
+    from tools.simvla.compile_checks import assess_result, read_log
+    directory = Path(directory)
+    result = read_json(directory / "result.json")
+    expected = {"row": row, "mode": mode, "input_sha256": input_sha256,
+                "run_identity_sha256": run_identity_sha256}
+    if any(result.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("Result identity differs from current paired experiment")
+    if result.get("actions_sha256") != sha(directory / "actions.pt"):
+        raise RuntimeError("Saved action bytes differ from result.json")
+    assessment = assess_result(result, log_text=read_log(directory / "run.log"))
+    if assessment["timing_checks"] != "PASS":
+        raise RuntimeError("Existing result requires review: " + str(assessment["issues"]))
+    return result
 
 
 def prepare_inputs(c, output):
@@ -106,6 +143,9 @@ def prepare_inputs(c, output):
 
     path = output / "recorded_inputs.pt"
     if path.exists():
+        contract = verify_recorded_inputs(output)
+        if contract["samples"] != c["windows"] or contract["cache_manifest_sha256"] != sha(Path(c["cache"]) / "manifest.json"):
+            raise RuntimeError("Existing input selection contract changed")
         return
     dataset = ExactTeacherSequenceDataset(c["cache"], split="heldout")
     selected = _balanced_indices(dataset.identities, limit=c["windows"], seed=c["seed"])
@@ -151,9 +191,10 @@ class Replay:
 
         self.torch, self.row, self.compiler = torch, row, compiler
         checkpoint = str(Path(c["hf_home"]) / "hub/models--YuankaiLuo--SimVLA-LIBERO/snapshots" / c["checkpoint_revision"])
-        self.model, _, self.action = load_frozen_simvla(checkpoint=checkpoint,
+        self.model, self.processor, self.action = load_frozen_simvla(checkpoint=checkpoint,
             norm_stats=c["norm_stats"], smolvlm_model="HuggingFaceTB/SmolVLM-500M-Instruct",
             device=torch.device("cuda"))
+        self.original_transformer_forward = self.model.transformer.forward
         self.step = ActionStep(self.model.transformer).eval()
         first = samples[0]["queries"][0]
         condition = self.model.forward_vlm_efficient(first["image_input"], first["image_mask"], first["input_ids"])["vlm_features"]
@@ -262,12 +303,20 @@ def worker(c, output, row, mode):
     from tools.simvla.compile_runtime import Compiler
 
     torch.set_num_threads(1)
-    configure_strict_torch_determinism(c["seed"])
+    determinism = configure_strict_torch_determinism(c["seed"])
     total = torch.cuda.get_device_properties(0).total_memory
     torch.cuda.set_per_process_memory_fraction((total - 2 * 1024**3) / total)
     compiler = Compiler(mode == "compile")
     directory = output / row / mode
     directory.mkdir(parents=True, exist_ok=True)
+    input_contract = verify_recorded_inputs(output)
+    run_identity = sha(output / "provenance.json")
+    source_before = source_identity(c)
+    if source_before != read_json(output / "provenance.json")["source_files"]:
+        raise RuntimeError("Source differs from recorded experiment provenance")
+    if mode == "compile":
+        verify_result_artifacts(output / row / "eager", row=row, mode="eager",
+            input_sha256=input_contract["sha256"], run_identity_sha256=run_identity)
     cpu = torch.load(output / "recorded_inputs.pt", map_location="cpu", weights_only=False)
     def move(x):
         if torch.is_tensor(x): return x.cuda()
@@ -337,12 +386,17 @@ def worker(c, output, row, mode):
             "max_output_abs_diff": max((v["max_abs"] for v in comparisons), default=None),
             "gripper_sign_changes": sum(v["first5_gripper_sign_changes"] for v in comparisons),
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "determinism": determinism, "input_sha256": input_contract["sha256"],
+            "run_identity_sha256": run_identity, "actions_sha256": sha(directory / "actions.pt"),
             "next": "live SR re-evaluation required before using compiled SR; this is only finite-input parity"}
+        if source_identity(c) != source_before:
+            raise RuntimeError("Source changed during worker execution; results are not reusable")
         write_json(directory / "result.json", report)
         print(json.dumps({k: report[k] for k in ["row", "mode", "verdict", "latency_ms_per_query", "max_output_abs_diff"]}), flush=True)
 
 
 def aggregate(c, output):
+    from tools.simvla.compile_checks import assess_result, read_log
     results = {}
     lines = ["# SimVLA compile 검증", "", "고정된 실제 입력의 모델 계산시간 비교입니다. 논문의 policy ms/action 또는 성공률이 아닙니다.", "",
         "| 구성 | eager ms/query | compile ms/query | eager/compile | 출력 최대 차이 | 상태 |",
@@ -358,10 +412,25 @@ def aggregate(c, output):
             lines.append(f"| {row} | {a:.3f} | {b:.3f} | {a/b:.3f}x | {compiled.get('max_output_abs_diff')} | {compiled.get('verdict')} |")
         else:
             lines.append(f"| {row} | - | - | - | - | {compiled.get('verdict', e.get('verdict', 'NOT_RUN'))} |")
-    complete = all(len(pair) == 2 and all(v.get("verdict") == "RECORDED_INPUT_BENCHMARK_COMPLETE" for v in pair.values()) for pair in results.values())
-    verdict = "BENCHMARK_COMPLETE" if complete else "BENCHMARK_FINISHED_WITH_ITEMS_TO_REVIEW"
+    assessments = {row: {mode: assess_result(value, log_text=read_log(output / row / mode / "run.log"))
+                   for mode, value in pair.items()} for row, pair in results.items()}
+    contract = verify_recorded_inputs(output)
+    run_identity = sha(output / "provenance.json")
+    for row, pair in assessments.items():
+        for mode, assessment in pair.items():
+            try:
+                verify_result_artifacts(output / row / mode, row=row, mode=mode,
+                    input_sha256=contract["sha256"], run_identity_sha256=run_identity)
+            except (OSError, ValueError, RuntimeError) as exc:
+                assessment["issues"].append("artifact_validation:" + str(exc))
+                assessment["timing_checks"] = "REVIEW_REQUIRED"
+    complete = all(len(pair) == 2 and all(v["timing_checks"] == "PASS" for v in pair.values()) for pair in assessments.values())
+    verdict = "REPLAY_COMPLETE_SR_NOT_VALIDATED" if complete else "REPLAY_REVIEW_REQUIRED"
     write_json(output / "summary.json", {"verdict": verdict, "rows": results,
+        "assessments": assessments,
         "not_a_success_rate_experiment": True, "not_paper_end_to_end_latency": True})
+    lines.extend(["", "실행 완료는 출력 동등성이나 성공률 검증 통과를 뜻하지 않습니다.",
+        "검증 이슈: " + json.dumps({k: v for k, v in assessments.items() if any(x['issues'] for x in v.values())}, ensure_ascii=False)])
     (output / "report_ko.md").write_text("\n".join(lines) + "\n")
     return verdict
 
@@ -382,19 +451,24 @@ def run_all(c, output):
             "git_head": subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip(),
             "config_sha256": sha(locked), "inputs": {key: sha(c[key]) for key in
                 ["norm_stats", "condition_checkpoint", "generation_checkpoint", "bridge_checkpoint"]},
-            "source_files": source_identity(c)})
+            "source_files": source_identity(c), "model_assets": model_asset_identity(c)})
         if (output / "provenance.json").exists():
             previous = read_json(output / "provenance.json")
-            for key in ("source_files", "inputs", "config_sha256"):
-                if previous[key] != provenance[key]:
+            for key in ("source_files", "inputs", "config_sha256", "model_assets", "packages", "gpu", "environment"):
+                if previous.get(key) != provenance[key]:
                     raise RuntimeError(f"Existing run provenance changed: {key}; choose a new output")
-        write_json(output / "provenance.json", provenance)
+        else:
+            write_json(output / "provenance.json", provenance)
         prepare_inputs(c, output)
+        contract = verify_recorded_inputs(output)
+        run_identity = sha(output / "provenance.json")
         for row in c["rows"]:
             for mode in ("eager", "compile"):
                 directory = output / row / mode
                 result = directory / "result.json"
-                if result.exists() and read_json(result).get("verdict") == "RECORDED_INPUT_BENCHMARK_COMPLETE":
+                if result.exists():
+                    verify_result_artifacts(directory, row=row, mode=mode,
+                        input_sha256=contract["sha256"], run_identity_sha256=run_identity)
                     print(f"REUSE row={row} mode={mode}", flush=True)
                     continue
                 if mode == "compile" and not (output / row / "eager/actions.pt").exists():
@@ -442,6 +516,7 @@ def run_all(c, output):
         verdict = aggregate(c, output)
         write_json(output / "status.json", {"state": "finished", "verdict": verdict})
         print(f"{verdict} report={output/'report_ko.md'}", flush=True)
+        return verdict == "REPLAY_COMPLETE_SR_NOT_VALIDATED"
 
 
 def stop_worker(process):
@@ -464,7 +539,7 @@ def main():
     p.add_argument("--mode", choices=["eager", "compile"])
     args = p.parse_args()
     c = read_json(args.config)
-    output = args.output or Path(c["storage"]) / "results/simvla/compile_benchmark/paired_long_inputs_v1"
+    output = args.output or Path(c["storage"]) / "results/simvla/compile_benchmark/paired_long_inputs_v2"
     configure(c)
     try:
         if args.command == "preflight": print(json.dumps(preflight(c), indent=2))
@@ -475,7 +550,7 @@ def main():
             if args.row not in c["rows"] or not args.mode: raise ValueError("Valid row and mode required")
             worker(c, output, args.row, args.mode)
         elif args.command == "summarize": print(aggregate(c, output))
-        else: run_all(c, output)
+        else: return 0 if run_all(c, output) else 2
     except Exception:
         traceback.print_exc()
         return 1

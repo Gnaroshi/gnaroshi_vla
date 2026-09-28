@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Run in an existing pane; never exit/replace the caller's interactive shell.
 set +e
+if [ "$(hostname -s)" != "jbr-TRX50" ]; then
+  printf 'COMPILE_BENCHMARK_EXIT=1: this GPU-0 launcher is restricted to rb2.\n'
+  exit 0
+fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="${SIMVLA_PYTHON:-/home/mingyujung/private/gnaroshi_vla_storage/envs/simvla/libero_mujoco237/bin/python}"
 export CUDA_VISIBLE_DEVICES=0
@@ -18,7 +22,12 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${ROOT}" || { printf 'COMPILE_BENCHMARK_FAILED: repository missing\n'; exit 0; }
 if [ "$#" -eq 0 ]; then set -- all; fi
-"${PY}" -u tools/simvla/compile_benchmark.py "$@"
+if [ "$1" = "audit" ]; then
+  shift
+  "${PY}" -u tools/simvla/compile_audit.py "$@"
+else
+  "${PY}" -u tools/simvla/compile_benchmark.py "$@"
+fi
 rc=$?
 printf '\nCOMPILE_BENCHMARK_EXIT=%s (the existing pane remains open)\n' "$rc"
 exit 0
