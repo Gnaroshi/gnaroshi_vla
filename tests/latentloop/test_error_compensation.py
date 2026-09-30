@@ -34,3 +34,38 @@ def test_every_trained_arm_has_online_evaluation():
     for arm in ARMS:
         assert by_id["eval_" + arm]["deps"] == ["train_" + arm]
     assert all("--smoke" not in j["cmd"] for j in plan)
+
+
+def test_oracle_condition_never_leaks_into_student_full_steps():
+    from types import SimpleNamespace
+    from torch import nn
+    from methods.latentloop.modules.simvla_generation_loop import SimVLAGenerationHiddenUpdater, SimVLAGenerationLoop
+    from architectures.simvla.adapters.latentloop.efficient_multirate.generation_objective import generation_local_oracle_loss
+    torch.set_num_threads(1)
+    class Transformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.action_decoder = nn.Linear(8, 7)
+            self.conditions = []
+        def forward(self, *, vlm_features, action_with_noise, proprio, t):
+            self.conditions.append(vlm_features.detach().clone())
+            hidden = vlm_features.mean(1)[:, None, :].expand(-1, 10, -1)
+            return self.action_decoder(hidden)
+    transformer = Transformer().requires_grad_(False)
+    updater = SimVLAGenerationHiddenUpdater(hidden_dim=8, condition_dim=8, rank_dim=4)
+    loop = SimVLAGenerationLoop(updater, transformer.action_decoder)
+    predicted, teacher = torch.randn(1, 4, 8), torch.randn(1, 4, 8)
+    arguments = dict(loop=loop, transformer=transformer, action_space=SimpleNamespace(postprocess=lambda x: x),
+        condition=predicted, initial_noise=torch.randn(1, 10, 7), normalized_proprio=torch.randn(1, 8),
+        condition_valid_mask=None, condition_change_code=torch.zeros(1, 128),
+        full_step_indices=(0, 4, 8), teacher_final_action=torch.randn(1, 10, 7))
+    result = generation_local_oracle_loss(**arguments, oracle_condition=teacher)
+    assert len(transformer.conditions) == 4
+    for condition in transformer.conditions[:3]:
+        torch.testing.assert_close(condition, predicted, rtol=0, atol=0)
+    torch.testing.assert_close(transformer.conditions[3], teacher.repeat(7, 1, 1), rtol=0, atol=0)
+    result.total.backward()
+    assert all(p.grad is None for p in transformer.parameters())
+    default = generation_local_oracle_loss(**arguments)
+    explicit = generation_local_oracle_loss(**arguments, oracle_condition=predicted)
+    torch.testing.assert_close(default.total, explicit.total, rtol=0, atol=0)

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
+import hashlib
 import time
 from pathlib import Path
 
@@ -57,7 +59,8 @@ def offline(c, arm, runtime, updater, output):
             context, raw, noise, _ = query_inputs(adapter, action, sequence, age)
             target = sequence["teacher_actions"][:, age - 1]
             for name, loop in loops.items():
-                result = objective(loop, frozen, action, context, noise, target,
+                row_context = replace(context, valid_mask=None) if name == "parent" else context
+                result = objective(loop, frozen, action, row_context, noise, target,
                     sequence["teacher_conditions"][:, age - 1],
                     "true_condition_no_code" if name == "parent" else arm)
                 prediction = action.action_space.postprocess(result.trace.final_noisy_action)
@@ -86,6 +89,10 @@ def run(c, arm, *, smoke=False):
     # Neutral code projection preserves the parent at initialization in all arms.
     with torch.no_grad():
         updater.condition_code_projection.weight.zero_()
+    initial_hash = hashlib.sha256()
+    for name, tensor in updater.state_dict().items():
+        initial_hash.update(name.encode())
+        initial_hash.update(tensor.detach().cpu().contiguous().numpy().tobytes())
     loop = SimVLAGenerationLoop(updater, frozen.transformer.action_decoder).to(device)
     optimizer = torch.optim.AdamW(updater.parameters(), lr=c["learning_rate"], weight_decay=0)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,
@@ -102,6 +109,7 @@ def run(c, arm, *, smoke=False):
         start, elapsed = saved["optimizer_step"], saved["training_seconds"]
     total = 2 if smoke else c["steps"]
     training = {"identity": run_id, "arm": arm, "loss": "normalized hidden MSE only",
+        "initial_updater_sha256": initial_hash.hexdigest(),
         "oracle": "predicted condition" if arm == "same_condition" else "full teacher condition at student x,t",
         "condition_code": "zero" if arm.endswith("no_code") else "existing observation delta encoder output",
         "full_transformer_condition": "predicted condition in EVERY arm",
@@ -140,6 +148,8 @@ def run(c, arm, *, smoke=False):
                 target = sequence["teacher_actions"][:, age - 1]
                 teacher = sequence["teacher_conditions"][:, age - 1]
                 if step == 1:
+                    write_json(output / "first_batch.json", {"task_id": host["task_id"].tolist(),
+                        "episode_id": host["episode_id"], "anchor_query_index": host["anchor_query_index"].tolist(), "age": age})
                     with torch.no_grad():
                         actual = action.decode_action_from_condition(teacher, raw,
                             steps=10, initial_noise=noise, return_debug=True).action
