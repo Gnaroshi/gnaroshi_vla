@@ -44,6 +44,7 @@ def generation_local_oracle_loss(
     hidden_weight: float = 1.0,
     velocity_weight: float = 0.1,
     final_action_weight: float = 0.1,
+    oracle_condition: Tensor | None = None,
 ) -> GenerationLossOutput:
     """Roll out the student, then batch all student-state local-oracle calls once."""
 
@@ -83,7 +84,9 @@ def generation_local_oracle_loss(
 
     batch = condition.shape[0]
     positions = len(trace.predicted_hidden)
-    oracle_condition = condition.repeat(positions, 1, 1)
+    # Cross-condition supervision changes only the training oracle, never the
+    # student's inputs or the frozen full steps along its own trajectory.
+    oracle_condition = (condition if oracle_condition is None else oracle_condition).repeat(positions, 1, 1)
     oracle_proprio = normalized_proprio.repeat(positions, 1)
     oracle_action = torch.cat([value.detach() for value in trace.skipped_noisy_actions], dim=0)
     oracle_tau = torch.cat([value.detach() for value in trace.skipped_times], dim=0)
