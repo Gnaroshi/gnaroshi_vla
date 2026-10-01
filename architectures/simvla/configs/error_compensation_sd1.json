@@ -1,6 +1,6 @@
 {
   "storage": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla",
-  "output": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/error_compensation/long_seed01_v1",
+  "output": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/error_compensation/long_recursive_kc4_train_seed01_v1",
   "python": "/home/mingyujung/miniconda3/envs/simvla_libero/bin/python",
   "upstream": "/home/mingyujung/private/gnaroshi_vla/architectures/simvla/upstream",
   "hf_home": "/home/mingyujung/private/gnaroshi_vla/.cache/huggingface",
@@ -20,5 +20,7 @@
   "save_interval": 1000,
   "log_interval": 50,
   "heldout_windows": 100,
+  "training_condition_ages": [1, 2, 3],
+  "evaluation_condition_intervals": [4, 3],
   "wandb_project": "gnaroshi-simvla-latentloop"
 }

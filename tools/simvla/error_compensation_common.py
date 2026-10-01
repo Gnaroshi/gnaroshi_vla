@@ -12,7 +12,7 @@ from tools.simvla.compile_benchmark import read_json, write_json, sha
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "architectures/simvla/configs/error_compensation_sd1.json"
 ARMS = ("same_condition", "true_condition", "true_condition_no_code")
-ROWS = ("baseline", "condition_naive3", "condition_naive4", "condition_naive5", "parent", *ARMS)
+ROWS = ("condition_full10", *ARMS)
 
 
 def configure(c):

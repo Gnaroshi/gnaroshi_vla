@@ -21,7 +21,8 @@ from .exact_teacher_cache import collate_exact_teacher_sequences
 from .generation_checkpoint import load_generation_checkpoint
 from .generation_objective import generation_local_oracle_loss
 from .generation_train import RankDisjointStepSampler
-from .shared_refinement_train import load_runtime, lr_factor, query_inputs, assert_frozen
+from .shared_refinement_train import load_runtime, lr_factor, assert_frozen
+from .recursive_condition_inputs import query_inputs
 from methods.latentloop.modules.simvla_generation_loop import SimVLAGenerationLoop
 
 
@@ -55,9 +56,15 @@ def offline(c, arm, runtime, updater, output):
     indices = _balanced_indices(heldout.identities, limit=c["heldout_windows"], seed=c["seed"])
     for index in tqdm(indices, desc=f"Heldout {arm}", mininterval=2):
         sequence = move_batch(collate_exact_teacher_sequences([heldout[index]]), device)
-        for age in (1, 3):
+        for age in c["training_condition_ages"]:
             context, raw, noise, _ = query_inputs(adapter, action, sequence, age)
             target = sequence["teacher_actions"][:, age - 1]
+            teacher = sequence["teacher_conditions"][:, age - 1]
+            valid = context.valid_mask
+            predicted_c, original_c = context.condition[valid].float(), teacher[valid].float()
+            condition_metrics = {"condition_mse": float((predicted_c - original_c).square().mean()),
+                "condition_cosine": float(torch.nn.functional.cosine_similarity(
+                    predicted_c.flatten(), original_c.flatten(), dim=0))}
             for name, loop in loops.items():
                 row_context = replace(context, valid_mask=None) if name == "parent" else context
                 result = objective(loop, frozen, action, row_context, noise, target,
@@ -65,16 +72,25 @@ def offline(c, arm, runtime, updater, output):
                     "true_condition_no_code" if name == "parent" else arm)
                 prediction = action.action_space.postprocess(result.trace.final_noisy_action)
                 rows.append({"index": index, "age": age, "row": name,
-                    **action_metrics(prediction, target), "hidden_loss": float(result.hidden_normalized_mse)})
-            naive = action.decode_action_from_condition(context.condition, raw,
-                initial_noise=noise, steps=3, return_debug=True).action
-            rows.append({"index": index, "age": age, "row": "naive3", **action_metrics(naive, target)})
+                    **action_metrics(prediction, target), **condition_metrics,
+                    "hidden_loss": float(result.hidden_normalized_mse)})
+            for name, steps in (("naive3", 3), ("condition_full10", 10)):
+                decoded = action.decode_action_from_condition(context.condition, raw,
+                    initial_noise=noise, steps=steps, return_debug=True).action
+                rows.append({"index": index, "age": age, "row": name,
+                    **action_metrics(decoded, target), **condition_metrics})
     metrics = list(action_metrics(prediction, target))
-    summary = {name: {key: sum(r[key] for r in rows if r["row"] == name) /
-        sum(r["row"] == name for r in rows) for key in metrics} for name in ("parent", "candidate", "naive3")}
+    names = ("parent", "candidate", "naive3", "condition_full10")
+    def means(selected):
+        return {key: sum(r[key] for r in selected) / len(selected)
+            for key in (*metrics, "condition_mse", "condition_cosine")}
+    summary = {name: means([r for r in rows if r["row"] == name]) for name in names}
+    by_age = {str(age): {name: means([r for r in rows if r["row"] == name and r["age"] == age])
+        for name in names} for age in c["training_condition_ages"]}
     write_json(output / "offline_queries.json", rows)
     write_json(output / "offline_summary.json", {"verdict": "OFFLINE_COMPLETE_NO_SR_GATE",
-        "heldout_windows": len(indices), "queries_per_row": 2 * len(indices), "metrics": summary})
+        "heldout_windows": len(indices), "queries_per_row": 3 * len(indices), "metrics": summary,
+        "by_condition_age": by_age, "student_condition_rollout": "recursive ages 1,2,3 from the same original anchor"})
 
 
 def run(c, arm, *, smoke=False):
@@ -86,7 +102,7 @@ def run(c, arm, *, smoke=False):
     device, adapter, frozen, action, train, heldout = runtime
     updater, parent_payload = load_generation_checkpoint(c["generation_checkpoint"], device=device)
     updater.requires_grad_(True).train()
-    # Neutral code projection preserves the parent at initialization in all arms.
+    # All arms use the same parent weights and zero code-projection initialization.
     with torch.no_grad():
         updater.condition_code_projection.weight.zero_()
     initial_hash = hashlib.sha256()
@@ -107,13 +123,15 @@ def run(c, arm, *, smoke=False):
         optimizer.load_state_dict(saved["optimizer_state_dict"])
         scheduler.load_state_dict(saved["scheduler_state_dict"])
         start, elapsed = saved["optimizer_step"], saved["training_seconds"]
-    total = 2 if smoke else c["steps"]
+    total = 3 if smoke else c["steps"]
     training = {"identity": run_id, "arm": arm, "loss": "normalized hidden MSE only",
         "initial_updater_sha256": initial_hash.hexdigest(),
         "oracle": "predicted condition" if arm == "same_condition" else "full teacher condition at student x,t",
         "condition_code": "zero" if arm.endswith("no_code") else "existing observation delta encoder output",
         "full_transformer_condition": "predicted condition in EVERY arm",
-        "full_indices": [0, 4, 8], "integration_steps": 10, "query_ages": [1, 3],
+        "full_indices": [0, 4, 8], "integration_steps": 10, "query_ages": [1, 2, 3],
+        "condition_rollout": "recursive predictions, no teacher refresh within q0->q1->q2->q3",
+        "condition_training_k_c": 4, "recorded_observations": "original cached trajectories; not on-policy observations",
         "fresh_queries": "unchanged original Generation updater, zero code",
         "trainable": [n for n, p in updater.named_parameters() if p.requires_grad],
         "parameters": sum(p.numel() for p in updater.parameters()), "train": train.contract(),
@@ -143,18 +161,18 @@ def run(c, arm, *, smoke=False):
         try:
             for step, host in enumerate(progress, start=start + 1):
                 sequence = move_batch(host, device)
-                age = (1, 3)[(step - 1) % 2]
+                age = c["training_condition_ages"][(step - 1) % 3]
                 context, raw, noise, _ = query_inputs(adapter, action, sequence, age)
                 target = sequence["teacher_actions"][:, age - 1]
                 teacher = sequence["teacher_conditions"][:, age - 1]
-                if step == 1:
-                    write_json(output / "first_batch.json", {"task_id": host["task_id"].tolist(),
+                if step <= 3:
+                    write_json(output / f"first_batch_age{age}.json", {"task_id": host["task_id"].tolist(),
                         "episode_id": host["episode_id"], "anchor_query_index": host["anchor_query_index"].tolist(), "age": age})
                     with torch.no_grad():
                         actual = action.decode_action_from_condition(teacher, raw,
                             steps=10, initial_noise=noise, return_debug=True).action
                     diff = float((actual - target).abs().max())
-                    write_json(output / "teacher_cache_check.json", {"max_action_diff": diff})
+                    write_json(output / f"teacher_cache_check_age{age}.json", {"max_action_diff": diff})
                     if diff > 2e-4:
                         raise RuntimeError(f"Teacher/cache numerical contract mismatch: {diff}")
                 optimizer.zero_grad(set_to_none=True)
@@ -169,7 +187,7 @@ def run(c, arm, *, smoke=False):
                 optimizer.step()
                 scheduler.step()
                 if step == 1 or step % c["log_interval"] == 0 or step == total:
-                    metrics = {"step": step, "hidden_mse": float(result.hidden_normalized_mse),
+                    metrics = {"step": step, "condition_age": age, "hidden_mse": float(result.hidden_normalized_mse),
                         "velocity_l1": float(result.velocity_l1), "action_l1": float(result.final_action_l1),
                         "lr": optimizer.param_groups[0]["lr"], "grad_norm": float(grad),
                         "seconds": elapsed + time.monotonic() - started,

@@ -14,7 +14,7 @@ from tools.simvla.error_compensation_common import (
 )
 
 
-def make_policy(c, row, *, smoke=False):
+def make_policy(c, row, *, smoke=False, k_c=2):
     import torch
     from architectures.simvla.adapters.latentloop.native_v0_runtime import load_frozen_simvla, freeze_module
     from architectures.simvla.adapters.latentloop.native_v0_checkpoint import load_native_v0_checkpoint
@@ -45,8 +45,10 @@ def make_policy(c, row, *, smoke=False):
         install_exact_uint8_delta_path(adapter)
         use_normalized_float_delta_inputs(adapter)
         policy = SynchronizedConditionK_CPolicy(adapter=adapter, checkpoint_id=c["condition_checkpoint"],
-            k_c=2, row_name=row, **common)
-        if row.startswith("condition_naive"):
+            k_c=k_c, row_name=row, **common)
+        if row == "condition_full10":
+            pass
+        elif row.startswith("condition_naive"):
             policy.nfe = int(row.removeprefix("condition_naive"))
             policy._decode = MethodType(SynchronizedConditionNaiveNFEPolicy._decode, policy)
         else:
@@ -70,7 +72,7 @@ def make_policy(c, row, *, smoke=False):
             def decode(self, condition, proprio, *, policy_query_index):
                 noise, noise_seed = self._paired_initial_noise(condition, proprio, policy_query_index)
                 normalized = self.action_adapter.normalize_proprio(proprio)
-                updated = policy_query_index % 2 == 1 and candidate_loop is not None
+                updated = policy_query_index % k_c != 0 and candidate_loop is not None
                 loop = candidate_loop if updated else parent_loop
                 code = condition.new_zeros(condition.shape[0], parent.condition_code_dim)
                 if updated and row != "true_condition_no_code":
@@ -91,10 +93,10 @@ def make_policy(c, row, *, smoke=False):
     return policy
 
 
-def check_counts(policy, row, actual):
+def check_counts(policy, row, actual, k_c=2):
     q = int(policy.metrics.counters["num_policy_queries"])
-    nfe = int(row.removeprefix("condition_naive")) if row.startswith("condition_naive") else (10 if row == "baseline" else 3)
-    full = q if row == "baseline" else (q + 1) // 2
+    nfe = int(row.removeprefix("condition_naive")) if row.startswith("condition_naive") else (10 if row in ("baseline", "condition_full10") else 3)
+    full = q if row == "baseline" else (q + k_c - 1) // k_c
     cheap = 7 * q if row in ("parent", *ARMS) else 0
     expected = {"transformer": nfe * q, "generation": cheap, "condition": q - full}
     observed = {key: actual.get(key, 0) for key in expected}
@@ -105,7 +107,7 @@ def check_counts(policy, row, actual):
     return {"queries": q, "full_vlm": full, **observed}
 
 
-def run(c, row, *, smoke=False):
+def run(c, row, *, smoke=False, k_c=4):
     configure(c)
     import numpy as np
     import torch
@@ -115,13 +117,13 @@ def run(c, row, *, smoke=False):
     torch.set_num_threads(1)
     configure_strict_torch_determinism(c["evaluation_seed"])
     run_id = identity(c)
-    directory = Path(c["output"]) / ("eval_smoke" if smoke else "online") / row
+    directory = Path(c["output"]) / ("eval_smoke" if smoke else "online") / f"kc{k_c}_{row}"
     manifest = read_json(Path(c["output"]) / "episode_manifest.json")
     specs = manifest["episodes"][:1] if smoke else manifest["episodes"]
     done = []
     directory.mkdir(parents=True, exist_ok=True)
     with torch.inference_mode():
-        policy = make_policy(c, row, smoke=smoke)
+        policy = make_policy(c, row, smoke=smoke, k_c=k_c)
         calls = Counter()
         handles = []
         def add(module, name):
@@ -142,7 +144,7 @@ def run(c, row, *, smoke=False):
                 path = directory / "episodes" / f"task{task}_trial{trial}.json"
                 if path.exists():
                     saved = read_json(path)
-                    if saved["identity"] != run_id or saved["row"] != row:
+                    if saved["identity"] != run_id or saved["row"] != row or saved["k_c"] != k_c:
                         raise RuntimeError("Mixed episode provenance")
                     done.append(saved)
                     continue
@@ -165,7 +167,7 @@ def run(c, row, *, smoke=False):
                 frames, timing = [], []
                 success = False
                 started = last_progress = time.monotonic()
-                for index in range(11 if smoke else 900):
+                for index in range(26 if smoke else 900):
                     inputs = build_env_obs(obs)
                     if trial == 0 and task in (9, 4) and index % 2 == 0:
                         frames.append(video_frame_from_obs(obs))
@@ -182,8 +184,12 @@ def run(c, row, *, smoke=False):
                             "successes": sum(r["success"] for r in done)})
                         last_progress = time.monotonic()
                     if success: break
-                counts = check_counts(policy, row, calls)
-                result = {"identity": run_id, "row": row, "task_id": task, "trial_id": trial,
+                counts = check_counts(policy, row, calls, k_c)
+                ages = sorted({int(t["age"]) for t in policy.query_trace})
+                if smoke and ages != list(range(k_c)):
+                    raise RuntimeError(f"Smoke did not cover all Condition ages: {ages}")
+                result = {"identity": run_id, "row": row, "k_c": k_c, "task_id": task, "trial_id": trial,
+                    "condition_ages_seen": ages,
                     "success": bool(success), "episode_length": index + 1, "counters": counts,
                     "policy_ms_total": sum(timing), "wall_seconds": time.monotonic() - started,
                     "timing_scope": "eager policy.act, outer CUDA sync, invocation hooks; sd1 screening only"}
@@ -194,12 +200,13 @@ def run(c, row, *, smoke=False):
                         save_episode_video(frames, directory / f"task{task}_trial{trial}.mp4", fps=10)
                     except Exception as exc:
                         write_json(directory / f"task{task}_video_error.json", {"error": str(exc)})
-                print(f"{row}: {len(done)}/{len(specs)} success={sum(r['success'] for r in done)}/{len(done)} task={task} trial={trial}", flush=True)
+                print(f"kc{k_c}/{row}: {len(done)}/{len(specs)} success={sum(r['success'] for r in done)}/{len(done)} task={task} trial={trial}", flush=True)
         finally:
             for handle in handles: handle.remove()
             if env is not None: env.close()
     write_json(directory / "summary.json", {"verdict": "SMOKE_PASS" if smoke else "EVALUATION_COMPLETE",
-        "identity": run_id, "row": row, "episodes": len(done), "successes": sum(r["success"] for r in done),
+        "identity": run_id, "row": row, "k_c": k_c, "candidate_training_k_c": 4 if row in ARMS else None,
+        "episodes": len(done), "successes": sum(r["success"] for r in done),
         "success_rate": sum(r["success"] for r in done) / len(done),
         "policy_ms_per_action": sum(r["policy_ms_total"] for r in done) / sum(r["episode_length"] for r in done),
         "paper_latency": False, "gpu": torch.cuda.get_device_name(0), "compile": False,
@@ -211,5 +218,6 @@ if __name__ == "__main__":
     p.add_argument("--config", default=str(CONFIG))
     p.add_argument("--row", choices=ROWS, required=True)
     p.add_argument("--smoke", action="store_true")
+    p.add_argument("--k-c", type=int, choices=(3, 4), default=4)
     a = p.parse_args()
-    run(read_json(a.config), a.row, smoke=a.smoke)
+    run(read_json(a.config), a.row, smoke=a.smoke, k_c=a.k_c)

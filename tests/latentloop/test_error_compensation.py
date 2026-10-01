@@ -28,11 +28,14 @@ def test_short_horizon_schedule():
 
 
 def test_every_trained_arm_has_online_evaluation():
-    plan = jobs({"python": "python", "output": "/tmp/results"}, "/tmp/c.json", False)
+    plan = jobs({"python": "python", "output": "/tmp/results", "evaluation_condition_intervals": [4, 3]}, "/tmp/c.json", False)
     by_id = {j["id"]: j for j in plan}
     assert len(plan) == 11
     for arm in ARMS:
-        assert by_id["eval_" + arm]["deps"] == ["train_" + arm]
+        for k_c in (3, 4):
+            assert by_id[f"eval_kc{k_c}_{arm}"]["deps"] == ["train_" + arm]
+    assert plan[3]["id"] == "eval_kc4_condition_full10"
+    assert not plan[3]["deps"]
     assert all("--smoke" not in j["cmd"] for j in plan)
 
 

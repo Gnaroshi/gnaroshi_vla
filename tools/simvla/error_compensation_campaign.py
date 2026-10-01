@@ -63,6 +63,9 @@ def prepare(c):
             "execution_horizon": 5, "wait_steps": 10, "max_policy_actions": 900, "renderer": "egl",
             "reset": "explicit seed 7 at each episode; fixed task/trial state; paired noise per query",
             "timing": "sd1 eager exploration only; no rb2 paper timing claim",
+            "training_condition_ages": c["training_condition_ages"],
+            "evaluation_condition_intervals": c["evaluation_condition_intervals"],
+            "student_condition": "recursive predictions through ages 1,2,3; teacher-recorded observations",
             "training": "three matched 5k arms; fixed Condition/backbone/decoder; NO success or MSE stopping gate"}}
     contract["identity"] = digest(contract)
     dest = output / "contract.json"
@@ -84,11 +87,28 @@ def jobs(c, config, smoke):
             "architectures.simvla.adapters.latentloop.efficient_multirate.error_compensation_train",
             "--config", str(config), "--arm", arm] + (["--smoke"] if smoke else []),
             "summary": str(Path(c["output"]) / ("smoke" if smoke else "train") / arm / "summary.json")})
-    for row in ROWS:
-        result.append({"id": "eval_" + row, "deps": ["train_" + row] if row in ARMS else [],
-            "cmd": prefix + ["tools.simvla.error_compensation_eval", "--config", str(config), "--row", row] + (["--smoke"] if smoke else []),
-            "summary": str(Path(c["output"]) / ("eval_smoke" if smoke else "online") / row / "summary.json")})
+    for k_c in c["evaluation_condition_intervals"]:
+        for row in ROWS:
+            key = f"kc{k_c}_{row}"
+            result.append({"id": "eval_" + key, "deps": ["train_" + row] if row in ARMS else [],
+                "cmd": prefix + ["tools.simvla.error_compensation_eval", "--config", str(config),
+                    "--row", row, "--k-c", str(k_c)] + (["--smoke"] if smoke else []),
+                "summary": str(Path(c["output"]) / ("eval_smoke" if smoke else "online") / key / "summary.json")})
     return result
+
+
+def job_complete(job, run_identity, smoke, steps):
+    path = Path(job["summary"])
+    if not path.exists():
+        return False
+    report = read_json(path)
+    if report.get("identity") != run_identity:
+        raise RuntimeError(f"Incompatible result: {path}")
+    training = job["id"].startswith("train_")
+    verdict = "SMOKE_PASS" if smoke else ("TRAIN_AND_OFFLINE_COMPLETE" if training else "EVALUATION_COMPLETE")
+    key = "steps" if training else "episodes"
+    expected = (3 if smoke else steps) if training else (1 if smoke else 500)
+    return report.get("verdict") == verdict and report.get(key) == expected
 
 
 def idle(gpu):
@@ -99,11 +119,12 @@ def idle(gpu):
 
 def summarize(c):
     output = Path(c["output"])
-    reports = {r: read_json(output / "online" / r / "summary.json") for r in ROWS
+    keys = [f"kc{k}_{r}" for k in c["evaluation_condition_intervals"] for r in ROWS]
+    reports = {r: read_json(output / "online" / r / "summary.json") for r in keys
         if (output / "online" / r / "summary.json").exists()}
-    write_json(output / "comparison_summary.json", {"complete": len(reports) == len(ROWS),
-        "rows": reports, "unavailable": [r for r in ROWS if r not in reports],
-        "interpretation": "true_condition vs same_condition isolates oracle target; true_condition vs no_code tests shared code. No superiority assumed."})
+    write_json(output / "comparison_summary.json", {"complete": len(reports) == len(keys),
+        "rows": reports, "unavailable": [r for r in keys if r not in reports],
+        "interpretation": "Matched recursive Condition inputs: true_condition vs same_condition tests the oracle target; true_condition vs no_code tests shared observation features. condition_full10 removes Generation approximation. No superiority assumed."})
 
 
 def campaign(c, config, smoke):
@@ -113,7 +134,9 @@ def campaign(c, config, smoke):
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     prepare(c)
     plan = jobs(c, config, smoke)
-    active, completed, failed, retries = {}, set(), {}, {}
+    run_identity = read_json(output / "contract.json")["identity"]
+    completed = {j["id"] for j in plan if job_complete(j, run_identity, smoke, c["steps"])}
+    active, failed, retries = {}, {}, {}
     logfile = output / ("smoke_logs" if smoke else "logs")
     logfile.mkdir(exist_ok=True)
     def stop(_sig, _frame):
@@ -126,13 +149,13 @@ def campaign(c, config, smoke):
                 if process.poll() is None: continue
                 stream.close()
                 del active[gpu]
-                ok = process.returncode == 0 and Path(job["summary"]).exists()
+                ok = process.returncode == 0 and job_complete(job, run_identity, smoke, c["steps"])
                 if ok:
                     completed.add(job["id"])
                     print(f"DONE gpu={gpu} {job['id']}", flush=True)
                 else:
                     retries[job["id"]] = retries.get(job["id"], 0) + 1
-                    if retries[job["id"]] > 1: failed[job["id"]] = process.returncode
+                    if retries[job["id"]] > 1: failed[job["id"]] = process.returncode or "completion validation failed"
                     print(f"JOB_ERROR {job['id']} rc={process.returncode} retry={retries[job['id']]} log={logfile / (job['id'] + '.log')}", flush=True)
             for job in plan:
                 if job["id"] not in completed and any(d in failed for d in job["deps"]):
@@ -166,6 +189,9 @@ def campaign(c, config, smoke):
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
             stream.close()
+        write_json(output / ("smoke_status.json" if smoke else "status.json"),
+            {"active": {}, "completed": sorted(completed), "failed": failed,
+                "total_jobs": len(plan), "unfinished": sorted({j["id"] for j in plan} - completed - set(failed))})
     if not smoke: summarize(c)
     write_json(output / ("smoke_complete.json" if smoke else "campaign_complete.json"),
         {"verdict": "COMPLETE" if not failed else "INCOMPLETE", "completed": sorted(completed), "failed": failed})
