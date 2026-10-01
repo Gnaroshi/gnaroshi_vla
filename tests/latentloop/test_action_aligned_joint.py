@@ -8,7 +8,7 @@ from methods.latentloop.modules.action_aligned_joint import (
     ARMS, trainable_groups, query_schedule, action_loss, differentiable_rollout,
 )
 from methods.latentloop.modules.simvla_generation_loop import SimVLAGenerationHiddenUpdater, SimVLAGenerationLoop
-from tools.simvla.action_aligned_campaign import jobs
+from tools.simvla.action_aligned_campaign import jobs, process_matches
 from architectures.simvla.adapters.latentloop.efficient_multirate.recursive_condition_inputs import query_inputs
 
 
@@ -35,6 +35,20 @@ def test_queue_does_not_repeat_baseline_or_skip_any_candidate():
         assert len(j['deps'])==1
         assert '--k-c' in j['cmd']
         assert 'baseline' not in j['id']
+
+
+def test_waiter_does_not_confuse_reused_pids_or_zombies(tmp_path):
+    rec=dict(pid=123,start_ticks='4321')
+    assert not process_matches(rec, tmp_path)
+    p=tmp_path/'123'
+    p.mkdir()
+    fields=['S']+['0']*18+['4321']
+    (p/'stat').write_text('123 (waiting task) '+' '.join(fields))
+    assert process_matches(rec, tmp_path)
+    assert not process_matches(dict(pid=123,start_ticks='9999'), tmp_path)
+    fields[0]='Z'
+    (p/'stat').write_text('123 (waiting task) '+' '.join(fields))
+    assert not process_matches(rec,tmp_path)
 
 
 def test_loss_uses_only_executed_prefix_and_continuous_gripper():

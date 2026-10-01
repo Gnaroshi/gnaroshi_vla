@@ -23,6 +23,7 @@
   "heldout_windows": 100,
   "training_condition_ages": [1, 2, 3],
   "evaluation_condition_intervals": [4, 2],
+  "wait_for_processes": [{"pid": 3897206, "start_ticks": "1515073162", "reason": "Existing Seer GPU4-7 evaluation launcher; do not interrupt or overlap."}],
   "training_description": "Four matched 5K arms: Condition latent, Condition action, Generation action, joint action. Original backbone/transformer/decoder frozen. First-five normalized action L1 except latent control. Fresh query each fourth step. Single Generation module; code zero and mask None match parent. No scientific stopping gate.",
   "wandb_project": "gnaroshi-simvla-latentloop"
 }
