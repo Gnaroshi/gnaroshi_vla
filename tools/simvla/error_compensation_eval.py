@@ -107,7 +107,7 @@ def check_counts(policy, row, actual, k_c=2):
     return {"queries": q, "full_vlm": full, **observed}
 
 
-def run(c, row, *, smoke=False, k_c=4, policy_factory=None, counter_row=None):
+def run(c, row, *, smoke=False, k_c=4, policy_factory=None, counter_row=None, counter_checker=None):
     configure(c)
     import numpy as np
     import torch
@@ -129,7 +129,7 @@ def run(c, row, *, smoke=False, k_c=4, policy_factory=None, counter_row=None):
         def add(module, name):
             handles.append(module.register_forward_pre_hook(lambda _m, _i: calls.update([name])))
         add(policy.model.transformer.blocks[0], "transformer")
-        if hasattr(policy, "native_v0"):
+        if hasattr(policy, "native_v0") and policy.native_v0.condition_updater is not None:
             add(policy.native_v0.condition_updater, "condition")
         # Count the actual updater calls for both parent and candidate, including closure-owned modules.
         if hasattr(policy, "_experiment_loops"):
@@ -184,7 +184,7 @@ def run(c, row, *, smoke=False, k_c=4, policy_factory=None, counter_row=None):
                             "successes": sum(r["success"] for r in done)})
                         last_progress = time.monotonic()
                     if success: break
-                counts = check_counts(policy, counter_row or row, calls, k_c)
+                counts = (counter_checker or check_counts)(policy, counter_row or row, calls, k_c)
                 ages = sorted({int(t["age"]) for t in policy.query_trace})
                 if smoke and ages != list(range(k_c)):
                     raise RuntimeError(f"Smoke did not cover all Condition ages: {ages}")
@@ -193,6 +193,8 @@ def run(c, row, *, smoke=False, k_c=4, policy_factory=None, counter_row=None):
                     "success": bool(success), "episode_length": index + 1, "counters": counts,
                     "policy_ms_total": sum(timing), "wall_seconds": time.monotonic() - started,
                     "timing_scope": "eager policy.act, outer CUDA sync, invocation hooks; sd1 screening only"}
+                if hasattr(policy, 'extra_episode_metrics'):
+                    result.update(policy.extra_episode_metrics())
                 write_json(path, result)
                 done.append(result)
                 if frames:
@@ -204,13 +206,25 @@ def run(c, row, *, smoke=False, k_c=4, policy_factory=None, counter_row=None):
         finally:
             for handle in handles: handle.remove()
             if env is not None: env.close()
-    write_json(directory / "summary.json", {"verdict": "SMOKE_PASS" if smoke else "EVALUATION_COMPLETE",
+    summary = {"verdict": "SMOKE_PASS" if smoke else "EVALUATION_COMPLETE",
         "identity": run_id, "row": row, "k_c": k_c, "candidate_training_k_c": 4 if row in ARMS or policy_factory else None,
         "episodes": len(done), "successes": sum(r["success"] for r in done),
         "success_rate": sum(r["success"] for r in done) / len(done),
         "policy_ms_per_action": sum(r["policy_ms_total"] for r in done) / sum(r["episode_length"] for r in done),
         "paper_latency": False, "gpu": torch.cuda.get_device_name(0), "compile": False,
-        "per_task_successes": {str(t): sum(r["success"] for r in done if r["task_id"] == t) for t in range(10)}})
+        "per_task_successes": {str(t): sum(r["success"] for r in done if r["task_id"] == t) for t in range(10)}}
+    if any('component_timing' in r for r in done):
+        keys = set().union(*(r.get('component_timing', {}) for r in done))
+        total_actions = sum(r['episode_length'] for r in done)
+        summary['component_timing'] = {}
+        for name in sorted(keys):
+            entries = [r.get('component_timing', {}).get(name, {}) for r in done]
+            total = sum(e.get('cuda_ms_total', 0.0) for e in entries)
+            calls = sum(e.get('calls', 0) for e in entries)
+            summary['component_timing'][name] = dict(calls=calls, cuda_ms_total=total,
+                cuda_ms_per_call=total/calls if calls else None, cuda_ms_per_action=total/total_actions)
+        summary['component_timing_scope'] = 'CUDA-event intervals; nested observation/residual inside condition_query. Do not sum nested timers. Sensor/render outside policy timer.'
+    write_json(directory / "summary.json", summary)
 
 
 if __name__ == "__main__":

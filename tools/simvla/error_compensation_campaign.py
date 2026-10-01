@@ -65,7 +65,7 @@ def prepare(c):
             "timing": "sd1 eager exploration only; no rb2 paper timing claim",
             "training_condition_ages": c["training_condition_ages"],
             "evaluation_condition_intervals": c["evaluation_condition_intervals"],
-            "student_condition": "recursive predictions through ages 1,2,3; teacher-recorded observations",
+            "student_condition": c.get("student_condition_description", "recursive predictions through ages 1,2,3; teacher-recorded observations"),
             "training": c.get("training_description", "three matched 5k arms; fixed Condition/backbone/decoder; NO success or MSE stopping gate")}}
     contract["identity"] = digest(contract)
     dest = output / "contract.json"
