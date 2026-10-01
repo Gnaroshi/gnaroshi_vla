@@ -66,7 +66,7 @@ def prepare(c):
             "training_condition_ages": c["training_condition_ages"],
             "evaluation_condition_intervals": c["evaluation_condition_intervals"],
             "student_condition": "recursive predictions through ages 1,2,3; teacher-recorded observations",
-            "training": "three matched 5k arms; fixed Condition/backbone/decoder; NO success or MSE stopping gate"}}
+            "training": c.get("training_description", "three matched 5k arms; fixed Condition/backbone/decoder; NO success or MSE stopping gate")}}
     contract["identity"] = digest(contract)
     dest = output / "contract.json"
     if dest.exists() and read_json(dest) != contract:
@@ -97,7 +97,7 @@ def jobs(c, config, smoke):
     return result
 
 
-def job_complete(job, run_identity, smoke, steps):
+def job_complete(job, run_identity, smoke, steps, smoke_steps=3):
     path = Path(job["summary"])
     if not path.exists():
         return False
@@ -107,7 +107,7 @@ def job_complete(job, run_identity, smoke, steps):
     training = job["id"].startswith("train_")
     verdict = "SMOKE_PASS" if smoke else ("TRAIN_AND_OFFLINE_COMPLETE" if training else "EVALUATION_COMPLETE")
     key = "steps" if training else "episodes"
-    expected = (3 if smoke else steps) if training else (1 if smoke else 500)
+    expected = (smoke_steps if smoke else steps) if training else (1 if smoke else 500)
     return report.get("verdict") == verdict and report.get(key) == expected
 
 
@@ -127,15 +127,15 @@ def summarize(c):
         "interpretation": "Matched recursive Condition inputs: true_condition vs same_condition tests the oracle target; true_condition vs no_code tests shared observation features. condition_full10 removes Generation approximation. No superiority assumed."})
 
 
-def campaign(c, config, smoke):
+def campaign(c, config, smoke, *, job_builder=jobs, summarizer=summarize):
     output = Path(c["output"])
     output.mkdir(parents=True, exist_ok=True)
     lock = (output / "campaign.lock").open("w")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     prepare(c)
-    plan = jobs(c, config, smoke)
+    plan = job_builder(c, config, smoke)
     run_identity = read_json(output / "contract.json")["identity"]
-    completed = {j["id"] for j in plan if job_complete(j, run_identity, smoke, c["steps"])}
+    completed = {j["id"] for j in plan if job_complete(j, run_identity, smoke, c["steps"], c.get("smoke_steps", 3))}
     active, failed, retries = {}, {}, {}
     logfile = output / ("smoke_logs" if smoke else "logs")
     logfile.mkdir(exist_ok=True)
@@ -149,7 +149,7 @@ def campaign(c, config, smoke):
                 if process.poll() is None: continue
                 stream.close()
                 del active[gpu]
-                ok = process.returncode == 0 and job_complete(job, run_identity, smoke, c["steps"])
+                ok = process.returncode == 0 and job_complete(job, run_identity, smoke, c["steps"], c.get("smoke_steps", 3))
                 if ok:
                     completed.add(job["id"])
                     print(f"DONE gpu={gpu} {job['id']}", flush=True)
@@ -177,7 +177,7 @@ def campaign(c, config, smoke):
                     "completed": sorted(completed), "failed": failed, "total_jobs": len(plan)}
                 write_json(output / ("smoke_status.json" if smoke else "status.json"), status)
                 print(f"STATUS {len(completed)}/{len(plan)} done; active={status['active']}; failures={failed}", flush=True)
-                if not smoke: summarize(c)
+                if not smoke: summarizer(c)
                 last_status = time.monotonic()
             time.sleep(5)
     finally:
@@ -192,7 +192,7 @@ def campaign(c, config, smoke):
         write_json(output / ("smoke_status.json" if smoke else "status.json"),
             {"active": {}, "completed": sorted(completed), "failed": failed,
                 "total_jobs": len(plan), "unfinished": sorted({j["id"] for j in plan} - completed - set(failed))})
-    if not smoke: summarize(c)
+    if not smoke: summarizer(c)
     write_json(output / ("smoke_complete.json" if smoke else "campaign_complete.json"),
         {"verdict": "COMPLETE" if not failed else "INCOMPLETE", "completed": sorted(completed), "failed": failed})
     return 1 if failed else 0

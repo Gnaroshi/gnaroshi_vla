@@ -107,7 +107,7 @@ def check_counts(policy, row, actual, k_c=2):
     return {"queries": q, "full_vlm": full, **observed}
 
 
-def run(c, row, *, smoke=False, k_c=4):
+def run(c, row, *, smoke=False, k_c=4, policy_factory=None, counter_row=None):
     configure(c)
     import numpy as np
     import torch
@@ -123,7 +123,7 @@ def run(c, row, *, smoke=False, k_c=4):
     done = []
     directory.mkdir(parents=True, exist_ok=True)
     with torch.inference_mode():
-        policy = make_policy(c, row, smoke=smoke, k_c=k_c)
+        policy = (policy_factory or make_policy)(c, row, smoke=smoke, k_c=k_c)
         calls = Counter()
         handles = []
         def add(module, name):
@@ -132,7 +132,7 @@ def run(c, row, *, smoke=False, k_c=4):
         if hasattr(policy, "native_v0"):
             add(policy.native_v0.condition_updater, "condition")
         # Count the actual updater calls for both parent and candidate, including closure-owned modules.
-        if row in ("parent", *ARMS):
+        if hasattr(policy, "_experiment_loops"):
             for loop in policy._experiment_loops:
                 add(loop.updater, "generation")
         suite = benchmark.get_benchmark_dict()["libero_10"]()
@@ -184,7 +184,7 @@ def run(c, row, *, smoke=False, k_c=4):
                             "successes": sum(r["success"] for r in done)})
                         last_progress = time.monotonic()
                     if success: break
-                counts = check_counts(policy, row, calls, k_c)
+                counts = check_counts(policy, counter_row or row, calls, k_c)
                 ages = sorted({int(t["age"]) for t in policy.query_trace})
                 if smoke and ages != list(range(k_c)):
                     raise RuntimeError(f"Smoke did not cover all Condition ages: {ages}")
@@ -205,7 +205,7 @@ def run(c, row, *, smoke=False, k_c=4):
             for handle in handles: handle.remove()
             if env is not None: env.close()
     write_json(directory / "summary.json", {"verdict": "SMOKE_PASS" if smoke else "EVALUATION_COMPLETE",
-        "identity": run_id, "row": row, "k_c": k_c, "candidate_training_k_c": 4 if row in ARMS else None,
+        "identity": run_id, "row": row, "k_c": k_c, "candidate_training_k_c": 4 if row in ARMS or policy_factory else None,
         "episodes": len(done), "successes": sum(r["success"] for r in done),
         "success_rate": sum(r["success"] for r in done) / len(done),
         "policy_ms_per_action": sum(r["policy_ms_total"] for r in done) / sum(r["episode_length"] for r in done),

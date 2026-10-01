@@ -15,8 +15,12 @@ class RecursiveConditionContext:
     global_code: Tensor
 
 
-@torch.no_grad()
-def query_inputs(adapter, action, sequence, age):
+def query_inputs(adapter, action, sequence, age, *, track_grad=False):
+    with torch.set_grad_enabled(track_grad):
+        return _query_inputs(adapter, action, sequence, age)
+
+
+def _query_inputs(adapter, action, sequence, age):
     if age not in (1, 2, 3):
         raise ValueError("Recursive Condition age must be 1, 2 or 3")
     condition = sequence["anchor_condition"]
