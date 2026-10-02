@@ -69,6 +69,7 @@ def sources(c):
     extra = [ROOT / "tools/simvla/compiled_campaign.py", ROOT / "tools/simvla/compiled_policy.py",
         ROOT / "tools/simvla/compiled_profile.py",
         CONFIG, DEFAULT_CONFIG, ROOT / "architectures/simvla/wrappers/run_compiled_paper_rb2.sh"]
+    extra.extend(ROOT / p for p in c.get("extra_source_files", []))
     for directory in (ROOT / "architectures/simvla/wrappers/dcld_eval", ROOT / "architectures/simvla/adapters", ROOT / "methods"):
         extra.extend(directory.rglob("*.py"))
     for p in extra:
@@ -132,20 +133,21 @@ def check_compiler(compiler, row):
         raise RuntimeError("Compile bypass: " + str(missing))
 
 
-def warmup(policy, obs, prompt, compiler, row):
+def warmup(policy, obs, prompt, compiler, row, *, actions=40,
+           policy_checker=check_policy, compiler_checker=check_compiler, reset_checker=check_reset):
     import torch
     from architectures.simvla.wrappers.dcld_eval.rollout_runner import build_env_obs
     images = build_env_obs(obs)
     started = time.perf_counter()
     for cycle in range(2):
-        check_reset(policy)
-        for _ in range(40):
+        reset_checker(policy)
+        for _ in range(actions):
             policy.act(*images, prompt)
         torch.cuda.synchronize()
         print(f"WARMUP row={row} cycle={cycle+1}/2 graphs={compiler.graph_count()}", flush=True)
-    check_compiler(compiler, row)
-    check_policy(policy, row)
-    check_reset(policy)
+    compiler_checker(compiler, row)
+    policy_checker(policy, row)
+    reset_checker(policy)
     return time.perf_counter() - started
 
 
@@ -174,7 +176,9 @@ def summarize_cell(directory, identity, expected):
     return report
 
 
-def worker(c, output, suite_name, seed, row, *, smoke=False):
+def worker(c, output, suite_name, seed, row, *, smoke=False,
+           replay_factory=Replay, policy_factory=attach_policy,
+           policy_checker=check_policy, compiler_checker=check_compiler, reset_checker=check_reset):
     import numpy as np
     import torch
     from libero.libero import benchmark
@@ -191,7 +195,7 @@ def worker(c, output, suite_name, seed, row, *, smoke=False):
     identity = digest({"campaign": digest(contract), "suite": suite_name, "seed": seed, "row": row, "smoke": smoke})
     directory = output / ("smoke" if smoke else "rows") / suite_name / seed / row
     specs = sorted(m["episodes"], key=lambda x: (-x["task_id"], x["trial_id"]))
-    if smoke: specs = specs[:2]
+    if smoke: specs = specs[:c.get("smoke_episodes", 2)]
     expected = [(x["task_id"], x["trial_id"]) for x in specs]
     if summarize_cell(directory, identity, expected):
         print(f"RECOVERED_COMPLETE row={row} episodes={len(specs)}", flush=True)
@@ -211,8 +215,8 @@ def worker(c, output, suite_name, seed, row, *, smoke=False):
     for name in ("torch._dynamo", "torch._inductor"): logging.getLogger(name).addHandler(capture)
     compiler = Compiler(True)
     with torch.inference_mode():
-        replay = Replay(c, base_row(row), compiler, sample)
-        policy = attach_policy(replay, c, row, m)
+        replay = replay_factory(c, base_row(row), compiler, sample)
+        policy = policy_factory(replay, c, row, m)
         suite = benchmark.get_benchmark_dict()[suite_name]()
         completed = successes = saved_videos = 0
         cell_start = time.monotonic()
@@ -229,9 +233,11 @@ def worker(c, output, suite_name, seed, row, *, smoke=False):
                     for _ in range(10): obs, _, _, _ = env.step([0.0] * 6 + [-1.0])
                     if position == 0:
                         write_json(directory / "progress.json", {"phase": "warmup", "task": task_id, "completed": completed, "total": len(specs)})
-                        seconds = warmup(policy, obs, prompt, compiler, row)
+                        seconds = warmup(policy, obs, prompt, compiler, row,
+                            actions=c.get("warmup_actions", 40), policy_checker=policy_checker,
+                            compiler_checker=compiler_checker, reset_checker=reset_checker)
                         write_json(directory / f"warmup_task{task_id}.json", {"seconds_excluded": seconds, "compiler": compiler.records})
-                    check_reset(policy)
+                    reset_checker(policy)
                     times, frames, actions = [], [], []
                     graphs_before = compiler.graph_count()
                     success = False
@@ -258,8 +264,8 @@ def worker(c, output, suite_name, seed, row, *, smoke=False):
                         if done:
                             success = True
                             break
-                    check_policy(policy, row)
-                    check_compiler(compiler, row)
+                    policy_checker(policy, row)
+                    compiler_checker(compiler, row)
                     fallback = any(any(t in msg for t in ("hit config.recompile_limit", "hit config.cache_size_limit", "WON'T CONVERT")) for msg in capture.messages)
                     timing_valid = compiler.graph_count() == graphs_before and not fallback
                     result = {"identity": identity, "suite": suite_name, "seed": seed, "row": row,
@@ -322,7 +328,9 @@ def run_child(c, output, command, suite, seed, row):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"START {command} {suite}/{seed}/{row} log={log_path}", flush=True)
     with log_path.open("a") as log:
-        process = subprocess.Popen([sys.executable, "-u", str(Path(__file__).resolve()), command,
+        entry = (["-m", c["campaign_module"]] if c.get("campaign_module")
+                 else [str(Path(__file__).resolve())])
+        process = subprocess.Popen([sys.executable, "-u", *entry, command,
             "--suite", suite, "--seed", seed, "--row", row, "--output", str(output)], stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True, env={**os.environ, "PYTHONHASHSEED": str(SEEDS[seed][0])})
         started = time.monotonic()
