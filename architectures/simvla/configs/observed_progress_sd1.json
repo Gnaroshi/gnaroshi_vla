@@ -1,0 +1,19 @@
+{
+  "output": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/trend_condition/observed_progress_k8_seed01_v1",
+  "steps": 6000,
+  "decomposition_steps": 1500,
+  "smoke_steps": 14,
+  "smoke_policy_actions": 41,
+  "save_interval": 1500,
+  "validation_at_steps": [1500, 3000],
+  "training_k_c": 8,
+  "training_condition_ages": [1,2,3,4,5,6,7],
+  "evaluation_condition_intervals": [8,4],
+  "wait_for_processes": [],
+  "frozen_trend_checkpoint": {
+    "path": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/artifacts/simvla/observed_progress/trend_k8_step3000.pt",
+    "sha256": "b9687266e047c4cfd21d0b7b9bf5c90dc520b4252576d7e2514c1096c0308e14"
+  },
+  "student_condition_description": "Frozen K8 b; matched residual control vs observation-dependent scalar progress vs orthogonal residual vs spatial features. No previous predicted condition input.",
+  "training_description": "Four matched 6K runs: 1500 condition MSE +4500 executed first-five action L1; same K8 windows, seed, schedule and frozen Generation; interim heldout curves. Full K8 then K4 evaluation, 500 each; no SR stopping gate."
+}

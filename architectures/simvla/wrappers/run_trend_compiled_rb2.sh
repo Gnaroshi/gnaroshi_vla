@@ -22,7 +22,13 @@ export LIBERO_CONFIG_PATH="${STORAGE}/results/simvla/reproduction/official_ckpt_
 export TORCHINDUCTOR_CACHE_DIR="${STORAGE}/results/simvla/compile_benchmark/paired_long_inputs_v1/compiler_cache"
 cd "${ROOT}" || exit 0
 if [ "$#" -eq 0 ]; then set -- all; fi
-"${PY}" -u -m tools.simvla.trend_compiled_rb2 "$@"
+MODULE=tools.simvla.trend_compiled_rb2
+if [ "${1:-}" = "--controls" ]; then
+  MODULE=tools.simvla.trend_controls_rb2
+  shift
+  if [ "$#" -eq 0 ]; then set -- all; fi
+fi
+"${PY}" -u -m "${MODULE}" "$@"
 rc=$?
 printf '\nTREND_EVAL_EXIT=%s (tmux pane remains open; inspect status.json)\n' "$rc"
 exit 0

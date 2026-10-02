@@ -1,0 +1,8 @@
+{
+  "output": "/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/trend_condition/k4_controls_compiled_seed01_v1",
+  "trend_reference_root": "/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/trend_condition/long_compiled_seed01_v1",
+  "long_rows": ["trend_k4_naive3", "hold_k4_generation3"],
+  "campaign_module": "tools.simvla.trend_controls_rb2",
+  "extra_source_files": ["tools/simvla/trend_controls_rb2.py", "tools/simvla/trend_compiled_rb2.py", "architectures/simvla/configs/trend_controls_rb2.json", "architectures/simvla/configs/trend_compiled_rb2.json", "architectures/simvla/wrappers/run_trend_compiled_rb2.sh"],
+  "interpretation": "Two missing K4 controls, same b, manifest and compiled path; no repeated baseline."
+}

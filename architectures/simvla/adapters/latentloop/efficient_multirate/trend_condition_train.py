@@ -23,6 +23,9 @@ from .generation_checkpoint import load_generation_checkpoint
 from .generation_train import RankDisjointStepSampler
 from .exact_teacher_cache import collate_exact_teacher_sequences
 from .condition_mechanism import action_metrics, _balanced_indices
+from methods.latentloop.modules.observed_progress import ARMS as PROGRESS_ARMS, build_model, projection_coefficient
+
+ARMS = (*ARMS, *PROGRESS_ARMS)
 
 
 @torch.no_grad()
@@ -40,7 +43,11 @@ def offline(c, model, runtime, loop, step_model, output):
                 action.normalize_proprio(s['proprio_sequence'][:, age]), s['explicit_noises'][:, age-1])
             target_b, target_r = teacher_decomposition(ctx.anchor, s['teacher_conditions'], age)
             base = ctx.anchor + age * ctx.trend
-            if model.arm == 'frozen_trend_residual':
+            if model.arm in PROGRESS_ARMS:
+                target_alpha = projection_coefficient(s['teacher_conditions'][:, age-1]-ctx.anchor,
+                    ctx.trend, ctx.anchor, ctx.valid)
+                target_r = s['teacher_conditions'][:, age-1]-ctx.anchor-target_alpha*ctx.trend
+            elif model.arm == 'frozen_trend_residual':
                 target_r = s['teacher_conditions'][:, age-1] - base
             record = dict(index=index, age=age, task_id=int(s['task_id'][0]),
                 condition_mse=float(scaled_mse(condition, s['teacher_conditions'][:, age-1], ctx.anchor, ctx.valid)),
@@ -52,6 +59,9 @@ def offline(c, model, runtime, loop, step_model, output):
                 full_displacement_energy=float((s['teacher_conditions'][:,age-1]-ctx.anchor)[ctx.valid].square().mean()),
                 **action_metrics(action.action_space.postprocess(predicted), s['teacher_actions'][:,age-1]))
             rows.append(record)
+            if model.arm in PROGRESS_ARMS:
+                record.update(progress=float(model.last_alpha.flatten()[0]),
+                    oracle_progress=float(target_alpha.flatten()[0]))
     keys = [k for k in rows[0] if k not in ('index', 'age', 'task_id')]
     mean = lambda rs: {k: sum(r[k] for r in rs)/len(rs) for k in keys}
     write_json(output/'offline_queries.json', rows)
@@ -68,9 +78,9 @@ def run(c, arm, smoke=False):
     device, parent, frozen, action, train, heldout = runtime
     torch.manual_seed(c['seed'])
     max_age = c.get('training_k_c', 4) - 1
-    model = TrendCondition(parent, arm, max_age=max_age).to(device).requires_grad_(True).eval()
+    model = build_model(parent, arm, max_age=max_age).to(device).requires_grad_(True).eval()
     initial_trend = None
-    if arm == 'frozen_trend_residual':
+    if arm == 'frozen_trend_residual' or arm in PROGRESS_ARMS:
         source = c['frozen_trend_checkpoint']
         if sha(source['path']) != source['sha256']:
             raise RuntimeError('Frozen trend checkpoint checksum mismatch')
@@ -105,6 +115,12 @@ def run(c, arm, smoke=False):
         residual_target='teacher_Cj - (C0 + j*frozen_b)' if initial_trend else None,
         train=train.contract(), heldout=heldout.contract(),
         forecast='all three residuals batched at refresh without later observations' if arm=='trend_forecast' else None)
+    if arm in PROGRESS_ARMS:
+        contract.update(inference='C0 + alpha(current observations)*frozen_b + E_perpendicular',
+            interpretation='Progress and residual are separated in the same weighted metric as condition MSE; no SR guarantee',
+            loss_stage1='anchor-variance-scaled condition MSE; equivalent orthogonal progress/residual fitting',
+            loss_stage2='normalized executed first-five action L1; observation, progress and optional residual train',
+            residual_target='teacher_Cj-C0-oracle_alpha*b; oracle is used for offline analysis only')
     write_json(output/'training_contract.json', contract)
     latest = output/'latest.pt'
     saved = torch.load(latest, map_location=device, weights_only=False) if latest.exists() and not smoke else None
@@ -164,7 +180,8 @@ def run(c, arm, smoke=False):
                     if diff>2e-4: raise RuntimeError(f'Teacher/cache mismatch {diff}')
                 optimizer.zero_grad(set_to_none=True)
                 if stage=='decomposition':
-                    loss=decomposition_loss(model,s,age,condition,trend,residual)
+                    loss=(scaled_mse(condition,s['teacher_conditions'][:,age-1],s['anchor_condition'],s['valid_mask'].bool())
+                        if arm in PROGRESS_ARMS else decomposition_loss(model,s,age,condition,trend,residual))
                 else:
                     predicted=differentiable_rollout(loop,step_model,condition,
                         action.normalize_proprio(s['proprio_sequence'][:,age]),s['explicit_noises'][:,age-1])
@@ -194,6 +211,8 @@ def run(c, arm, smoke=False):
                         model=model.state_dict(),optimizer=optimizer.state_dict(),scheduler=scheduler.state_dict(),
                         step=step,stage=stage,seconds=elapsed_now,contract=contract),latest)
                     print(f'SAVED {arm} {step}/{total}',flush=True)
+                if not smoke and step in c.get('validation_at_steps', []):
+                    offline(c,model,runtime,loop,step_model,output/'validation'/f'step_{step}')
         finally:
             if tracker:
                 try: tracker.finish()

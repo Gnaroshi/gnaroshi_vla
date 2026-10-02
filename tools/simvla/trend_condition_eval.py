@@ -8,6 +8,7 @@ from types import MethodType
 import torch
 
 from methods.latentloop.modules.trend_condition import ARMS, TrendCondition
+from methods.latentloop.modules.observed_progress import build_model
 from tools.simvla.error_compensation_common import identity, read_json
 from tools.simvla.error_compensation_eval import make_policy as parent_policy, run
 
@@ -36,9 +37,9 @@ def expected_counts(arm, queries, k_c):
     full = (queries+k_c-1)//k_c
     light = queries-full
     return dict(transformer=3*queries, generation=7*queries,
-        condition=light if arm in ('direct_anchor','trend_residual') else full if arm=='trend_forecast' else 0,
+        condition=light if arm in ('direct_anchor','trend_residual','frozen_trend_residual','progress_residual','progress_spatial') else full if arm=='trend_forecast' else 0,
         trend=0 if arm=='direct_anchor' else full,
-        observation=light if arm in ('direct_anchor','trend_residual') else 0,
+        observation=light if arm in ('direct_anchor','trend_residual','frozen_trend_residual','progress_only','progress_residual','progress_spatial') else 0,
         full_vlm=full, queries=queries, lightweight_conditions=light)
 
 
@@ -58,13 +59,13 @@ def make_policy(c, row, *, smoke=False, k_c=4, checkpoint_loader=None, generatio
     if generation_mode not in ('learned','naive3'):
         raise ValueError(generation_mode)
     policy=parent_policy(c,'parent' if generation_mode=='learned' else 'condition_naive3',k_c=k_c)
-    model=TrendCondition(policy.native_v0,row).to('cuda').requires_grad_(False).eval()
     payload=(checkpoint_loader(c,row) if checkpoint_loader else
         torch.load(Path(c['output'])/('smoke' if smoke else 'train')/row/'latest.pt',
         map_location='cuda',weights_only=False))
     if checkpoint_loader is None and (payload['format']!='simvla_trend_condition_v1' or payload['identity']!=identity(c)
             or payload['arm']!=row or payload['step']!=(c['smoke_steps'] if smoke else c['steps'])):
         raise RuntimeError('Incompatible or incomplete trend checkpoint')
+    model=build_model(policy.native_v0,row,max_age=payload['contract']['k_c']-1).to('cuda').requires_grad_(False).eval()
     model.load_state_dict(payload['model'],strict=True)
     policy.native_v0=model
     policy.row_name=row
@@ -73,6 +74,10 @@ def make_policy(c, row, *, smoke=False, k_c=4, checkpoint_loader=None, generatio
         model.trend_head.forward=timers.wrap(model.trend_head.forward,'trend_head')
     if model.delta_encoder is not None:
         model.delta_encoder.forward=timers.wrap(model.delta_encoder.forward,'observation_encoder')
+    if row == 'progress_spatial':
+        model.spatial_encode=timers.wrap(model.spatial_encode,'observation_encoder_spatial')
+    if hasattr(model,'progress_head'):
+        model.progress_head.forward=timers.wrap(model.progress_head.forward,'progress_head')
     if model.condition_updater is not None:
         model.condition_updater.forward=timers.wrap(model.condition_updater.forward,'residual_head')
     policy.condition_adapter.encode_condition=timers.wrap(policy.condition_adapter.encode_condition,'backbone')

@@ -228,6 +228,7 @@ class TokenSharedConditionUpdater(nn.Module):
         valid_mask: Tensor,
         group_ids: Tensor,
         age: Tensor | int,
+        token_feature: Tensor | None = None,
     ) -> NativeV0UpdateOutput:
         if previous_condition.ndim != 3 or previous_condition.shape[-1] != self.condition_dim:
             raise ValueError(
@@ -263,6 +264,10 @@ class TokenSharedConditionUpdater(nn.Module):
         hidden = hidden + self.token_embedding(token_ids).unsqueeze(0)
         hidden = hidden + self.group_embedding(group_ids)
         hidden = hidden + self.age_embedding(age_tensor).unsqueeze(1)
+        if token_feature is not None:
+            if token_feature.shape != hidden.shape:
+                raise ValueError('Token observation features must match the low-rank hidden shape')
+            hidden = hidden + token_feature
         hidden = F.gelu(hidden)
         residual = self.up(hidden)
         gate = torch.sigmoid(self.gate_head(hidden))

@@ -104,6 +104,8 @@ def job_complete(job, run_identity, smoke, steps, smoke_steps=3):
     report = read_json(path)
     if report.get("identity") != run_identity:
         raise RuntimeError(f"Incompatible result: {path}")
+    if job.get('expected_verdict'):
+        return report.get('verdict') == job['expected_verdict']
     training = job["id"].startswith("train_")
     verdict = "SMOKE_PASS" if smoke else ("TRAIN_AND_OFFLINE_COMPLETE" if training else "EVALUATION_COMPLETE")
     key = "steps" if training else "episodes"
