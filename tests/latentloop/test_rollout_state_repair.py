@@ -1,6 +1,8 @@
 import json
 import random
 from pathlib import Path
+import sys
+from types import ModuleType,SimpleNamespace
 
 import numpy as np
 import pytest
@@ -42,6 +44,74 @@ def test_reservoir_is_bounded_and_reaches_late_queries():
     assert min(slots)>=0 and max(slots)<4
 
 
+@pytest.mark.parametrize('driver',['original','student'])
+@pytest.mark.parametrize('sampled',[False,True])
+def test_collection_driver_controls_execution_not_teacher_sampling(tmp_path,monkeypatch,driver,sampled):
+    from tools.simvla import rollout_state_repair as repair
+    from tools.simvla.error_compensation_common import sha
+    condition=torch.ones(1,2,3)
+    batch=dict(input_ids=None,image_input=None,image_mask=None,
+        raw_rgb=torch.zeros(1,2,4,4,3),proprio=torch.zeros(1,8))
+    ctx=SimpleNamespace(anchor=condition,images=batch['raw_rgb'],proprio=batch['proprio'],
+        valid=torch.ones(1,2,dtype=torch.bool),groups=torch.zeros(1,2,dtype=torch.long))
+    class Policy:
+        def __init__(self):
+            self.condition_adapter=SimpleNamespace(encode_condition=lambda **kw:condition*2)
+            self.action_adapter=SimpleNamespace(
+                decode_action_from_condition=lambda cond,prop,**kw:torch.full((1,10,7),float(cond.mean())*10),
+                action_space=SimpleNamespace(normalize_action=lambda a:a))
+            self.reset()
+        def reset(self): self.steps=0; self._trend_context=ctx
+        def _paired_initial_noise(self,condition,proprio,index): return torch.zeros(1,10,7),index
+        def _decode(self,condition,proprio,**kw): return torch.ones(1,10,7)*3,0
+        def _full_refresh(self,batch,**kw): return condition*2,torch.ones(1,10,7)*3,0
+        def _v0_update(self,batch,**kw): return condition,torch.ones(1,10,7)*3,0
+        def act(self,*args):
+            q=self.steps//5
+            if self.steps%5==0:
+                if q%8==0: result=self._full_refresh(batch,policy_query_index=q)
+                else: result=self._v0_update(batch,age=q%8,policy_query_index=q)
+                self.current_action=result[1][0,0].numpy()
+            self.steps+=1
+            return SimpleNamespace(action=self.current_action)
+    class Env:
+        def __init__(self): self.actions=[]
+        def seed(self,value): pass
+        def reset(self): pass
+        def set_init_state(self,value): return None
+        def step(self,action): self.actions.append(action); return None,0,False,{}
+        def close(self): pass
+    env=Env(); pol=Policy()
+    fake_libero=ModuleType('libero.libero')
+    fake_libero.benchmark=SimpleNamespace(get_benchmark_dict=lambda:{'libero_10':lambda:SimpleNamespace(get_task=lambda i:i)})
+    monkeypatch.setitem(sys.modules,'libero.libero',fake_libero)
+    fake_runner=ModuleType('architectures.simvla.wrappers.dcld_eval.rollout_runner')
+    fake_runner.build_env_obs=lambda obs:()
+    fake_runner.get_libero_env=lambda task,*args:(env if task==9 else Env(),'task')
+    monkeypatch.setitem(sys.modules,fake_runner.__name__,fake_runner)
+    monkeypatch.setattr(repair,'configure',lambda c:None)
+    monkeypatch.setattr(repair,'configure_strict_torch_determinism',lambda seed:None)
+    monkeypatch.setattr(repair,'identity',lambda c:'test')
+    monkeypatch.setattr(repair,'policy',lambda c:pol)
+    if not sampled: monkeypatch.setattr(repair,'reservoir_slot',lambda *args:None)
+    states=tmp_path/'states.pt'; torch.save(torch.zeros(1,3),states)
+    c=dict(output=str(tmp_path),collection_seed=7,collection_noise_seed=7,
+        collection_min_free_gib=0,collection_samples_per_age=4,
+        collection_states={str(i):dict(path=str(states),sha256=sha(states),indices=[0]) for i in (9,5,1)})
+    # Full collection avoids the smoke assertion that each age was retained.
+    repair.collect(c,1,False,driver)
+    assert len(env.actions)==910
+    np.testing.assert_array_equal(np.asarray(env.actions[10:]),20 if driver=='original' else 3)
+    marker=json.loads((tmp_path/'collection'/driver/'task9_state0.json').read_text())
+    assert marker['driver']==driver and marker['teacher_action_applied']==(driver=='original')
+    assert marker['records']==(28 if sampled else 0)
+    if sampled:
+        records=torch.load(tmp_path/'collection'/driver/'task9_state0.pt',weights_only=False)
+        assert {r['age'] for r in records}==set(range(1,8))
+        assert all(r['images'].dtype==torch.uint8 for r in records)
+        assert all(torch.equal(r['target_action'],torch.full((1,10,7),20.)) for r in records)
+
+
 @pytest.mark.parametrize('arm',['frozen_trend_residual','progress_only','progress_residual','progress_spatial'])
 def test_pair_adapter_is_same_as_sequence_and_freezes_b(arm):
     source,_,s=fixture(8)
@@ -57,14 +127,14 @@ def test_pair_adapter_is_same_as_sequence_and_freezes_b(arm):
         assert all(p.grad is None for p in model.trend_head.parameters())
 
 
-def test_queue_collection_dependencies_and_two_matched_trainings():
+def test_queue_collection_dependencies_and_three_matched_trainings():
     c=dict(output='/output',python='/python')
     plan=jobs(c,Path('/config'),False)
-    assert len(plan)==11 and len({p['id'] for p in plan})==11
+    assert len(plan)==18 and len({p['id'] for p in plan})==18
     training=[p for p in plan if p['id'].startswith('train_')]
-    assert len(training)==2
-    assert all(set(p['deps'])=={f'collect_{i}' for i in range(4)} for p in training)
-    assert len([p for p in plan if p['id'].startswith('eval_')])==4
+    assert len(training)==3
+    assert all(set(p['deps'])=={f'collect_{d}_{i}' for d in ('original','student') for i in range(4)} for p in training)
+    assert len([p for p in plan if p['id'].startswith('eval_')])==6
     export=next(p for p in plan if p['id']=='export_rb2')
     assert set(export['deps'])=={p['id'] for p in training}
 

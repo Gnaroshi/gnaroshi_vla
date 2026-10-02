@@ -15,7 +15,7 @@ STORAGE=Path('/home/mingyujung/private/gnaroshi_vla_storage')
 OUTPUT=STORAGE/'results/simvla/trend_condition/rollout_repair_compiled_seed01_v1'
 INCOMING=STORAGE/'incoming/simvla_rollout_state_repair'
 PRIOR=STORAGE/'results/simvla/trend_condition/k4_controls_compiled_seed01_v1'
-ROWS=('trend_k8_full10','selected_k8','offline_k8','rollout_k8')
+ROWS=('trend_k8_full10','selected_k8','offline_k8','fresh_original_k8','rollout_k8')
 
 
 def base_config():
@@ -156,7 +156,7 @@ def run_all(c):
                 while not (bundle:=bundle_ready()):
                     write_json(OUTPUT/'pipeline_status.json',dict(phase='waiting_for_sd1_bundle',gpu_used=False,completed_rows=len(results)))
                     print('WAIT: sd1 is collecting/training/evaluating; bundle not ready',flush=True); time.sleep(60)
-                key={'selected_k8':'selected','offline_k8':'offline_control','rollout_k8':'rollout_repair'}[row]
+                key={'selected_k8':'selected','offline_k8':'offline_control','fresh_original_k8':'fresh_original_control','rollout_k8':'rollout_repair'}[row]
                 item=bundle['checkpoints'][key]
                 spec=dict(path=str(INCOMING/item['file']),sha256=item['sha256'],arm=bundle['selected_arm'],step=6000 if key=='selected' else 3000)
             try:
@@ -165,7 +165,7 @@ def run_all(c):
             except Exception as exc:
                 failures.append(dict(row=row,error=str(exc))); print(f'ROW_FAILED {row}: {exc}',flush=True)
             write_json(OUTPUT/'combined_summary.json',dict(complete=len(results)==len(ROWS),results=results,failures=failures,
-                interpretation='Generation replacement is a diagnostic intervention. Three repair rows have identical inference architecture and compute; only training data differ. Single development seed.'))
+                interpretation='Generation replacement is a diagnostic intervention. Selected and three repair rows share inference architecture. All three continuations share source, steps, batch and optimizer; only training data differ. Single development seed.'))
         write_json(OUTPUT/'pipeline_status.json',dict(phase='complete' if not failures else 'finished_with_failures',failures=failures))
         return int(bool(failures))
 

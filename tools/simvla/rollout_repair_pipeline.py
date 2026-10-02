@@ -8,7 +8,7 @@ import time
 
 from tools.simvla.error_compensation_common import ROOT,read_json,write_json,sha,identity
 from tools.simvla.error_compensation_campaign import prepare,campaign
-from tools.simvla.rollout_state_repair import VARIANTS,disjoint_indices,state_hash_array
+from tools.simvla.rollout_state_repair import VARIANTS,DRIVERS,disjoint_indices,state_hash_array
 
 CONFIG=ROOT/'architectures/simvla/configs/rollout_state_repair_sd1.json'
 ARMS=('frozen_trend_residual','progress_only','progress_residual','progress_spatial')
@@ -74,11 +74,13 @@ def jobs(c,config,smoke):
     prefix=[c['python'],'-u','-m','tools.simvla.rollout_state_repair']
     plan=[]
     shards=[0] if smoke else list(range(4))
-    for s in shards:
-        plan.append(dict(id=f'collect_{s}',deps=[],cmd=prefix+['collect','--config',str(config),'--shard',str(s)]+extra,
-            expected_verdict='COLLECTION_COMPLETE',summary=str(out/('collection_smoke' if smoke else 'collection')/f'shard{s}_summary.json')))
+    for driver in DRIVERS:
+        for s in shards:
+            plan.append(dict(id=f'collect_{driver}_{s}',deps=[],cmd=prefix+['collect','--config',str(config),'--shard',str(s),'--driver',driver]+extra,
+                expected_verdict='COLLECTION_COMPLETE',summary=str(out/('collection_smoke' if smoke else 'collection')/driver/f'shard{s}_summary.json')))
+    collected=[j['id'] for j in plan]
     for v in VARIANTS:
-        plan.append(dict(id='train_'+v,deps=[f'collect_{s}' for s in shards],
+        plan.append(dict(id='train_'+v,deps=collected,
             cmd=prefix+['train','--config',str(config),'--variant',v]+extra,
             summary=str(out/('smoke' if smoke else 'train')/v/'summary.json')))
     if not smoke:
@@ -100,7 +102,7 @@ def summary_data(c):
         for v in VARIANTS:
             path=out/'online'/f'kc{k}_{v}'/'summary.json'
             if path.exists(): rows[f'kc{k}_{v}']=read_json(path)
-    return dict(complete=len(rows)==4,rows=rows,
+    return dict(complete=len(rows)==2*len(VARIANTS),rows=rows,
         selected_checkpoint=c['selected_checkpoint'],selection=read_json(out/'selection.json'),
         training_steps_each=c['steps'],shared_architecture=True,added_inference_operations=0,
         scope='Development test of student-state mismatch, not a new-method novelty claim or heldout seed confirmation')

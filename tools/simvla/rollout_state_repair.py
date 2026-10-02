@@ -27,7 +27,9 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.exact_teacher_
 from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mechanism import _balanced_indices
 from tools.simvla.compile_runtime import ActionStep
 
-VARIANTS = ('offline_control','rollout_repair')
+VARIANTS = ('offline_control','fresh_original_control','rollout_repair')
+DRIVERS = ('original','student')
+DATA_DRIVER = {'fresh_original_control':'original','rollout_repair':'student'}
 
 
 def state_hash_array(value):
@@ -96,13 +98,14 @@ def prediction(model,s):
 
 
 @torch.no_grad()
-def collect(c, shard, smoke=False):
+def collect(c, shard, smoke=False, driver='student'):
+    if driver not in DRIVERS: raise ValueError(driver)
     configure(c)
     configure_strict_torch_determinism(c['collection_seed'])
     torch.set_num_threads(1)
     from libero.libero import benchmark
     from architectures.simvla.wrappers.dcld_eval.rollout_runner import build_env_obs,get_libero_env
-    out=Path(c['output'])/('collection_smoke' if smoke else 'collection')
+    out=Path(c['output'])/('collection_smoke' if smoke else 'collection')/driver
     out.mkdir(parents=True,exist_ok=True)
     if shutil.disk_usage(out).free < c['collection_min_free_gib']*1024**3:
         raise RuntimeError('Insufficient space for bounded student-state collection')
@@ -111,21 +114,33 @@ def collect(c, shard, smoke=False):
     suite=benchmark.get_benchmark_dict()['libero_10']()
     selected_records=[]
     counts,slots={},{}
-    original=p._v0_update
+    original,original_full=p._v0_update,p._full_refresh
     current={}
+    def full(self,batch,*,policy_query_index):
+        condition,action,seed=original_full(batch,policy_query_index=policy_query_index)
+        if driver=='original':
+            noise,seed=self._paired_initial_noise(condition,batch['proprio'],policy_query_index)
+            action=self.action_adapter.decode_action_from_condition(condition,batch['proprio'],steps=10,initial_noise=noise)
+            self.cached_action_chunk=action.detach()
+        return condition,action,seed
     def update(self,batch,*,age,policy_query_index):
         result=original(batch,age=age,policy_query_index=policy_query_index)
         counts[age]=counts.get(age,0)+1
         rng=random.Random(c['collection_seed']+current['task_id']*1000000+current['state_index']*1000+policy_query_index)
         slot=reservoir_slot(counts[age],c['collection_samples_per_age'],rng)
-        if slot is None: return result
+        if slot is None and driver=='student': return result
         ctx=self._trend_context
-        # Teacher reads the same observation but never changes the student action.
+        # The driver determines executed actions; sample selection never does.
         teacher=self.condition_adapter.encode_condition(input_ids=batch['input_ids'],
             image_input=batch['image_input'],image_mask=batch['image_mask'])
         if teacher.shape!=ctx.anchor.shape: raise RuntimeError('Online token shape changed')
         noise,seed=self._paired_initial_noise(teacher,batch['proprio'],policy_query_index)
         target=self.action_adapter.decode_action_from_condition(teacher,batch['proprio'],steps=10,initial_noise=noise)
+        executed=result
+        if driver=='original':
+            executed=(teacher,target,seed)
+            self.cached_condition,self.cached_action_chunk=teacher.detach(),target.detach()
+        if slot is None: return executed
         teacher_generation,_=self._decode(teacher,batch['proprio'],policy_query_index=policy_query_index)
         norm=self.action_adapter.action_space.normalize_action
         record=dict(anchor=ctx.anchor,anchor_images=ctx.images,images=batch['raw_rgb'],
@@ -141,7 +156,8 @@ def collect(c, shard, smoke=False):
         if key in slots: selected_records[slots[key]]=record
         else:
             slots[key]=len(selected_records); selected_records.append(record)
-        return result
+        return executed
+    p._full_refresh=MethodType(full,p)
     p._v0_update=MethodType(update,p)
     summaries=[]
     tasks=[9] if smoke else [t for t in range(9,-1,-1) if t%4==shard]
@@ -157,11 +173,11 @@ def collect(c, shard, smoke=False):
                 marker=path.with_suffix('.json')
                 if marker.exists():
                     info=read_json(marker)
-                    if info['identity']!=identity(c) or sha(path)!=info['sha256']: raise RuntimeError('Collection resume mismatch')
+                    if info['identity']!=identity(c) or info['driver']!=driver or sha(path)!=info['sha256']: raise RuntimeError('Collection resume mismatch')
                     summaries.append(info)
                     continue
                 current.clear()
-                current.update(task_id=task_id,state_index=index,state_hash=state_hash_array(raw[index]),
+                current.update(driver=driver,task_id=task_id,state_index=index,state_hash=state_hash_array(raw[index]),
                     split='heldout' if number==4 else 'train')
                 configure_strict_torch_determinism(c['collection_seed']+task_id*100+index)
                 env.seed(7)
@@ -175,7 +191,7 @@ def collect(c, shard, smoke=False):
                 begun=last_progress=time.monotonic()
                 for step in range(41 if smoke else 900):
                     action=p.act(*build_env_obs(obs),prompt).action
-                    if not np.isfinite(action).all(): raise RuntimeError('Student produced a nonfinite action')
+                    if not np.isfinite(action).all(): raise RuntimeError(driver+' driver produced a nonfinite action')
                     obs,_,success,_=env.step(action.tolist())
                     if time.monotonic()-last_progress>30:
                         status=dict(task=task_id,state=index,actions=step+1,samples=len(selected_records),completed_episodes=len(summaries))
@@ -188,10 +204,10 @@ def collect(c, shard, smoke=False):
                 atomic_torch_save(selected_records,path)
                 info=dict(identity=identity(c),**current,records=len(selected_records),
                     sha256=sha(path),file=path.name,success=bool(success),actions=step+1,seconds=time.monotonic()-begun,
-                    use='training collection, not official success evaluation',teacher_action_applied=False)
+                    use='training collection, not official success evaluation',teacher_action_applied=driver=='original')
                 write_json(marker,info)
                 summaries.append(info)
-                print(f'COLLECT shard={shard} task={task_id} state={index} records={len(selected_records)}',flush=True)
+                print(f'COLLECT driver={driver} shard={shard} task={task_id} state={index} records={len(selected_records)}',flush=True)
         finally: env.close()
     write_json(out/f'shard{shard}_summary.json',dict(identity=identity(c),verdict='COLLECTION_COMPLETE',
         episodes=summaries,records=sum(x['records'] for x in summaries)))
@@ -200,9 +216,9 @@ def collect(c, shard, smoke=False):
 def load_records(c,smoke=False):
     directory=Path(c['output'])/('collection_smoke' if smoke else 'collection')
     records=[]
-    for marker in sorted(directory.glob('task*_state*.json')):
+    for marker in sorted(directory.glob('*/task*_state*.json')):
         info=read_json(marker)
-        path=directory/info['file']
+        path=marker.parent/info['file']
         if info['identity']!=identity(c) or sha(path)!=info['sha256']: raise RuntimeError('Invalid collected sample')
         records.extend(torch.load(path,map_location='cpu',mmap=True,weights_only=False))
     if not records: raise RuntimeError('No collected states')
@@ -212,13 +228,15 @@ def load_records(c,smoke=False):
 @torch.no_grad()
 def validation(c,model,action,loop,step,heldout,records,out):
     groups={}
-    for label in ('original_states','student_states'):
+    for label in ('cached_original_states','fresh_original_states','student_states'):
         values=[]
-        if label=='original_states':
+        if label=='cached_original_states':
             ids=_balanced_indices(heldout.identities,limit=30,seed=c['seed'])
             samples=(sample_from_sequence(move_batch(collate_exact_teacher_sequences([heldout[i]]),'cuda'),a)
                 for i in ids for a in range(1,8))
-        else: samples=(move_batch(r,'cuda') for r in records if r['metadata']['split']=='heldout')
+        else:
+            driver='original' if label=='fresh_original_states' else 'student'
+            samples=(move_batch(r,'cuda') for r in records if r['metadata']['split']=='heldout' and r['metadata']['driver']==driver)
         for s in samples:
             condition=prediction(model,s)
             pred=differentiable_rollout(loop,step,condition,action.normalize_proprio(s['proprio']),s['noise'])
@@ -251,8 +269,9 @@ def train(c,variant,smoke=False):
     frozen_b,frozen_g=state_hash(model.trend_head),state_hash(generation)
     original_model=state_hash(model)
     records=load_records(c,smoke)
-    by_age={a:[r for r in records if r['age']==a and r['metadata']['split']=='train'] for a in range(1,8)}
-    if any(not r for r in by_age.values()): raise RuntimeError('Training collection missing an age')
+    by_age={d:{a:[r for r in records if r['age']==a and r['metadata']['split']=='train' and r['metadata']['driver']==d]
+        for a in range(1,8)} for d in DRIVERS}
+    if any(not r for ages in by_age.values() for r in ages.values()): raise RuntimeError('Training collection missing an age/driver')
     if not smoke and variant=='offline_control' and not (out/'before/validation.json').exists():
         validation(c,model,action,loop,step_model,heldout,records,out/'before')
     params=[p for p in model.parameters() if p.requires_grad]
@@ -269,7 +288,7 @@ def train(c,variant,smoke=False):
     # Fixed per-step draws give exact data replay after a technical interruption.
     contract={**source['contract'], 'steps':total,'repair_variant':variant,'source_checkpoint':c['selected_checkpoint'],
         'loss':'normalized first-five action L1 only','optimizer':'AdamW 1e-4 wd0 clip1; cosine to 0.1x, batch2 as two microbatches',
-        'training_data':'50% student states' if variant=='rollout_repair' else '100% original states',
+        'training_data':('50% cached original + 50% '+DATA_DRIVER[variant]+' driver states') if variant in DATA_DRIVER else '100% cached original states',
         'trend_frozen':True,'generation_frozen':True,'no_new_inference_operations':True}
     write_json(out/'training_contract.json',contract)
     tracker=None
@@ -290,7 +309,9 @@ def train(c,variant,smoke=False):
             rng=random.Random(c['seed']*100000+n)
             ids=[rng.randrange(len(data)) for _ in range(2)]
             samples=[sample_from_sequence(move_batch(collate_exact_teacher_sequences([data[i]]),device),age) for i in ids]
-            if variant=='rollout_repair': samples[1]=move_batch(by_age[age][rng.randrange(len(by_age[age]))],device)
+            if variant in DATA_DRIVER:
+                pool=by_age[DATA_DRIVER[variant]][age]
+                samples[1]=move_batch(pool[rng.randrange(len(pool))],device)
             optimizer.zero_grad(set_to_none=True)
             losses=[]
             for s in samples:
@@ -331,11 +352,12 @@ def main():
     p.add_argument('command',choices=('collect','train','eval'))
     p.add_argument('--config',required=True)
     p.add_argument('--shard',type=int,choices=range(4),default=0)
+    p.add_argument('--driver',choices=DRIVERS,default='student')
     p.add_argument('--variant',choices=VARIANTS,default=VARIANTS[0])
     p.add_argument('--k-c',type=int,choices=(4,8),default=8)
     p.add_argument('--smoke',action='store_true')
     a=p.parse_args(); c=read_json(a.config)
-    if a.command=='collect': collect(c,a.shard,a.smoke)
+    if a.command=='collect': collect(c,a.shard,a.smoke,a.driver)
     elif a.command=='train': train(c,a.variant,a.smoke)
     else:
         def factory(c,row,*,smoke,k_c): return policy(c,row,smoke,k_c)

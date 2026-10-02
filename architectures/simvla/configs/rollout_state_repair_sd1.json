@@ -9,7 +9,7 @@
   "collection_episodes_per_task": 5,
   "collection_samples_per_age": 4,
   "collection_min_free_gib": 20,
-  "training_description": "Matched 3K continuation: original-state data versus 50% student-visited states. Same selected Condition model, frozen b/Generation, optimizer, age distribution, batch2, first-five action L1. No extra inference computation.",
+  "training_description": "Three matched 3K continuations: cached original data; 50% new original-policy data; 50% new student-policy data. Both collection drivers use identical disjoint initial states. Same selected Condition model, frozen b/Generation, optimizer, age distribution, batch2, first-five action L1. No extra inference computation.",
   "student_condition_description": "Selected observation-dependent K8 model, unchanged architecture; original anchor and current observations only.",
   "wait_for_processes": [],
   "rb2_destination": "rb2:/home/mingyujung/private/gnaroshi_vla_storage/incoming/simvla_rollout_state_repair"
