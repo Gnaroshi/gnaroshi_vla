@@ -8,12 +8,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from methods.latentloop.modules.trend_condition import (
-    ARMS, TrendCondition, decomposition_loss, scaled_mse, teacher_decomposition,
+    MODEL_ARMS as ARMS, TrendCondition, decomposition_loss, scaled_mse, teacher_decomposition,
 )
 from methods.latentloop.modules.action_aligned_joint import action_loss, differentiable_rollout
 from methods.latentloop.modules.simvla_generation_loop import SimVLAGenerationLoop
 from tools.simvla.error_compensation_common import configure, identity, read_json, snapshots, write_json
 from tools.simvla.compile_runtime import ActionStep
+from tools.simvla.compile_benchmark import sha
 from architectures.simvla.adapters.latentloop.native_v0_checkpoint import atomic_torch_save
 from architectures.simvla.adapters.latentloop.native_v0_runtime import append_jsonl, move_batch
 from .shared_refinement_train import load_runtime, lr_factor, assert_frozen
@@ -33,14 +34,19 @@ def offline(c, model, runtime, loop, step_model, output):
         s = move_batch(collate_exact_teacher_sequences([heldout[index]]), device)
         ctx = model.prepare(s['anchor_condition'], s['image_sequence'][:, 0],
             s['proprio_sequence'][:, 0], s['valid_mask'].bool(), s['group_ids'])
-        for age in (1, 2, 3):
+        for age in range(1, model.max_age + 1):
             condition, residual = model.predict(ctx, age, s['image_sequence'][:, age], s['proprio_sequence'][:, age])
             predicted = differentiable_rollout(loop, step_model, condition,
                 action.normalize_proprio(s['proprio_sequence'][:, age]), s['explicit_noises'][:, age-1])
             target_b, target_r = teacher_decomposition(ctx.anchor, s['teacher_conditions'], age)
+            base = ctx.anchor + age * ctx.trend
+            if model.arm == 'frozen_trend_residual':
+                target_r = s['teacher_conditions'][:, age-1] - base
             record = dict(index=index, age=age, task_id=int(s['task_id'][0]),
                 condition_mse=float(scaled_mse(condition, s['teacher_conditions'][:, age-1], ctx.anchor, ctx.valid)),
-                trend_endpoint_mse=float(scaled_mse(3*ctx.trend, 3*target_b, ctx.anchor, ctx.valid)),
+                condition_cosine=float(torch.nn.functional.cosine_similarity(condition[ctx.valid], s['teacher_conditions'][:, age-1][ctx.valid], dim=-1).mean()),
+                base_condition_mse=float(scaled_mse(base, s['teacher_conditions'][:, age-1], ctx.anchor, ctx.valid)),
+                trend_endpoint_mse=float(scaled_mse(model.max_age*ctx.trend, model.max_age*target_b, ctx.anchor, ctx.valid)),
                 residual_mse=float(scaled_mse(residual, target_r, ctx.anchor, ctx.valid)),
                 residual_target_energy=float(target_r[ctx.valid].square().mean()),
                 full_displacement_energy=float((s['teacher_conditions'][:,age-1]-ctx.anchor)[ctx.valid].square().mean()),
@@ -50,7 +56,7 @@ def offline(c, model, runtime, loop, step_model, output):
     mean = lambda rs: {k: sum(r[k] for r in rs)/len(rs) for k in keys}
     write_json(output/'offline_queries.json', rows)
     write_json(output/'offline_summary.json', dict(verdict='OFFLINE_COMPLETE_NO_SR_GATE', queries=len(rows),
-        metrics=mean(rows), by_condition_age={str(a): mean([r for r in rows if r['age']==a]) for a in (1,2,3)}))
+        metrics=mean(rows), by_condition_age={str(a): mean([r for r in rows if r['age']==a]) for a in range(1, model.max_age+1)}))
 
 
 def run(c, arm, smoke=False):
@@ -61,28 +67,42 @@ def run(c, arm, smoke=False):
     runtime = load_runtime(c, snapshots(c))
     device, parent, frozen, action, train, heldout = runtime
     torch.manual_seed(c['seed'])
-    model = TrendCondition(parent, arm).to(device).requires_grad_(True).eval()
+    max_age = c.get('training_k_c', 4) - 1
+    model = TrendCondition(parent, arm, max_age=max_age).to(device).requires_grad_(True).eval()
+    initial_trend = None
+    if arm == 'frozen_trend_residual':
+        source = c['frozen_trend_checkpoint']
+        if sha(source['path']) != source['sha256']:
+            raise RuntimeError('Frozen trend checkpoint checksum mismatch')
+        payload = torch.load(source['path'], map_location=device, weights_only=False)
+        if payload['arm'] != 'trend_only' or payload['step'] != 3000 or payload['contract']['k_c'] != max_age+1:
+            raise RuntimeError('Frozen trend training horizon/arm mismatch')
+        model.initialize_frozen_trend({k.removeprefix('trend_head.'):v for k,v in payload['model'].items() if k.startswith('trend_head.')})
+        initial_trend = state_hash(model.trend_head)
     generation, _ = load_generation_checkpoint(c['generation_checkpoint'], device=device)
     generation.requires_grad_(False).eval()
     initial_generation = state_hash(generation)
     loop = SimVLAGenerationLoop(generation, frozen.transformer.action_decoder).eval()
     step_model = ActionStep(frozen.transformer).eval()
     initial_model = state_hash(model)
-    params = list(model.parameters())
+    params = [p for p in model.parameters() if p.requires_grad]
     total = c['smoke_steps'] if smoke else c['steps']
     stage1 = total//2 if smoke else c['decomposition_steps']
     if not 0 < stage1 < total:
         raise ValueError('Both training stages must be nonempty')
     contract = dict(identity=run_id, arm=arm, steps=total, decomposition_steps=stage1,
         action_steps=total-stage1, parameters=sum(p.numel() for p in params),
-        trainable_names=[n for n,p in model.named_parameters()],
-        mean_target='(teacher_C3-original_C0)/3; training labels only',
+        trainable_names=[n for n,p in model.named_parameters() if p.requires_grad],
+        mean_target=f'(teacher_C{max_age}-original_C0)/{max_age}; training labels only',
         inference='original_C0 + age*predicted_trend + absolute_residual; no previous prediction input',
-        loss_stage1='anchor-variance-scaled MSE; mean of trend endpoint and residual terms when both exist',
-        loss_stage2='normalized executed first-five action L1 only; all active Condition branches adapted',
-        interpretation='Trend is mean-supervised during initialization, action-adapted in stage2; no exact mean guarantee after training',
+        loss_stage1='anchor-variance-scaled teacher-condition MSE with frozen b' if initial_trend else 'anchor-variance-scaled MSE; mean of trend endpoint and residual terms when both exist',
+        loss_stage2='normalized executed first-five action L1; only E_j and its observation encoder train' if initial_trend else 'normalized executed first-five action L1; all active Condition branches train',
+        interpretation='Previously trained b is frozen; E_j corrects teacher_Cj-(C0+j*b)' if initial_trend else 'Trend is mean-supervised during initialization, action-adapted in stage2; no exact mean guarantee after training',
         optimizer='AdamW lr1e-4 wd0 clip1; separate optimizer and cosine schedule for each stage',
-        generation_frozen=True, original_simvla_frozen=True, k_c=4, n_g=3, integration_steps=10, H=10, R=5,
+        generation_frozen=True, original_simvla_frozen=True, k_c=max_age+1, n_g=3, integration_steps=10, H=10, R=5,
+        trend_frozen=initial_trend is not None, frozen_trend_checkpoint=c.get('frozen_trend_checkpoint'),
+        total_parameters=sum(p.numel() for p in model.parameters()),
+        residual_target='teacher_Cj - (C0 + j*frozen_b)' if initial_trend else None,
         train=train.contract(), heldout=heldout.contract(),
         forecast='all three residuals batched at refresh without later observations' if arm=='trend_forecast' else None)
     write_json(output/'training_contract.json', contract)
@@ -133,9 +153,9 @@ def run(c, arm, smoke=False):
                         scheduler.load_state_dict(saved['scheduler'])
                     current_stage=stage
                 s=move_batch(host,device)
-                age=(step-1)%3+1
+                age=(step-1)%max_age+1
                 condition,trend,residual=model.sequence(s,age)
-                if step<=3:
+                if step<=max_age:
                     with torch.no_grad():
                         exact=action.decode_action_from_condition(s['teacher_conditions'][:,age-1],
                             s['proprio_sequence'][:,age],steps=10,initial_noise=s['explicit_noises'][:,age-1])
@@ -154,6 +174,8 @@ def run(c, arm, smoke=False):
                 norm=torch.nn.utils.clip_grad_norm_(params,1.0,error_if_nonfinite=True)
                 if not norm>0: raise RuntimeError('No active gradient')
                 assert_frozen(frozen,generation)
+                if initial_trend is not None:
+                    assert_frozen(model.trend_head)
                 optimizer.step()
                 scheduler.step()
                 elapsed_now=elapsed+time.monotonic()-begun
@@ -179,9 +201,12 @@ def run(c, arm, smoke=False):
             progress.close()
             del loader
     if state_hash(generation)!=initial_generation: raise RuntimeError('Frozen Generation mutated')
+    if initial_trend is not None and state_hash(model.trend_head) != initial_trend:
+        raise RuntimeError('Frozen trend mutated')
     if state_hash(model)==initial_model: raise RuntimeError('Condition weights unchanged')
     write_json(output/'state_audit.json',dict(initial=initial,final_condition=state_hash(model),
-        generation_unchanged=True,original_simvla_frozen=True))
+        generation_unchanged=True,original_simvla_frozen=True,
+        frozen_trend_sha256=initial_trend, trend_unchanged=True if initial_trend else None))
     if not smoke and not (output/'offline_summary.json').exists():
         model.requires_grad_(False).eval()
         offline(c,model,runtime,loop,step_model,output)

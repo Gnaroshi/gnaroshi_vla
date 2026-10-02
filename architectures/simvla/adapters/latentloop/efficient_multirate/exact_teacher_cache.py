@@ -613,14 +613,23 @@ class ExactTeacherSequenceDataset(Dataset[dict[str, Any]]):
         split: str,
         heldout_fraction: float = 0.2,
         split_seed: int = 20260822,
+        window_queries: int = 4,
     ) -> None:
         if split not in {"train", "heldout", "all"}:
             raise ValueError("split must be train, heldout, or all")
         self.store = ExactTeacherStore(cache)
+        if window_queries not in (4, 8):
+            raise ValueError("Supported query windows: 4 or 8")
+        self.window_queries = int(window_queries)
         selected: list[list[str]] = []
         identities: list[tuple[int, str, int]] = []
         for window in self.store.manifest["windows"]:
             first = self.store.query(window[0])["metadata"]
+            if window_queries != 4:
+                window = [query_identity(int(first['task_id']), str(first['episode_id']),
+                                         int(first['query_index']) + j) for j in range(window_queries)]
+                if not all(q in self.store.locators for q in window):
+                    continue
             heldout = stable_episode_partition(
                 int(first["task_id"]), str(first["episode_id"]), int(split_seed)
             ) < float(heldout_fraction)
@@ -653,6 +662,13 @@ class ExactTeacherSequenceDataset(Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         queries = [self.store.query(value) for value in self.windows[index]]
         first = queries[0]["metadata"]
+        for age, item in enumerate(queries):
+            meta = item['metadata']
+            if (meta['task_id'], meta['episode_id'], meta['query_index']) != (
+                    first['task_id'], first['episode_id'], first['query_index'] + age):
+                raise RuntimeError('Teacher window crosses an episode or skips a query')
+            if not torch.equal(item['valid_mask'], queries[0]['valid_mask']) or not torch.equal(item['group_ids'], queries[0]['group_ids']):
+                raise RuntimeError('Teacher token layout changes inside a window')
         images = torch.stack([_load_rgb_ref(item["metadata"]["raw_rgb_ref"]) for item in queries])
         noises = []
         for item in queries[1:]:
@@ -709,7 +725,8 @@ class ExactTeacherSequenceDataset(Dataset[dict[str, Any]]):
             "query_tensors_deduplicated": True,
             "action_horizon": 10,
             "execution_horizon": 5,
-            "fixed_k_c": 4,
+            "fixed_k_c": self.window_queries,
+            "window_construction": "original starts; consecutive query IDs from the same episode; incomplete tails excluded",
         }
 
 

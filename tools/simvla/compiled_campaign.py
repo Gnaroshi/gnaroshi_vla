@@ -108,7 +108,7 @@ def prepare(c, output):
         "options": {"max_autotune": True, "cudagraphs": False, "dynamic": False,
             "base_dtype": "float32", "bridge_dtype": "bfloat16"},
         "episodes_per_cell": 500, "episodes_total": len(jobs(c)) * 500,
-        "new_training": False, "success_threshold": None}
+        "new_training": c.get('new_training', False), "success_threshold": None}
     path = output / "campaign_contract.json"
     if path.exists() and read_json(path) != contract:
         raise RuntimeError("Campaign contract changed; preserve this output and use a new run name")

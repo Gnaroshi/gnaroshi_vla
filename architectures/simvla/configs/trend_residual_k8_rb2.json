@@ -1,0 +1,25 @@
+{
+  "output": "/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/trend_condition/residual_k4_k8_seed01_v1",
+  "reference_root": "/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/compiled_paper/three_seed_v2",
+  "trend_reference_root": "/home/mingyujung/private/gnaroshi_vla_storage/results/simvla/trend_condition/long_compiled_seed01_v1",
+  "frozen_k4_trend": {
+    "path": "/home/mingyujung/private/gnaroshi_vla_storage/artifacts/simvla/trend_condition/trend_only_step3000.pt",
+    "sha256": "542c100a2d21ed8d5a78de191cc47467ed0805635fadef67b6213793c8e2cef1"
+  },
+  "seeds": ["seed01"],
+  "other_rows": [],
+  "other_suites": [],
+  "smoke_episodes": 1,
+  "smoke_actions": 41,
+  "warmup_actions": 45,
+  "videos_per_row": 2,
+  "worker_timeout_seconds": 28800,
+  "campaign_module": "tools.simvla.trend_residual_pipeline",
+  "extra_source_files": ["tools/simvla/trend_residual_pipeline.py", "architectures/simvla/configs/trend_residual_k8_rb2.json", "architectures/simvla/wrappers/run_trend_residual_k8_rb2.sh"],
+  "steps": 3000,
+  "decomposition_steps": 750,
+  "smoke_steps": 14,
+  "heldout_windows": 100,
+  "new_training": true,
+  "interpretation": "Freeze the separately trained b. Learn E_j from current images/proprio and C0+j*b. K8 uses real ages1-7 during training. Evaluate all final checkpoints without an SR gate."
+}
