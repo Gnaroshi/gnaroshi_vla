@@ -1,0 +1,31 @@
+{
+  "storage": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla",
+  "output": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/trend_condition/long_followup_seed01_v1",
+  "python": "/home/mingyujung/miniconda3/envs/simvla_libero/bin/python",
+  "upstream": "/home/mingyujung/private/gnaroshi_vla/architectures/simvla/upstream",
+  "hf_home": "/home/mingyujung/private/gnaroshi_vla/.cache/huggingface",
+  "checkpoint_revision": "93dc4d90b0596c652ad2840ad743c62b9c4473fb",
+  "condition_checkpoint": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/latentloop/correct_native_v0_seed20260815_v1/08_train_150k/checkpoints/native_v0_step_150000.pt",
+  "generation_checkpoint": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/artifacts/simvla/generation_eval_bundle_20260824_v1/checkpoint/generation_step_030000.pt",
+  "norm_stats": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/artifacts/simvla/generation_eval_bundle_20260824_v1/norm/libero_norm_official_32700d0.json",
+  "cache": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/latentloop/simvla_efficient_coupled_multirate_latentloop_sigfix_v1/03_exact_teacher_cache",
+  "seed": 7,
+  "evaluation_seed": 20260815,
+  "action_noise_seed_base": 6828326409295398833,
+  "steps": 3000,
+  "smoke_steps": 6,
+  "smoke_policy_actions": 41,
+  "training_condition_ages": [1, 2, 3],
+  "evaluation_condition_intervals": [4, 6, 8],
+  "student_condition_description": "Frozen anchor plus age times learned slope; hold and naive3 controls. K6/K8 extrapolate without further training.",
+  "training_description": "No training. Reuse immutable completed trend_only step3000 checkpoint; five 500-episode evaluations.",
+  "trend_checkpoint": {
+    "path": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/trend_condition/long_kc4_seed01_v1/train/trend_only/latest.pt",
+    "sha256": "542c100a2d21ed8d5a78de191cc47467ed0805635fadef67b6213793c8e2cef1",
+    "identity": "37935bea4e90cf6e12a61c88b3cb8bbecffa06b3677e9dbd37e336f96b68afb9"
+  },
+  "reference_results": {
+    "trend_learned3_kc4": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/trend_condition/long_kc4_seed01_v1/online/kc4_trend_only/summary.json",
+    "baseline": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/error_compensation/long_seed01_v1/online/baseline/summary.json"
+  }
+}

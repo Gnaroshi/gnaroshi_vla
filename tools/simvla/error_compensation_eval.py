@@ -167,7 +167,7 @@ def run(c, row, *, smoke=False, k_c=4, policy_factory=None, counter_row=None, co
                 frames, timing = [], []
                 success = False
                 started = last_progress = time.monotonic()
-                for index in range(26 if smoke else 900):
+                for index in range(int(c.get('smoke_policy_actions',26)) if smoke else 900):
                     inputs = build_env_obs(obs)
                     if trial == 0 and task in (9, 4) and index % 2 == 0:
                         frames.append(video_frame_from_obs(obs))

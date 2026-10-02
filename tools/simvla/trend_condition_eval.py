@@ -54,12 +54,15 @@ def check_counts(policy, row, calls, k_c):
     return actual
 
 
-def make_policy(c, row, *, smoke=False, k_c=4):
-    policy=parent_policy(c,'parent',k_c=k_c)
+def make_policy(c, row, *, smoke=False, k_c=4, checkpoint_loader=None, generation_mode='learned'):
+    if generation_mode not in ('learned','naive3'):
+        raise ValueError(generation_mode)
+    policy=parent_policy(c,'parent' if generation_mode=='learned' else 'condition_naive3',k_c=k_c)
     model=TrendCondition(policy.native_v0,row).to('cuda').requires_grad_(False).eval()
-    payload=torch.load(Path(c['output'])/('smoke' if smoke else 'train')/row/'latest.pt',
-        map_location='cuda',weights_only=False)
-    if (payload['format']!='simvla_trend_condition_v1' or payload['identity']!=identity(c)
+    payload=(checkpoint_loader(c,row) if checkpoint_loader else
+        torch.load(Path(c['output'])/('smoke' if smoke else 'train')/row/'latest.pt',
+        map_location='cuda',weights_only=False))
+    if checkpoint_loader is None and (payload['format']!='simvla_trend_condition_v1' or payload['identity']!=identity(c)
             or payload['arm']!=row or payload['step']!=(c['smoke_steps'] if smoke else c['steps'])):
         raise RuntimeError('Incompatible or incomplete trend checkpoint')
     model.load_state_dict(payload['model'],strict=True)
