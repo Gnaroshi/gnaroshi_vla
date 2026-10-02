@@ -23,6 +23,11 @@ export TORCHINDUCTOR_CACHE_DIR="${STORAGE}/results/simvla/compile_benchmark/pair
 cd "${ROOT}" || exit 0
 if [ "$#" -eq 0 ]; then set -- all; fi
 MODULE=tools.simvla.trend_compiled_rb2
+if [ "${1:-}" = "--rollout-repair" ]; then
+  MODULE=tools.simvla.rollout_repair_rb2
+  shift
+  if [ "$#" -eq 0 ]; then set -- all; fi
+fi
 if [ "${1:-}" = "--controls" ]; then
   MODULE=tools.simvla.trend_controls_rb2
   shift

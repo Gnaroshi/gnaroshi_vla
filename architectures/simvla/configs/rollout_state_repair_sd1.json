@@ -1,0 +1,16 @@
+{
+  "predecessor": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/trend_condition/observed_progress_k8_seed01_v1",
+  "output": "/home/mingyujung/shared/nvme1/mingyujung/robotics/gnaroshi_vla/results/simvla/trend_condition/rollout_state_repair_seed01_v1",
+  "steps": 3000,
+  "smoke_steps": 14,
+  "evaluation_condition_intervals": [8,4],
+  "collection_seed": 20261003,
+  "collection_noise_seed": 2026100301,
+  "collection_episodes_per_task": 5,
+  "collection_samples_per_age": 4,
+  "collection_min_free_gib": 20,
+  "training_description": "Matched 3K continuation: original-state data versus 50% student-visited states. Same selected Condition model, frozen b/Generation, optimizer, age distribution, batch2, first-five action L1. No extra inference computation.",
+  "student_condition_description": "Selected observation-dependent K8 model, unchanged architecture; original anchor and current observations only.",
+  "wait_for_processes": [],
+  "rb2_destination": "rb2:/home/mingyujung/private/gnaroshi_vla_storage/incoming/simvla_rollout_state_repair"
+}
