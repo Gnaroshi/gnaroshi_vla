@@ -58,7 +58,9 @@ def check_counts(policy, row, calls, k_c):
 def make_policy(c, row, *, smoke=False, k_c=4, checkpoint_loader=None, generation_mode='learned'):
     if generation_mode not in ('learned','naive3'):
         raise ValueError(generation_mode)
-    policy=parent_policy(c,'parent' if generation_mode=='learned' else 'condition_naive3',k_c=k_c)
+    # The inherited recursive updater supports ages 1..3. It is replaced below
+    # by the checkpoint's anchor-based model before any policy query is run.
+    policy=parent_policy(c,'parent' if generation_mode=='learned' else 'condition_naive3',k_c=min(k_c,4))
     payload=(checkpoint_loader(c,row) if checkpoint_loader else
         torch.load(Path(c['output'])/('smoke' if smoke else 'train')/row/'latest.pt',
         map_location='cuda',weights_only=False))
@@ -69,6 +71,7 @@ def make_policy(c, row, *, smoke=False, k_c=4, checkpoint_loader=None, generatio
     model.load_state_dict(payload['model'],strict=True)
     policy.native_v0=model
     policy.row_name=row
+    policy.k_c=policy.refresh_every=k_c
     timers=ComponentTimers()
     if model.trend_head is not None:
         model.trend_head.forward=timers.wrap(model.trend_head.forward,'trend_head')
