@@ -130,11 +130,20 @@ def load_sequence(dataset: Any, index: int, device: torch.device) -> dict:
 def make_datasets(config: dict, checkpoint_payload: dict) -> tuple[Any, Any]:
     train_config = checkpoint_payload["training_config"]
     kwargs = {"heldout_fraction": train_config["heldout_fraction"], "split_seed": train_config["split_seed"]}
-    train = ExactTeacherSequenceDataset(config["cache"], split="train", window_queries=config.get('training_k_c', 4), **kwargs)
-    heldout = ExactTeacherSequenceDataset(config["cache"], split="heldout", window_queries=config.get('training_k_c', 4), **kwargs)
+    train = ExactTeacherSequenceDataset(config["cache"], split="train", **kwargs)
+    heldout = ExactTeacherSequenceDataset(config["cache"], split="heldout", **kwargs)
     expected = train_config["dataset_splits"]
     if train.split_sha256 != expected["train_split_sha256"] or heldout.split_sha256 != expected["heldout_split_sha256"]:
         raise RuntimeError("Cache split does not match the trained Condition checkpoint")
+    k = config.get('training_k_c', 4)
+    if k != 4:
+        # Longer windows may drop tails, but must preserve the original episode partition.
+        longer = [ExactTeacherSequenceDataset(config['cache'], split=split, window_queries=k, **kwargs)
+                  for split in ('train', 'heldout')]
+        for original, extended in zip((train, heldout), longer):
+            if not set(extended.identities).issubset(set(original.identities)):
+                raise RuntimeError('Extended windows changed original split membership')
+        train, heldout = longer
     return train, heldout
 
 

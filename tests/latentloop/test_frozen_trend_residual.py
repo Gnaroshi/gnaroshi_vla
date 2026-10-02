@@ -105,3 +105,18 @@ def test_k8_dataset_joins_consecutive_queries_without_crossing_episodes(monkeypa
     del queries[query_identity(0,'a',7)]
     with pytest.raises(ValueError,match='no exact teacher windows'):
         cache.ExactTeacherSequenceDataset('/unused',split='all',window_queries=8)
+
+
+def test_longer_windows_keep_original_episode_split_contract(monkeypatch):
+    from architectures.simvla.adapters.latentloop.efficient_multirate import condition_mechanism as module
+    def dataset(cache, *, split, window_queries=4, **kwargs):
+        identities=((0,split,0),(0,split,4)) if window_queries==4 else ((0,split,0),)
+        return SimpleNamespace(identities=identities,split_sha256=split if window_queries==4 else 'extended_'+split)
+    monkeypatch.setattr(module,'ExactTeacherSequenceDataset',dataset)
+    payload=dict(training_config=dict(heldout_fraction=.2,split_seed=1,
+        dataset_splits=dict(train_split_sha256='train',heldout_split_sha256='heldout')))
+    train,heldout=module.make_datasets(dict(cache='/unused',training_k_c=8),payload)
+    assert train.split_sha256=='extended_train' and heldout.split_sha256=='extended_heldout'
+    payload['training_config']['dataset_splits']['train_split_sha256']='wrong'
+    with pytest.raises(RuntimeError,match='Cache split'):
+        module.make_datasets(dict(cache='/unused',training_k_c=8),payload)

@@ -142,7 +142,7 @@ def prepare_training(c, row):
     contract['identity'] = campaign.digest(contract)
     output = Path(t['output'])
     path = output/'contract.json'
-    if path.exists() and read_json(path) != contract:
+    if path.exists() and read_json(path) != contract and any((output/p).exists() for p in ('train','smoke')):
         raise RuntimeError('Training contract changed; preserve previous output')
     write_json(path, contract)
     write_json(output/'config.json',t)
