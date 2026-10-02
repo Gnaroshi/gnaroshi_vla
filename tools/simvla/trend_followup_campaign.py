@@ -2,9 +2,11 @@
 import argparse
 import fcntl
 from pathlib import Path
+import time
 
 from tools.simvla.error_compensation_common import ROOT, read_json, write_json
-from tools.simvla.error_compensation_campaign import campaign
+from tools.simvla.error_compensation_campaign import campaign, prepare
+from tools.simvla.action_aligned_campaign import process_matches
 from tools.simvla.trend_followup_eval import ROWS, load_checkpoint
 
 CONFIG=ROOT/'architectures/simvla/configs/trend_followup_sd1.json'
@@ -44,6 +46,15 @@ def run_all(c,config):
     status=out/'pipeline_status.json'
     try:
         load_checkpoint(c,'trend_only')
+        prepare(c)
+        while True:
+            waiting=[r for r in c.get('wait_for_processes',[]) if process_matches(r)]
+            if not waiting:
+                break
+            write_json(status,dict(phase='WAITING_FOR_EXISTING_GPU_CAMPAIGN',waiting=waiting,
+                gpu_pool=[4,5,6,7],gpu_jobs_started=False,gpu_validation='PENDING'))
+            print('WAIT: existing Seer campaign owns GPU4-7; no SimVLA GPU use. Checking in 60s.',flush=True)
+            time.sleep(60)
         for smoke,phase in [(True,'GPU_SMOKE'),(False,'EVALUATE_500_EACH')]:
             write_json(status,dict(phase=phase,gpu_pool=[4,5,6,7]))
             rc=campaign(c,config,smoke,job_builder=jobs,summarizer=summarize)
