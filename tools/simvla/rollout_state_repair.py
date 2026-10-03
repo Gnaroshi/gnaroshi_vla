@@ -52,7 +52,11 @@ def disjoint_indices(raw, official, count, seed):
 
 
 def source_rgb(value):
+    # Live RGB is divided by 255 on CPU before transfer to CUDA. Reconstruct
+    # on that same backend: CUDA division may differ by one float32 ULP.
+    value=value.detach().cpu()
     if value.dtype==torch.uint8: return value
+    if value.dtype!=torch.float32: raise ValueError('Expected live float32 RGB')
     encoded=(value*255).round().to(torch.uint8)
     if not torch.equal(encoded.float()/255,value.float()):
         raise RuntimeError('Live RGB is not losslessly representable as source uint8')

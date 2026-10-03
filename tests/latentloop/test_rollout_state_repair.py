@@ -35,6 +35,17 @@ def test_rgb_roundtrip_exact():
     with pytest.raises(RuntimeError): source_rgb(torch.full((1,2,2,2,3),.123456))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='GPU roundtrip integration check')
+def test_rgb_roundtrip_matches_live_cpu_normalization_on_cuda():
+    from architectures.simvla.adapters.dcld.simvla_delta_obs_adapter import raw_rgb_to_tensor
+    raw=torch.arange(256,dtype=torch.uint8).reshape(1,1,16,16,1).expand(-1,2,-1,-1,3).contiguous()
+    live=raw_rgb_to_tensor(raw,device='cuda')
+    restored=source_rgb(live)
+    assert restored.device.type=='cpu'
+    assert torch.equal(restored,raw)
+    assert torch.equal(restored.float()/255,live.cpu())
+
+
 def test_reservoir_is_bounded_and_reaches_late_queries():
     rng=random.Random(7); slots={}
     for i in range(1,1001):
