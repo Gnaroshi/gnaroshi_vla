@@ -23,6 +23,11 @@ export TORCHINDUCTOR_CACHE_DIR="${STORAGE}/results/simvla/compile_benchmark/pair
 cd "${ROOT}" || exit 0
 if [ "$#" -eq 0 ]; then set -- all; fi
 MODULE=tools.simvla.trend_compiled_rb2
+if [ "${1:-}" = "--interval-followup" ]; then
+  MODULE=tools.simvla.interval_followup_rb2
+  shift
+  if [ "$#" -eq 0 ]; then set -- all; fi
+fi
 if [ "${1:-}" = "--bridge-sweep" ]; then
   MODULE=tools.simvla.bridge_interval_sweep
   shift
