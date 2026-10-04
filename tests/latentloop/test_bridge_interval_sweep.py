@@ -37,3 +37,21 @@ def test_factory_only_changes_refresh_interval(monkeypatch):
         policy=make_policy(None,{},row,{})
         assert policy.refresh_every==interval(row) and policy.flow_steps==10 and policy.bridge is sentinel
     with pytest.raises(ValueError): interval('latent_bridge_f9')
+
+
+def test_reuse_rejects_unaudited_source_or_manifest_changes(tmp_path,monkeypatch):
+    from tools.simvla import bridge_interval_sweep as m
+    import hashlib
+    root=tmp_path/'new'; p=root/'tools/simvla/compiled_campaign.py'
+    p.parent.mkdir(parents=True); p.write_text('source A')
+    h=hashlib.sha256(p.read_bytes()).hexdigest()
+    monkeypatch.setattr(m,'ROOT',root)
+    old={k:{} for k in ('artifacts','hf_assets','libero_config','libero_config_sha256','packages','gpu','options','measurement')}
+    old.update(manifest_hashes={'libero_10/seed01':'manifest'},source_files={'/old/tools/simvla/compiled_campaign.py':h})
+    new=dict(old)
+    assert m.compatible_contract(old,new)==[]
+    p.write_text('changed')
+    assert m.compatible_contract(old,new)
+    p.write_text('source A')
+    new['manifest_hashes']={'libero_10/seed01':'different'}
+    assert m.compatible_contract(old,new)==['episode_manifest']

@@ -18,6 +18,31 @@ REFERENCE=STORAGE/'results/simvla/compiled_paper/three_seed_v2'
 PREDECESSOR=STORAGE/'results/simvla/trend_condition/rollout_round2_compiled_seed01_v1'
 ROWS=tuple(f'latent_bridge_f{k}' for k in range(1,9))
 
+# Audited against the completed paper campaign. These exact source pairs
+# preserve the bridge inference path; any further edit invalidates reuse.
+SOURCE_EQUIVALENCE={
+    'architectures/simvla/adapters/latentloop/efficient_multirate/condition_mechanism.py':(
+        'e5235d0056b07a2ba9dcc9a39f92d9b8727184f900ef739f3a977254845cb49a',
+        '7fe11488326adce39c6a3ba23e88287bb804c344f60694ced7d81bfd27ddfdf4',
+        'Offline Ours condition diagnostics; not executed by Latent Bridge evaluation.'),
+    'architectures/simvla/adapters/latentloop/efficient_multirate/generation_objective.py':(
+        '2d175f2fcc1195207f2e92712d959bde82d0588d861f8d8cda135c189fadf5a5',
+        'f404d3fb89eb95e72e68b2301e20467122b3c16e1572693b932567f30d0259be',
+        'Ours training objective; no Generation Loop in this evaluation.'),
+    'architectures/simvla/adapters/latentloop/efficient_multirate/exact_teacher_cache.py':(
+        '68dea275af021c0891c8619b9e141d8354cceba1c81b6a1d10ce92a2e479cf31',
+        '406ac2fdd59faf8e28ed659a142458f5b44a5cc3e5734db6596b61383b24225d',
+        'Training-cache loader; preflight import only, no cache dataset instantiated in bridge rollouts.'),
+    'methods/latentloop/modules/native_simvla_v0.py':(
+        '555f4ab154ee0353576245d26aa4ba816581fb8ca53c8c21e1d184f790086fd7',
+        '34bac5dffff551c94184c9835a39171fcc3bf4695595731611086cb6ceb4dd5e',
+        'Ours Condition module; Replay never instantiates it for Latent Bridge.'),
+    'tools/simvla/compiled_campaign.py':(
+        '4b512f87aa6f2dd6b57b5cf40157b751732aa7c9910ae24c363d54beed0ef47f',
+        'c849020a8c09554b3efa1716843e66175b9c56568975ff66a3c080491796cb2c',
+        'Factory/checker injection and metadata extensions. Same rollout, reset, timing and aggregation; warmup remains 40 actions. Smoke length is outside measured evaluation.'),
+}
+
 
 def interval(row):
     if row not in ROWS: raise ValueError(row)
@@ -61,7 +86,7 @@ def make_policy(replay,c,row,manifest):
 def base_config():
     return {**read_json(DEFAULT_CONFIG),**read_json(campaign.CONFIG),
         'output':str(OUTPUT),'long_rows':list(ROWS),'other_suites':[],'other_rows':[],
-        'seeds':['seed01'],'smoke_episodes':1,'smoke_actions':41,'warmup_actions':41,
+        'seeds':['seed01'],'smoke_episodes':1,'smoke_actions':41,'warmup_actions':40,
         'campaign_module':'tools.simvla.bridge_interval_sweep',
         'extra_source_files':['tools/simvla/bridge_interval_sweep.py',
             'architectures/simvla/wrappers/run_trend_compiled_rb2.sh'],
@@ -79,7 +104,13 @@ def compatible_contract(old,new):
     for path,expected in old['source_files'].items():
         p=Path(path)
         translated=ROOT/p.relative_to(old_root) if p.is_relative_to(old_root) else p
-        if not translated.is_file() or sha(translated)!=expected: issues.append('source:'+str(translated))
+        if not translated.is_file():
+            issues.append('source:'+str(translated)); continue
+        actual=sha(translated)
+        if actual==expected: continue
+        relative=str(translated.relative_to(ROOT)) if translated.is_relative_to(ROOT) else None
+        audited=SOURCE_EQUIVALENCE.get(relative)
+        if not audited or (expected,actual)!=audited[:2]: issues.append('source:'+str(translated))
     return issues
 
 
@@ -138,7 +169,8 @@ def run_all(c):
         write_json(OUTPUT/'runtime_config.json',c)
         issues=compatible_contract(read_json(REFERENCE/'campaign_contract.json'),contract)
         write_json(OUTPUT/'reference_validation.json',dict(compatible=not issues,issues=issues,
-            reference_root=str(REFERENCE),policy='reuse f2/f3/f4 only when compatible, otherwise run them'))
+            reference_root=str(REFERENCE),audited_source_equivalence=SOURCE_EQUIVALENCE,
+            policy='reuse f2/f3/f4 only when compatible, otherwise run them'))
         results=[]; failures=[]
         for row in ROWS:
             try:
