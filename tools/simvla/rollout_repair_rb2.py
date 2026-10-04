@@ -61,7 +61,7 @@ def make_policy(replay,c,row,manifest):
     payload=torch.load(spec['path'],map_location='cpu',weights_only=False)
     if payload['arm']!=spec['arm'] or payload['contract']['k_c']!=8 or payload['step']!=spec['step']:
         raise RuntimeError('Checkpoint method/horizon/step mismatch')
-    mode='condition_nfe10' if row=='trend_k8_full10' else 'ours_kc2_ng3'
+    mode=c.get('action_mode','condition_nfe10' if row=='trend_k8_full10' else 'ours_kc2_ng3')
     policy=attach_policy(replay,c,mode,manifest)
     model=build_model(replay.native,spec['arm'],max_age=7).to('cuda').eval()
     model.load_state_dict(payload['model'],strict=True); model.requires_grad_(False)
@@ -78,7 +78,8 @@ def make_policy(replay,c,row,manifest):
         required.add('progress_head')
     replay.compiler.repair_required_components=required
     original_full,original_reset=policy._full_refresh,policy.reset
-    policy.native_v0=model; policy.row_name=policy.mode=row; policy.k_c=policy.refresh_every=8
+    policy.native_v0=model; policy.row_name=policy.mode=row
+    policy.k_c=policy.refresh_every=int(c.get('condition_interval',8))
     def reset(self):
         original_reset(); self._trend_context=None
     def full(self,batch,*,policy_query_index):
@@ -114,8 +115,8 @@ def bundle_ready():
     return manifest
 
 
-def evaluate(c,row,spec):
-    out=OUTPUT/'online'/row
+def evaluate(c,row,spec,*,output=None):
+    out=(Path(output) if output else OUTPUT)/'online'/row
     e={**c,'output':str(out),'long_rows':[row],'model_checkpoint':spec}
     config=out/'runtime_config.json'
     if config.exists() and read_json(config)!=e: raise RuntimeError('Row config changed')

@@ -72,7 +72,7 @@ def load_selected(c):
     spec=c['selected_checkpoint']
     if sha(spec['path'])!=spec['sha256']: raise RuntimeError('Selected checkpoint changed')
     p=torch.load(spec['path'],map_location='cpu',weights_only=False)
-    if p['arm']!=spec['arm'] or p['step']!=6000 or p['contract']['k_c']!=8:
+    if p['arm']!=spec['arm'] or p['step']!=spec.get('step',6000) or p['contract']['k_c']!=8:
         raise RuntimeError('Selected architecture/step/horizon mismatch')
     return p
 
@@ -220,11 +220,16 @@ def collect(c, shard, smoke=False, driver='student'):
 def load_records(c,smoke=False):
     directory=Path(c['output'])/('collection_smoke' if smoke else 'collection')
     records=[]
-    for marker in sorted(directory.glob('*/task*_state*.json')):
-        info=read_json(marker)
-        path=marker.parent/info['file']
-        if info['identity']!=identity(c) or sha(path)!=info['sha256']: raise RuntimeError('Invalid collected sample')
-        records.extend(torch.load(path,map_location='cpu',mmap=True,weights_only=False))
+    sources=[dict(path=str(directory),identity=identity(c),label='current')]
+    sources+=c.get('record_sources_smoke' if smoke else 'record_sources',[])
+    for source in sources:
+        for marker in sorted(Path(source['path']).glob('*/task*_state*.json')):
+            info=read_json(marker)
+            path=marker.parent/info['file']
+            if info['identity']!=source['identity'] or sha(path)!=info['sha256']: raise RuntimeError('Invalid collected sample')
+            for r in torch.load(path,map_location='cpu',mmap=True,weights_only=False):
+                r['metadata']={**r['metadata'],'collection_source':source['label']}
+                records.append(r)
     if not records: raise RuntimeError('No collected states')
     return records
 
@@ -232,7 +237,9 @@ def load_records(c,smoke=False):
 @torch.no_grad()
 def validation(c,model,action,loop,step,heldout,records,out):
     groups={}
-    for label in ('cached_original_states','fresh_original_states','student_states'):
+    labels=['cached_original_states','fresh_original_states','student_states']
+    if c.get('variant_settings'): labels+=['previous_student_states','current_student_states']
+    for label in labels:
         values=[]
         if label=='cached_original_states':
             ids=_balanced_indices(heldout.identities,limit=30,seed=c['seed'])
@@ -240,7 +247,9 @@ def validation(c,model,action,loop,step,heldout,records,out):
                 for i in ids for a in range(1,8))
         else:
             driver='original' if label=='fresh_original_states' else 'student'
-            samples=(move_batch(r,'cuda') for r in records if r['metadata']['split']=='heldout' and r['metadata']['driver']==driver)
+            source=label.split('_')[0] if label in ('previous_student_states','current_student_states') else None
+            samples=(move_batch(r,'cuda') for r in records if r['metadata']['split']=='heldout' and r['metadata']['driver']==driver
+                and (source is None or r['metadata']['collection_source']==source))
         for s in samples:
             condition=prediction(model,s)
             pred=differentiable_rollout(loop,step,condition,action.normalize_proprio(s['proprio']),s['noise'])
@@ -254,6 +263,19 @@ def validation(c,model,action,loop,step,heldout,records,out):
     write_json(out/'validation.json',groups)
 
 
+def training_settings(c,variant):
+    settings=c.get('variant_settings',{}).get(variant)
+    if settings is not None: return settings
+    if variant not in VARIANTS: raise ValueError(variant)
+    return dict(train_trend=False,driver=DATA_DRIVER.get(variant),sources=['current'])
+
+
+def sample_pool(records,settings,age):
+    return [r for r in records if r['age']==age and r['metadata']['split']=='train'
+        and r['metadata']['driver']==settings['driver']
+        and r['metadata']['collection_source'] in settings['sources']]
+
+
 def train(c,variant,smoke=False):
     configure(c)
     torch.set_num_threads(1)
@@ -265,7 +287,8 @@ def train(c,variant,smoke=False):
     model=build_model(parent,source['arm'],max_age=7).to(device).eval()
     model.load_state_dict(source['model'],strict=True)
     model.requires_grad_(True)
-    model.trend_head.requires_grad_(False)
+    settings=training_settings(c,variant)
+    model.trend_head.requires_grad_(settings['train_trend'])
     generation,_=load_generation_checkpoint(c['generation_checkpoint'],device=device)
     generation.eval().requires_grad_(False)
     loop=SimVLAGenerationLoop(generation,frozen.transformer.action_decoder).eval()
@@ -273,9 +296,8 @@ def train(c,variant,smoke=False):
     frozen_b,frozen_g=state_hash(model.trend_head),state_hash(generation)
     original_model=state_hash(model)
     records=load_records(c,smoke)
-    by_age={d:{a:[r for r in records if r['age']==a and r['metadata']['split']=='train' and r['metadata']['driver']==d]
-        for a in range(1,8)} for d in DRIVERS}
-    if any(not r for ages in by_age.values() for r in ages.values()): raise RuntimeError('Training collection missing an age/driver')
+    by_age={a:sample_pool(records,settings,a) for a in range(1,8)} if settings['driver'] else {}
+    if any(not r for r in by_age.values()): raise RuntimeError('Training collection missing an age/driver')
     if not smoke and variant=='offline_control' and not (out/'before/validation.json').exists():
         validation(c,model,action,loop,step_model,heldout,records,out/'before')
     params=[p for p in model.parameters() if p.requires_grad]
@@ -292,8 +314,8 @@ def train(c,variant,smoke=False):
     # Fixed per-step draws give exact data replay after a technical interruption.
     contract={**source['contract'], 'steps':total,'repair_variant':variant,'source_checkpoint':c['selected_checkpoint'],
         'loss':'normalized first-five action L1 only','optimizer':'AdamW 1e-4 wd0 clip1; cosine to 0.1x, batch2 as two microbatches',
-        'training_data':('50% cached original + 50% '+DATA_DRIVER[variant]+' driver states') if variant in DATA_DRIVER else '100% cached original states',
-        'trend_frozen':True,'generation_frozen':True,'no_new_inference_operations':True}
+        'training_data':settings,'trend_frozen':not settings['train_trend'],
+        'generation_frozen':True,'no_new_inference_operations':True}
     write_json(out/'training_contract.json',contract)
     tracker=None
     if not smoke and c.get('wandb_project'):
@@ -313,8 +335,13 @@ def train(c,variant,smoke=False):
             rng=random.Random(c['seed']*100000+n)
             ids=[rng.randrange(len(data)) for _ in range(2)]
             samples=[sample_from_sequence(move_batch(collate_exact_teacher_sequences([data[i]]),device),age) for i in ids]
-            if variant in DATA_DRIVER:
-                pool=by_age[DATA_DRIVER[variant]][age]
+            if settings['driver']:
+                pool=by_age[age]
+                # Equal draw probability per collection round, regardless of
+                # successful episode length or reservoir size.
+                source_label=rng.choice(settings['sources'])
+                pool=[r for r in pool if r['metadata']['collection_source']==source_label]
+                if not pool: raise RuntimeError('Collection round missing an age')
                 samples[1]=move_batch(pool[rng.randrange(len(pool))],device)
             optimizer.zero_grad(set_to_none=True)
             losses=[]
@@ -329,7 +356,7 @@ def train(c,variant,smoke=False):
                 (loss/2).backward(); losses.append(float(loss))
             norm=torch.nn.utils.clip_grad_norm_(params,1.,error_if_nonfinite=True)
             if not norm>0: raise RuntimeError('No gradient')
-            assert_frozen(frozen,generation,model.trend_head)
+            assert_frozen(frozen,generation,*([] if settings['train_trend'] else [model.trend_head]))
             optimizer.step(); scheduler.step()
             if n%50==0 or n in (1,total):
                 metrics=dict(step=n,age=age,loss=sum(losses)/2,lr=optimizer.param_groups[0]['lr'],seconds=elapsed+time.monotonic()-began)
@@ -342,13 +369,15 @@ def train(c,variant,smoke=False):
         if tracker:
             try: tracker.finish()
             except Exception: pass
-    if state_hash(model.trend_head)!=frozen_b or state_hash(generation)!=frozen_g: raise RuntimeError('Frozen weights changed')
+    if (not settings['train_trend'] and state_hash(model.trend_head)!=frozen_b) or state_hash(generation)!=frozen_g:
+        raise RuntimeError('Frozen weights changed')
+    if settings['train_trend'] and state_hash(model.trend_head)==frozen_b: raise RuntimeError('Trend was not trained')
     if state_hash(model)==original_model: raise RuntimeError('No model change')
     if not smoke: validation(c,model,action,loop,step_model,heldout,records,out)
     saved=torch.load(latest,map_location='cpu',weights_only=False)
     write_json(out/'summary.json',dict(identity=run_id,verdict='SMOKE_PASS' if smoke else 'TRAIN_AND_OFFLINE_COMPLETE',steps=total,
         checkpoint=str(latest),checkpoint_sha256=sha(latest),training_seconds=saved['seconds'],parameters=sum(p.numel() for p in params),
-        original_and_generation_and_trend_frozen=True,inference_architecture=source['arm']))
+        original_and_generation_frozen=True,trend_frozen=not settings['train_trend'],inference_architecture=source['arm']))
 
 
 def main():
@@ -357,7 +386,7 @@ def main():
     p.add_argument('--config',required=True)
     p.add_argument('--shard',type=int,choices=range(4),default=0)
     p.add_argument('--driver',choices=DRIVERS,default='student')
-    p.add_argument('--variant',choices=VARIANTS,default=VARIANTS[0])
+    p.add_argument('--variant',default=VARIANTS[0])
     p.add_argument('--k-c',type=int,choices=(4,8),default=8)
     p.add_argument('--smoke',action='store_true')
     a=p.parse_args(); c=read_json(a.config)
