@@ -70,10 +70,10 @@ def summarize(c):
         variant_settings=settings(),development_seed_reused=True,added_inference_operations=0))
 
 
-def export(c):
+def export(c,variants=VARIANTS):
     out=Path(c['output']); bundle=out/'rb2_bundle'; bundle.mkdir(exist_ok=True)
-    manifest=dict(selected_arm='frozen_trend_residual',checkpoints={},source_identity=identity(c),variant_settings=settings())
-    for v in VARIANTS:
+    manifest=dict(selected_arm='frozen_trend_residual',checkpoints={},source_identity=identity(c),variant_settings=c.get('variant_settings',settings()))
+    for v in variants:
         source=out/'train'/v/'latest.pt'; target=bundle/(v+'.pt')
         if target.exists():
             if sha(target)!=sha(source): raise RuntimeError('Export changed')

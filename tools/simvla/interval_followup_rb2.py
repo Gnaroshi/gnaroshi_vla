@@ -57,8 +57,8 @@ def base_config():
     return c
 
 
-def expected_counts(row, queries):
-    k, mode = ROWS[row]
+def expected_counts(row, queries, *, rows=ROWS):
+    k, mode = rows[row]
     full = (queries + k - 1) // k
     return dict(num_full_vlm_calls=full, num_condition_updater_calls=queries-full,
                 num_action_transformer_calls=queries*(10 if mode == 'condition_nfe10' else 3),
@@ -66,28 +66,28 @@ def expected_counts(row, queries):
                 num_trend_head_calls=full, num_observation_encoder_calls=queries-full)
 
 
-def check_policy(policy, row):
+def check_policy(policy, row, *, rows=ROWS):
     queries = int(policy.metrics.counters['num_policy_queries'])
-    for name, value in expected_counts(row, queries).items():
+    for name, value in expected_counts(row, queries, rows=rows).items():
         if int(policy.metrics.counters.get(name, 0)) != value:
             raise RuntimeError(f'{row}: {name} mismatch')
     if queries != (policy.step_index + 4) // 5:
         raise RuntimeError('H10/R5 query cadence changed')
 
 
-def check_compiler(compiler, row):
+def check_compiler(compiler, row, *, rows=ROWS):
     required = {'vlm', 'action_transformer', 'trend_head', 'observation_encoder', 'condition_updater'}
-    if ROWS[row][1] == 'ours_kc2_ng3':
+    if rows[row][1] == 'ours_kc2_ng3':
         required |= {'action_decoder', 'generation_updater'}
     missing = [name for name in required if not compiler.records.get(name, {}).get('graphs', 0)]
     if missing:
         raise RuntimeError('Compile bypass: ' + str(missing))
 
 
-def replay_factory(c, row, compiler, samples):
-    if c['action_mode'] != ROWS[row][1] or c['condition_interval'] != ROWS[row][0]:
+def replay_factory(c, row, compiler, samples, *, rows=ROWS):
+    if c['action_mode'] != rows[row][1] or c['condition_interval'] != rows[row][0]:
         raise RuntimeError('Worker config and declared row differ')
-    return Replay(c, ROWS[row][1], compiler, samples)
+    return Replay(c, rows[row][1], compiler, samples)
 
 
 def predecessor_busy():

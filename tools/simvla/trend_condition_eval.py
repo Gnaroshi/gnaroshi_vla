@@ -33,19 +33,20 @@ class ComponentTimers:
             for name, events in self.events.items()}
 
 
-def expected_counts(arm, queries, k_c):
+def expected_counts(arm, queries, k_c, generation_mode='learned'):
+    if generation_mode not in ('learned','naive3'): raise ValueError(generation_mode)
     full = (queries+k_c-1)//k_c
     light = queries-full
-    return dict(transformer=3*queries, generation=7*queries,
+    return dict(transformer=3*queries, generation=7*queries if generation_mode=='learned' else 0,
         condition=light if arm in ('direct_anchor','trend_residual','frozen_trend_residual','progress_residual','progress_spatial') else full if arm=='trend_forecast' else 0,
         trend=0 if arm=='direct_anchor' else full,
         observation=light if arm in ('direct_anchor','trend_residual','frozen_trend_residual','progress_only','progress_residual','progress_spatial') else 0,
         full_vlm=full, queries=queries, lightweight_conditions=light)
 
 
-def check_counts(policy, row, calls, k_c):
+def check_counts(policy, row, calls, k_c, generation_mode='learned'):
     queries = int(policy.metrics.counters['num_policy_queries'])
-    expected = expected_counts(row, queries, k_c)
+    expected = expected_counts(row, queries, k_c, generation_mode)
     actual = {key:calls.get(key,0) for key in ('transformer','generation','condition')}
     actual.update(trend=policy._trend_counts['trend'],observation=policy._trend_counts['observation'],
         full_vlm=policy.metrics.counters['num_full_vlm_calls'],queries=queries,

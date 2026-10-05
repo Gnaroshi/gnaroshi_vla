@@ -85,7 +85,9 @@ def policy(c, variant='selected', smoke=False, k_c=8):
         if p['identity']!=identity(c) or p['repair_variant']!=variant or p['step']!=(c['smoke_steps'] if smoke else c['steps']):
             raise RuntimeError('Repair checkpoint provenance mismatch')
         return p
-    return trend_policy(c,c['selected_checkpoint']['arm'],smoke=smoke,k_c=k_c,checkpoint_loader=load)
+    mode=training_settings(c,variant).get('generation_mode','learned') if variant!='selected' else 'learned'
+    return trend_policy(c,c['selected_checkpoint']['arm'],smoke=smoke,k_c=k_c,checkpoint_loader=load,
+        generation_mode=mode)
 
 
 def sample_from_sequence(s, age):
@@ -99,6 +101,23 @@ def sample_from_sequence(s, age):
 def prediction(model,s):
     ctx=model.prepare(s['anchor'],s['anchor_images'],s['anchor_proprio'],s['valid'],s['groups'])
     return model.predict(ctx,s['age'],s['images'],s['proprio'])[0]
+
+
+def training_ages(settings):
+    k=int(settings.get('training_k_c',8))
+    if k not in (4,8): raise ValueError('Training interval must be 4 or 8')
+    return tuple(range(1,k))
+
+
+def training_action(settings,action,loop,step,condition,s):
+    mode=settings.get('generation_mode','learned')
+    if mode=='learned':
+        return differentiable_rollout(loop,step,condition,action.normalize_proprio(s['proprio']),s['noise'])
+    if mode=='naive3':
+        # Keep the official coarse Euler grid and continuous gripper latent.
+        return action.decode_action_from_condition(condition,s['proprio'],steps=3,
+            initial_noise=s['noise'],requires_grad=True,return_debug=True).final_action_latent
+    raise ValueError(mode)
 
 
 @torch.no_grad()
@@ -235,7 +254,9 @@ def load_records(c,smoke=False):
 
 
 @torch.no_grad()
-def validation(c,model,action,loop,step,heldout,records,out):
+def validation(c,model,action,loop,step,heldout,records,out,settings=None):
+    settings=settings or {}
+    ages=training_ages(settings)
     groups={}
     labels=['cached_original_states','fresh_original_states','student_states']
     if c.get('variant_settings'): labels+=['previous_student_states','current_student_states']
@@ -244,22 +265,22 @@ def validation(c,model,action,loop,step,heldout,records,out):
         if label=='cached_original_states':
             ids=_balanced_indices(heldout.identities,limit=30,seed=c['seed'])
             samples=(sample_from_sequence(move_batch(collate_exact_teacher_sequences([heldout[i]]),'cuda'),a)
-                for i in ids for a in range(1,8))
+                for i in ids for a in ages)
         else:
             driver='original' if label=='fresh_original_states' else 'student'
             source=label.split('_')[0] if label in ('previous_student_states','current_student_states') else None
-            samples=(move_batch(r,'cuda') for r in records if r['metadata']['split']=='heldout' and r['metadata']['driver']==driver
+            samples=(move_batch(r,'cuda') for r in records if r['age'] in ages and r['metadata']['split']=='heldout' and r['metadata']['driver']==driver
                 and (source is None or r['metadata']['collection_source']==source))
         for s in samples:
             condition=prediction(model,s)
-            pred=differentiable_rollout(loop,step,condition,action.normalize_proprio(s['proprio']),s['noise'])
+            pred=training_action(settings,action,loop,step,condition,s)
             values.append(dict(age=s['age'],condition_mse=float(scaled_mse(condition,s['target_condition'],s['anchor'],s['valid'])),
                 action_l1=float(action_loss(pred,action.action_space.normalize_action(s['target_action'])))))
         if not values: raise RuntimeError('Empty heldout data group')
         groups[label]=dict(queries=len(values),condition_mse=np.mean([v['condition_mse'] for v in values]),
             action_l1=np.mean([v['action_l1'] for v in values]),by_age={str(a):dict(
                 action_l1=np.mean([v['action_l1'] for v in values if v['age']==a]),
-                condition_mse=np.mean([v['condition_mse'] for v in values if v['age']==a])) for a in range(1,8)})
+                condition_mse=np.mean([v['condition_mse'] for v in values if v['age']==a])) for a in ages})
     write_json(out/'validation.json',groups)
 
 
@@ -288,6 +309,7 @@ def train(c,variant,smoke=False):
     model.load_state_dict(source['model'],strict=True)
     model.requires_grad_(True)
     settings=training_settings(c,variant)
+    ages=training_ages(settings)
     model.trend_head.requires_grad_(settings['train_trend'])
     generation,_=load_generation_checkpoint(c['generation_checkpoint'],device=device)
     generation.eval().requires_grad_(False)
@@ -296,10 +318,10 @@ def train(c,variant,smoke=False):
     frozen_b,frozen_g=state_hash(model.trend_head),state_hash(generation)
     original_model=state_hash(model)
     records=load_records(c,smoke)
-    by_age={a:sample_pool(records,settings,a) for a in range(1,8)} if settings['driver'] else {}
+    by_age={a:sample_pool(records,settings,a) for a in ages} if settings['driver'] else {}
     if any(not r for r in by_age.values()): raise RuntimeError('Training collection missing an age/driver')
     if not smoke and variant=='offline_control' and not (out/'before/validation.json').exists():
-        validation(c,model,action,loop,step_model,heldout,records,out/'before')
+        validation(c,model,action,loop,step_model,heldout,records,out/'before',settings)
     params=[p for p in model.parameters() if p.requires_grad]
     total=c['smoke_steps'] if smoke else c['steps']
     optimizer=torch.optim.AdamW(params,lr=c['learning_rate'],weight_decay=0)
@@ -315,6 +337,7 @@ def train(c,variant,smoke=False):
     contract={**source['contract'], 'steps':total,'repair_variant':variant,'source_checkpoint':c['selected_checkpoint'],
         'loss':'normalized first-five action L1 only','optimizer':'AdamW 1e-4 wd0 clip1; cosine to 0.1x, batch2 as two microbatches',
         'training_data':settings,'trend_frozen':not settings['train_trend'],
+        'generation_mode':settings.get('generation_mode','learned'),'training_ages':list(ages),
         'generation_frozen':True,'no_new_inference_operations':True}
     write_json(out/'training_contract.json',contract)
     tracker=None
@@ -331,7 +354,7 @@ def train(c,variant,smoke=False):
             optimizer=optimizer.state_dict(),scheduler=scheduler.state_dict()),latest)
     try:
         for n in trange(start+1,total+1,desc=variant,mininterval=2):
-            age=(n-1)%7+1
+            age=ages[(n-1)%len(ages)]
             rng=random.Random(c['seed']*100000+n)
             ids=[rng.randrange(len(data)) for _ in range(2)]
             samples=[sample_from_sequence(move_batch(collate_exact_teacher_sequences([data[i]]),device),age) for i in ids]
@@ -350,7 +373,7 @@ def train(c,variant,smoke=False):
                     with torch.no_grad(): exact=action.decode_action_from_condition(s['target_condition'],s['proprio'],steps=10,initial_noise=s['noise'])
                     diff=float((exact-s['target_action']).abs().max())
                     if diff>2e-4: raise RuntimeError(f'Collected/original teacher action mismatch {diff}')
-                pred=differentiable_rollout(loop,step_model,prediction(model,s),action.normalize_proprio(s['proprio']),s['noise'])
+                pred=training_action(settings,action,loop,step_model,prediction(model,s),s)
                 loss=action_loss(pred,action.action_space.normalize_action(s['target_action']))
                 if not torch.isfinite(loss): raise RuntimeError('Nonfinite training loss')
                 (loss/2).backward(); losses.append(float(loss))
@@ -373,7 +396,7 @@ def train(c,variant,smoke=False):
         raise RuntimeError('Frozen weights changed')
     if settings['train_trend'] and state_hash(model.trend_head)==frozen_b: raise RuntimeError('Trend was not trained')
     if state_hash(model)==original_model: raise RuntimeError('No model change')
-    if not smoke: validation(c,model,action,loop,step_model,heldout,records,out)
+    if not smoke: validation(c,model,action,loop,step_model,heldout,records,out,settings)
     saved=torch.load(latest,map_location='cpu',weights_only=False)
     write_json(out/'summary.json',dict(identity=run_id,verdict='SMOKE_PASS' if smoke else 'TRAIN_AND_OFFLINE_COMPLETE',steps=total,
         checkpoint=str(latest),checkpoint_sha256=sha(latest),training_seconds=saved['seconds'],parameters=sum(p.numel() for p in params),
@@ -394,7 +417,8 @@ def main():
     elif a.command=='train': train(c,a.variant,a.smoke)
     else:
         def factory(c,row,*,smoke,k_c): return policy(c,row,smoke,k_c)
-        def counts(pol,row,calls,k): return check_counts(pol,c['selected_checkpoint']['arm'],calls,k)
+        def counts(pol,row,calls,k): return check_counts(pol,c['selected_checkpoint']['arm'],calls,k,
+            generation_mode=training_settings(c,row).get('generation_mode','learned'))
         evaluate(c,a.variant,smoke=a.smoke,k_c=a.k_c,policy_factory=factory,counter_checker=counts)
 
 

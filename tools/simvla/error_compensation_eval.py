@@ -207,7 +207,7 @@ def run(c, row, *, smoke=False, k_c=4, policy_factory=None, counter_row=None, co
             for handle in handles: handle.remove()
             if env is not None: env.close()
     summary = {"verdict": "SMOKE_PASS" if smoke else "EVALUATION_COMPLETE",
-        "identity": run_id, "row": row, "k_c": k_c, "candidate_training_k_c": c.get('training_k_c',4) if row in ARMS or policy_factory else None,
+        "identity": run_id, "row": row, "k_c": k_c, "candidate_training_k_c": c.get('variant_settings',{}).get(row,{}).get('training_k_c',c.get('training_k_c',4)) if row in ARMS or policy_factory else None,
         "episodes": len(done), "successes": sum(r["success"] for r in done),
         "success_rate": sum(r["success"] for r in done) / len(done),
         "policy_ms_per_action": sum(r["policy_ms_total"] for r in done) / sum(r["episode_length"] for r in done),
