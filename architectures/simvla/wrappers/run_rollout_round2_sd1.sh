@@ -6,6 +6,10 @@ export PYTHONPATH="$ROOT" PYTHONDONTWRITEBYTECODE=1 USE_TF=0
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export WANDB_MODE="${WANDB_MODE:-online}"
 MODULE=tools.simvla.rollout_round2_pipeline
+if [ "${1:-}" = "--observation-correction" ]; then
+  MODULE=tools.simvla.observation_correction_pipeline
+  shift
+fi
 if [ "${1:-}" = "--head-matched" ]; then
   MODULE=tools.simvla.head_matched_pipeline
   shift

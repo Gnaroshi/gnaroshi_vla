@@ -23,6 +23,11 @@ export TORCHINDUCTOR_CACHE_DIR="${STORAGE}/results/simvla/compile_benchmark/pair
 cd "${ROOT}" || exit 0
 if [ "$#" -eq 0 ]; then set -- all; fi
 MODULE=tools.simvla.trend_compiled_rb2
+if [ "${1:-}" = "--observation-correction" ]; then
+  MODULE=tools.simvla.observation_correction_rb2
+  shift
+  if [ "$#" -eq 0 ]; then set -- all; fi
+fi
 if [ "${1:-}" = "--head-matched" ]; then
   MODULE=tools.simvla.head_matched_rb2
   shift
