@@ -75,3 +75,17 @@ def test_refresh_does_not_share_previous_context():
     assert fresh.age==0
     assert fresh.previous is fresh.anchor
     assert fresh is not ctx
+
+
+def test_tensor_age_preserves_every_updater_output():
+    from tools.simvla.observation_correction_eval import tensor_age_call
+    model,ctx,image,proprio=fixture('observed_recurrent')
+    code=torch.randn(1,128)
+    with torch.no_grad():
+        for head in (model.condition_updater,model.measurement):
+            for age in range(1,8):
+                kwargs=dict(valid_mask=ctx.valid,group_ids=ctx.groups,age=age)
+                a=head(ctx.anchor,code,**kwargs)
+                b=tensor_age_call(head,ctx.anchor,code,**kwargs)
+                for name in ('condition','residual','gate'):
+                    torch.testing.assert_close(getattr(a,name),getattr(b,name),rtol=0,atol=0)

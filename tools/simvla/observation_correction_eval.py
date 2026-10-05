@@ -12,6 +12,17 @@ from tools.simvla.error_compensation_eval import make_policy as original_policy,
 from tools.simvla.trend_condition_eval import ComponentTimers
 
 
+def tensor_age_call(fn, *args, **kwargs):
+    # Keep the compiled graph shared across ages and across both updater heads.
+    # Integer ages specialize the same forward frame up to 2*7 times.
+    condition = args[0]
+    age = kwargs['age']
+    if not torch.is_tensor(age):
+        kwargs['age'] = torch.full((condition.shape[0],), age,
+            device=condition.device, dtype=torch.long)
+    return fn(*args, **kwargs)
+
+
 def load_payload(path, arm, *, expected_identity=None, steps=3000):
     payload = torch.load(path, map_location='cpu', weights_only=False)
     if (payload['format']!='simvla_observation_correction_v1' or payload['arm']!=arm
@@ -42,6 +53,8 @@ def attach(policy, parent, payload, arm, interval, compiler=None):
         forward = module.forward
         def measured(*args, _fn=forward, _name=name, **kwargs):
             counts[_name] += 1
+            if compiler is not None and _name in ('condition_updater','measurement_head'):
+                return tensor_age_call(_fn, *args, **kwargs)
             return _fn(*args, **kwargs)
         module.forward = measured
     if timers is not None:
