@@ -22,7 +22,7 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.shared_refinem
 from architectures.simvla.adapters.latentloop.efficient_multirate.exact_teacher_cache import collate_exact_teacher_sequences
 from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mechanism import _balanced_indices
 
-OUTPUT = PREDECESSOR.parents[1] / 'paired_error_analysis/condition_solver_seed01_v1'
+OUTPUT = PREDECESSOR.parents[1] / 'paired_error_analysis/condition_solver_seed01_v2'
 JOBS = ('previous_joint', *ARMS, 'previous_joint_student_states')
 
 
@@ -47,6 +47,14 @@ def paired_metrics(a00, a01, a10, a11):
     return result
 
 
+def query_record(metadata, actions, times, *, condition_ms, teacher_diff, latent_mse):
+    # condition_mse measures action error induced by the Condition replacement.
+    # Keep the latent-space normalized error separate from that action metric.
+    return dict(**metadata, **paired_metrics(*actions), **times,
+        condition_prediction_ms=float(condition_ms), teacher_cache_max_abs=float(teacher_diff),
+        latent_condition_normalized_mse=float(latent_mse))
+
+
 def configuration():
     c = read_json(PREDECESSOR/'runtime_config.json')
     c.update(output=str(OUTPUT), heldout_windows=100,
@@ -65,6 +73,10 @@ def configuration():
         same_proprio=True, same_noise=True, frozen_weights=True, prefix=5,
         labels='Original10 continuous normalized actions, not demonstration labels',
         latency='Synchronized eager tensor computation on sd1; excludes preprocessing/environment, not paper policy latency')
+    c['analysis_protocol']['metric_definitions'] = dict(
+        condition_mse='MSE of (predicted Condition + original10 actions) minus (original Condition + original10 actions), first five normalized actions',
+        latent_condition_normalized_mse='Condition tensor prediction MSE normalized by anchor scale')
+    c['analysis_protocol']['recovery_from'] = str(OUTPUT.with_name('condition_solver_seed01_v1'))
     return c
 
 
@@ -112,17 +124,18 @@ def collected_samples(c):
 
 
 @torch.inference_mode()
-def analyze(c, arm):
+def analyze(c, arm, *, smoke=False):
     configure(c)
     run_id = identity(c)
-    out = OUTPUT/arm
+    out = (OUTPUT/'smoke' if smoke else OUTPUT)/arm
+    verdict = 'PAIRED_SMOKE_PASS' if smoke else 'PAIRED_ANALYSIS_COMPLETE'
     out.mkdir(parents=True, exist_ok=True)
     dest = out/'summary.json'
     if dest.exists():
         old = read_json(dest)
         if old['identity'] != run_id:
             raise RuntimeError('Analysis identity mismatch')
-        if old['verdict'] == 'PAIRED_ANALYSIS_COMPLETE':
+        if old['verdict'] == verdict:
             return
     device, parent, frozen, action, _, heldout = load_runtime(c, snapshots(c))
     checkpoint_name = 'previous_joint' if arm == 'previous_joint_student_states' else arm
@@ -158,9 +171,8 @@ def analyze(c, arm):
         if diff > 2e-4:
             raise RuntimeError(f'Original teacher cache/runtime mismatch: {diff}')
         values = [outputs[key].final_action_latent for key in ('a00','a01','a10','a11')]
-        r = dict(**metadata, **paired_metrics(*values), **times, condition_prediction_ms=condition_ms,
-            teacher_cache_max_abs=diff,
-            condition_mse=float(scaled_mse(predicted,s['target_condition'],s['anchor'],s['valid'])))
+        r = query_record(metadata, values, times, condition_ms=condition_ms, teacher_diff=diff,
+            latent_mse=scaled_mse(predicted,s['target_condition'],s['anchor'],s['valid']))
         records.append(r)
         tensors.append(torch.stack([x[0].cpu() for x in values]))
         if len(records)%20 == 0:
@@ -168,6 +180,8 @@ def analyze(c, arm):
             print(f'PAIRED arm={arm} queries={len(records)}', flush=True)
     if arm == 'previous_joint_student_states':
         for i, raw in enumerate(collected_samples(c)):
+            if smoke and i >= 7:
+                break
             s = move_batch(raw, device)
             torch.cuda.synchronize(); tick = time.perf_counter()
             pred = prediction(model, s)
@@ -176,6 +190,8 @@ def analyze(c, arm):
                 source=raw['metadata']['driver']+'_collected_states'), milliseconds)
     else:
         ids = _balanced_indices(heldout.identities, limit=c['heldout_windows'], seed=c['seed'])
+        if smoke:
+            ids = ids[:1]
         write_json(out/'selected_windows.json',dict(indices=ids,identities=[heldout.identities[i] for i in ids]))
         for index in ids:
             seq = move_batch(collate_exact_teacher_sequences([heldout[index]]), device)
@@ -194,7 +210,7 @@ def analyze(c, arm):
         raise RuntimeError('Empty paired analysis')
     torch.save(dict(order=['teacher10','teacher3','predicted10','predicted3'], actions=torch.stack(tensors)), out/'paired_actions.pt')
     write_json(out/'query_metrics.json',records)
-    write_json(dest, dict(verdict='PAIRED_ANALYSIS_COMPLETE', identity=run_id, arm=arm, queries=len(records),
+    write_json(dest, dict(verdict=verdict, identity=run_id, arm=arm, queries=len(records), smoke=smoke,
         groups=aggregate(records), checkpoint=spec, seconds=time.monotonic()-began,
         gpu=torch.cuda.get_device_name(0), action_tensor_sha256=sha(out/'paired_actions.pt'),
         protocol=c['analysis_protocol'],
@@ -203,9 +219,10 @@ def analyze(c, arm):
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--preflight',action='store_true')
+    p.add_argument('--smoke',action='store_true')
     p.add_argument('--arm',choices=JOBS); a=p.parse_args()
     if a.arm:
-        analyze(read_json(OUTPUT/'runtime_config.json'),a.arm)
+        analyze(read_json(OUTPUT/'runtime_config.json'),a.arm,smoke=a.smoke)
         return 0
     c=configuration(); OUTPUT.mkdir(parents=True,exist_ok=True)
     if (OUTPUT/'runtime_config.json').exists():
@@ -214,17 +231,26 @@ def main():
         identity(c)
     prepare(c); write_json(OUTPUT/'runtime_config.json',c)
     run_id=identity(c)
-    jobs=[dict(id=arm,cmd=[c['python'],'-u','-m',__spec__.name,'--arm',arm],
-        summary=str(OUTPUT/arm/'summary.json'),completion=dict(verdict='PAIRED_ANALYSIS_COMPLETE',identity=run_id,arm=arm)) for arm in JOBS]
+    def jobs(smoke, arms):
+        root = OUTPUT/'smoke' if smoke else OUTPUT
+        return [dict(id=arm,cmd=[c['python'],'-u','-m',__spec__.name,'--arm',arm]+(['--smoke'] if smoke else []),
+            summary=str(root/arm/'summary.json'),completion=dict(verdict='PAIRED_SMOKE_PASS' if smoke else 'PAIRED_ANALYSIS_COMPLETE',
+                identity=run_id,arm=arm,smoke=smoke)) for arm in arms]
     if a.preflight:
         print('CPU_PREFLIGHT_PASS: six bounded paired analyses, no training, no new data collection',flush=True)
         return 0
-    rc=run_queue(OUTPUT,jobs,gpus=(4,5,6,7),predecessor=PREDECESSOR,
+    smoke_rc=run_queue(OUTPUT/'smoke',jobs(True,JOBS),gpus=(4,5,6,7),predecessor=PREDECESSOR,
+        environment=lambda gpu:environment(c,gpu),cwd=ROOT)
+    if a.smoke:
+        return smoke_rc
+    from tools.simvla.gpu_followup_queue import completed
+    ready = [j['id'] for j in jobs(True,JOBS) if completed(j)]
+    rc=run_queue(OUTPUT,jobs(False,ready),gpus=(4,5,6,7),predecessor=PREDECESSOR,
         environment=lambda gpu:environment(c,gpu),cwd=ROOT)
     reports={a:read_json(OUTPUT/a/'summary.json') for a in JOBS if (OUTPUT/a/'summary.json').exists()}
     write_json(OUTPUT/'comparison_summary.json',dict(complete=len(reports)==len(JOBS),rows=reports,
         inference='Action-error decomposition on matched inputs; no claim of task SR improvement'))
-    return rc
+    return int(bool(rc or smoke_rc))
 
 
 if __name__=='__main__':

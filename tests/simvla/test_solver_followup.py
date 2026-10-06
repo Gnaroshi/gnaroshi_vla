@@ -6,7 +6,7 @@ import torch
 
 from tools.simvla import bridge_coarse_followup as bridge
 from tools.simvla import gpu_followup_queue as queue
-from tools.simvla.paired_error_analysis import paired_metrics, aggregate
+from tools.simvla.paired_error_analysis import paired_metrics, aggregate, query_record
 
 
 @pytest.mark.parametrize('row', bridge.ROWS)
@@ -84,6 +84,19 @@ def test_analysis_groups_preserve_source_interval_age():
     result = aggregate(rows)
     assert result['heldout/k8']['metrics']['condition_l1']['mean'] == 1.5
     assert result['heldout/k8/age2']['queries'] == 1
+
+
+def test_real_record_assembly_and_serialization_keep_latent_and_action_errors_separate(tmp_path):
+    zero = torch.zeros(1,10,7)
+    record = query_record(dict(source='heldout', interval=4, age=1, window=0),
+        (zero, zero, zero+2, zero+3), dict(a00_decode_ms=1.0),
+        condition_ms=2.0, teacher_diff=0.0, latent_mse=torch.tensor(.25))
+    assert record['condition_mse'] == 4.0
+    assert record['latent_condition_normalized_mse'] == .25
+    queue.write_json(tmp_path/'query_metrics.json', [record])
+    summary = aggregate(queue.read_json(tmp_path/'query_metrics.json'))
+    assert summary['all']['metrics']['condition_mse']['mean'] == 4.0
+    assert summary['all']['metrics']['latent_condition_normalized_mse']['mean'] == .25
 
 
 def test_predecessor_and_gpu_lease_exclusion(tmp_path):
