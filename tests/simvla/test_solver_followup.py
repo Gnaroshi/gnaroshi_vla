@@ -131,7 +131,7 @@ def test_queue_retry_recovery_skip_completed_and_continue_independent(tmp_path, 
     monkeypatch.setattr(queue.time, 'monotonic', lambda: clock[0])
     monkeypatch.setattr(queue.time, 'sleep', lambda n: clock.__setitem__(0, clock[0]+n))
     monkeypatch.setattr(queue, 'gpu_idle', lambda g: True)
-    monkeypatch.setattr(queue, 'predecessor_pending', lambda _: clock[0] < 10)
+    monkeypatch.setattr(queue, 'predecessor_pending', lambda _, lock_name='pipeline.lock': clock[0] < 10)
     jobs = [dict(id=k, cmd=[k], summary=str(tmp_path/(k+'.json')), completion={'verdict':'OK'})
         for k in ('existing', 'bad', 'recover', 'good')]
     queue.write_json(jobs[0]['summary'], {'verdict':'OK'})

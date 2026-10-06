@@ -22,9 +22,11 @@ def acquire_lock(path):
     return stream
 
 
-def predecessor_pending(directory):
+def predecessor_pending(directory, lock_name='pipeline.lock'):
     directory = Path(directory)
-    path = directory / 'pipeline.lock'
+    if lock_name not in ('pipeline.lock', 'queue.lock'):
+        raise ValueError('Unsupported predecessor lock name')
+    path = directory / lock_name
     if not path.exists():
         raise FileNotFoundError('Missing predecessor lock: ' + str(path))
     lock = acquire_lock(path)
@@ -64,7 +66,8 @@ def completed(job):
     return all(d.get(k) == v for k, v in job['completion'].items())
 
 
-def run_queue(output, jobs, *, gpus, predecessor, environment, cwd, timeout=28800):
+def run_queue(output, jobs, *, gpus, predecessor, environment, cwd, timeout=28800,
+              predecessor_lock_name='pipeline.lock'):
     output = Path(output)
     host = socket.gethostname()
     allowed = (4, 5, 6, 7) if host == 'jbrserver1' else (0,) if host == 'jbr-TRX50' else ()
@@ -75,7 +78,7 @@ def run_queue(output, jobs, *, gpus, predecessor, environment, cwd, timeout=2880
         raise RuntimeError('This queue already has an owner')
     lease_root = Path.home() / '.cache/gnaroshi_vla/gpu_leases' / host
     write_json(output / 'queue_plan.json', dict(host=host, gpus=gpus, jobs=jobs,
-        predecessor=str(predecessor), gpu_lease_root=str(lease_root),
+        predecessor=str(predecessor), predecessor_lock_name=predecessor_lock_name, gpu_lease_root=str(lease_root),
         policy='Wait for predecessor pending jobs, then acquire an idle GPU and shared lease; retry technical failures once; no SR gate.'))
     status_path = output / 'queue_status.json'
     old = read_json(status_path) if status_path.exists() else {}
@@ -117,7 +120,7 @@ def run_queue(output, jobs, *, gpus, predecessor, environment, cwd, timeout=2880
                     print('FAILED ' + job['id'] + ' log=' + str(log.name), flush=True)
                 else:
                     print('RETRY ' + job['id'] + ' log=' + str(log.name), flush=True)
-            waiting = predecessor_pending(predecessor)
+            waiting = predecessor_pending(predecessor, predecessor_lock_name)
             active_ids = {v[0]['id'] for v in active.values()}
             if not waiting:
                 for gpu in gpus:

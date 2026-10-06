@@ -57,7 +57,9 @@ def validate_manifest(m, suite, seed):
 
 def jobs(c):
     result = []
-    for suite, rows in [("libero_10", c["long_rows"])] + [(s, c["other_rows"]) for s in c["other_suites"]]:
+    suites = ([(s, c["long_rows"]) for s in c["benchmark_suites"]] if c.get("benchmark_suites")
+              else [("libero_10", c["long_rows"])] + [(s, c["other_rows"]) for s in c["other_suites"]])
+    for suite, rows in suites:
         for seed in c["seeds"]:
             for row in rows:
                 result.append((suite, seed, row))
@@ -77,7 +79,7 @@ def sources(c):
     return result
 
 
-def prepare(c, output):
+def prepare(c, output, *, manifest_validator=validate_manifest):
     preflight(c)
     verify_recorded_inputs(Path(c["recorded_input"]))
     if socket.gethostname() != "jbr-TRX50":
@@ -88,8 +90,9 @@ def prepare(c, output):
     for key in ("assets", "bddl_files", "init_states"):
         if not Path(settings[key]).is_dir():
             raise RuntimeError(f"LIBERO {key} directory is missing")
-    manifests = {f"{s}/{seed}": validate_manifest(read_json(manifest_path(c, s, seed)), s, seed)
-        for s in ["libero_10"] + c["other_suites"] for seed in c["seeds"]}
+    suites = c.get("benchmark_suites") or ["libero_10"] + c["other_suites"]
+    manifests = {f"{s}/{seed}": manifest_validator(read_json(manifest_path(c, s, seed)), s, seed)
+        for s in suites for seed in c["seeds"]}
     from architectures.simvla.adapters.latentloop.efficient_multirate.generation_control_contracts import FROZEN_GENERATION_CHECKPOINT_SHA256, FROZEN_NORM_STATS_SHA256
     from architectures.simvla.adapters.latentloop.efficient_multirate.fixed_2x2_contracts import FROZEN_CONDITION_CHECKPOINT_SHA256
     expected = {"condition_checkpoint": FROZEN_CONDITION_CHECKPOINT_SHA256,
@@ -178,7 +181,8 @@ def summarize_cell(directory, identity, expected):
 
 def worker(c, output, suite_name, seed, row, *, smoke=False,
            replay_factory=Replay, policy_factory=attach_policy,
-           policy_checker=check_policy, compiler_checker=check_compiler, reset_checker=check_reset):
+           policy_checker=check_policy, compiler_checker=check_compiler, reset_checker=check_reset,
+           manifest_validator=validate_manifest, suite_factory=None):
     import numpy as np
     import torch
     from libero.libero import benchmark
@@ -191,7 +195,7 @@ def worker(c, output, suite_name, seed, row, *, smoke=False,
     contract = read_json(output / "campaign_contract.json")
     if sources(c) != contract["source_files"]:
         raise RuntimeError("Source changed after campaign preparation")
-    m = validate_manifest(read_json(output / "manifests" / suite_name / seed / "episode_manifest.json"), suite_name, seed)
+    m = manifest_validator(read_json(output / "manifests" / suite_name / seed / "episode_manifest.json"), suite_name, seed)
     identity = digest({"campaign": digest(contract), "suite": suite_name, "seed": seed, "row": row, "smoke": smoke})
     directory = output / ("smoke" if smoke else "rows") / suite_name / seed / row
     specs = sorted(m["episodes"], key=lambda x: (-x["task_id"], x["trial_id"]))
@@ -217,7 +221,7 @@ def worker(c, output, suite_name, seed, row, *, smoke=False,
     with torch.inference_mode():
         replay = replay_factory(c, base_row(row), compiler, sample)
         policy = policy_factory(replay, c, row, m)
-        suite = benchmark.get_benchmark_dict()[suite_name]()
+        suite = suite_factory(m) if suite_factory else benchmark.get_benchmark_dict()[suite_name]()
         completed = successes = saved_videos = 0
         cell_start = time.monotonic()
         observations = []
