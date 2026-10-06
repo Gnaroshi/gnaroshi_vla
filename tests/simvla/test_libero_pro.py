@@ -60,15 +60,15 @@ def test_pro_manifest_keeps_500_long_protocol(monkeypatch, suite):
 def test_pro_grid():
     c = dict(benchmark_suites=pro.SUITES, long_rows=pro.ROWS, seeds=['seed01'])
     jobs = pro.campaign.jobs(c)
-    assert len(jobs) == len(set(jobs)) == 12
-    assert len(jobs)*500 == 6000
+    assert len(jobs) == len(set(jobs)) == 14
+    assert len(jobs)*500 == 7000
 
 
 @pytest.mark.parametrize('row', pro.ROWS)
 def test_exact_paths(row):
     from tools.simvla.compiled_policy import expected_counts
     q = 9
-    counts = pro.nfe.expected_counts(row, q) if row.startswith('bridge_') else expected_counts(row, q)
+    counts = pro.bridge.expected_counts(row, q) if row.startswith('bridge_') else expected_counts(row, q)
     p = SimpleNamespace(flow_steps=10, step_index=41,
         metrics=SimpleNamespace(counters={**counts, 'num_policy_queries': q}))
     pro.policy_checker(p, row)

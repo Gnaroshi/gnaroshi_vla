@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from tools.simvla import compiled_campaign as campaign, condition_nfe_sweep as nfe
+from tools.simvla import compiled_campaign as campaign, condition_nfe_sweep as nfe, bridge_coarse_followup as bridge
 from tools.simvla.compile_benchmark import ROOT, DEFAULT_CONFIG, Replay, configure, read_json, write_json
 from tools.simvla.compiled_policy import attach_policy, check_policy, check_reset
 from tools.simvla.gpu_followup_queue import run_queue
@@ -14,7 +14,7 @@ from tools.simvla.libero_pro_assets import ASSETS, STORAGE, SUITES, verify
 
 OUTPUT = STORAGE/'results/simvla/libero_pro/long_position_task_seed01_v1'
 ROWS = ('baseline', 'naive_nfe3', 'condition_naive3', 'ours_kc2_ng3',
-        'bridge_f2_nfe3', 'bridge_f3_nfe3')
+        'bridge_f2_naive3', 'bridge_f3_naive3', 'bridge_f4_naive3')
 
 
 def configuration():
@@ -26,10 +26,11 @@ def configuration():
         'campaign_module': 'tools.simvla.libero_pro_zero_shot', 'new_training': False,
         'extra_source_files': ['tools/simvla/libero_pro_zero_shot.py', 'tools/simvla/libero_pro_assets.py',
             'tools/simvla/condition_nfe_sweep.py', 'tools/simvla/gpu_followup_queue.py',
+            'tools/simvla/bridge_coarse_followup.py', 'tools/simvla/bridge_interval_sweep.py',
             'architectures/simvla/wrappers/run_libero_pro_zero_shot_rb2.sh',
             str(ASSETS/'asset_contract.json')]
             + [str(p) for p in sorted((ASSETS/'upstream/libero').rglob('*.py'))],
-        'scope': 'Zero-shot Long Position and Task variants; six frozen methods; 500 paired episodes per cell; seed01; no PRO tuning. SimVLA H10/R5, wait10, max900 retained. Not a full PRO benchmark or an online-disturbance response test.'}
+        'scope': 'Zero-shot Long Position and Task variants; seven frozen methods including Large Bridge f2/f3/f4; 500 paired episodes per cell; seed01; no PRO tuning. SimVLA H10/R5, wait10, max900 retained. Not a full PRO benchmark or an online-disturbance response test.'}
 
 
 def make_manifest(template, suite, assets):
@@ -79,19 +80,19 @@ class NumericSuite:
 
 
 def replay_factory(c, row, compiler, samples):
-    return nfe.replay_factory(c, row, compiler, samples) if row.startswith('bridge_') else Replay(c, row, compiler, samples)
+    return bridge.replay_factory(c, row, compiler, samples) if row.startswith('bridge_') else Replay(c, row, compiler, samples)
 
 
 def policy_factory(replay, c, row, manifest):
-    return nfe.make_policy(replay, c, row, manifest) if row.startswith('bridge_') else attach_policy(replay, c, row, manifest)
+    return bridge.make_policy(replay, c, row, manifest) if row.startswith('bridge_') else attach_policy(replay, c, row, manifest)
 
 
 def policy_checker(policy, row):
-    return nfe.check_policy(policy, row) if row.startswith('bridge_') else check_policy(policy, row)
+    return bridge.check_policy(policy, row) if row.startswith('bridge_') else check_policy(policy, row)
 
 
 def compiler_checker(compiler, row):
-    return nfe.check_compiler(compiler, row) if row.startswith('bridge_') else campaign.check_compiler(compiler, row)
+    return bridge.check_compiler(compiler, row) if row.startswith('bridge_') else campaign.check_compiler(compiler, row)
 
 
 def recover(suite, row, smoke=False):
@@ -136,8 +137,8 @@ def run_cell(c, suite, row):
 
 def summarize(c):
     results = [read_json(marker(s, r)) for s in SUITES for r in ROWS if marker(s, r).exists()]
-    write_json(OUTPUT/'comparison_summary.json', dict(complete=len(results)==12, rows=results,
-        scope=c['scope'], episodes_requested=6000, new_training=False))
+    write_json(OUTPUT/'comparison_summary.json', dict(complete=len(results)==len(SUITES)*len(ROWS), rows=results,
+        scope=c['scope'], episodes_requested=500*len(SUITES)*len(ROWS), new_training=False))
     with (OUTPUT/'comparison.csv').open('w', newline='') as stream:
         writer = csv.writer(stream)
         writer.writerow(['suite', 'method', 'successes', 'episodes', 'SR_percent',
@@ -193,7 +194,7 @@ def main():
                 raise RuntimeError('Unverifiable completion marker')
     summarize(c)
     if args.command == 'preflight':
-        print('PRO_CPU_PREFLIGHT_PASS: 12 cells x 500 episodes; no training or GPU evaluation started', flush=True)
+        print('PRO_CPU_PREFLIGHT_PASS: 14 cells x 500 episodes; no training or GPU evaluation started', flush=True)
         return 0
     plan = [dict(id=f'{suite}__{row}', cmd=[c['python'], '-u', '-m', 'tools.simvla.libero_pro_zero_shot',
         'cell', '--suite', suite, '--row', row], summary=str(marker(suite, row)),
