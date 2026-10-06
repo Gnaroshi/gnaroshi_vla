@@ -7,7 +7,9 @@ from tools.simvla.compile_benchmark import Replay, sha, verify_recorded_inputs, 
 from tools.simvla.compiled_policy import attach_policy, base_row, check_policy, check_reset
 
 
-def profile(c, output, suite, seed, row):
+def profile(c, output, suite, seed, row, *, replay_factory=Replay, policy_factory=attach_policy,
+            policy_checker=check_policy, reset_checker=check_reset,
+            compiler_checker=None, extra_instruments=None):
     import numpy as np
     import torch
     from tools.simvla.compile_runtime import Compiler
@@ -17,7 +19,8 @@ def profile(c, output, suite, seed, row):
     contract = read_json(output / "campaign_contract.json")
     if sources(c) != contract["source_files"]: raise RuntimeError("Source changed")
     m = read_json(output / "manifests" / suite / seed / "episode_manifest.json")
-    observations_path = output / "rows" / suite / seed / "baseline/observations.pt"
+    from pathlib import Path
+    observations_path = Path(c['profile_observations']) if c.get('profile_observations') else output / "rows" / suite / seed / "baseline/observations.pt"
     observations = torch.load(observations_path, map_location="cpu", weights_only=False)
     if len(observations) != 8: raise RuntimeError("Eight baseline query observations required")
     directory = output / "latency" / suite / seed / row
@@ -39,11 +42,11 @@ def profile(c, output, suite, seed, row):
     capture = WarningCapture()
     for name in ("torch._dynamo", "torch._inductor"): logging.getLogger(name).addHandler(capture)
     with torch.inference_mode():
-        replay = Replay(c, base_row(row), compiler, sample)
-        policy = attach_policy(replay, c, row, m)
+        replay = replay_factory(c, base_row(row), compiler, sample)
+        policy = policy_factory(replay, c, row, m)
         policy.task_id, policy.trial_id = 9, 0
         def sequence():
-            check_reset(policy)
+            reset_checker(policy)
             elapsed, actions = [], []
             for image0, image1, proprio, prompt in observations:
                 for _ in range(5):
@@ -53,10 +56,10 @@ def profile(c, output, suite, seed, row):
                     torch.cuda.synchronize()
                     elapsed.append((time.perf_counter()-start)*1000)
                     actions.append(step.action)
-            check_policy(policy, row)
+            policy_checker(policy, row)
             return elapsed, np.stack(actions)
         for _ in range(2): sequence()
-        check_compiler(compiler, row)
+        (compiler_checker or check_compiler)(compiler, row)
         before = compiler.graph_count()
         measurements = []
         for _ in range(10):
@@ -81,13 +84,15 @@ def profile(c, output, suite, seed, row):
         instrument(policy, "_decode", "action_generation_inclusive")
         instrument(replay.model, "forward_vlm_efficient", "vlm")
         instrument(replay.step, "forward", "full_action_transformer_and_decoder")
-        if replay.native is not None:
+        if replay.native is not None and extra_instruments is None:
             instrument(replay.native.delta_encoder, "forward", "observation_encoder")
             instrument(replay.native.condition_updater, "forward", "condition_updater")
         if replay.loop is not None:
             instrument(replay.loop.updater, "forward", "generation_updater")
         if replay.bridge is not None:
             instrument(replay.bridge, "predict_next", "latent_bridge")
+        if extra_instruments is not None:
+            extra_instruments(policy, replay, instrument)
         try:
             for _ in range(2): sequence()
             for values in component.values(): values.clear()

@@ -53,6 +53,11 @@ def prepare(c):
     files = [ROOT / p for p in tracked if p.endswith(".py") and p.startswith(("tools/simvla/", "methods/latentloop/", "architectures/simvla/adapters/", "architectures/simvla/wrappers/"))]
     files += list(ROOT.glob("tools/simvla/error_compensation*.py"))
     files += [ROOT / "architectures/simvla/adapters/latentloop/efficient_multirate/error_compensation_train.py"]
+    for relative in c.get("extra_source_files", ()):
+        path = ROOT / relative
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        files.append(path)
     contract = {"config": c, "source_sha256": {str(p.relative_to(ROOT)): sha(p) for p in sorted(set(files))},
         "artifacts": hashes, "snapshots": assets,
         "upstream_sources": {str(p): sha(p) for p in (Path(c["upstream"]) / "models").glob("*.py")},

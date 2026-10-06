@@ -23,6 +23,17 @@ def acquire_lock(path):
 
 
 def predecessor_pending(directory):
+    if isinstance(directory, (list, tuple)):
+        return any(predecessor_pending(item) for item in directory)
+    if isinstance(directory, dict):
+        path = Path(directory['path']) / directory.get('lock', 'queue.lock')
+        if not path.exists():
+            raise FileNotFoundError('Missing predecessor lock: ' + str(path))
+        lock = acquire_lock(path)
+        if lock is None:
+            return True
+        lock.close()
+        return False
     directory = Path(directory)
     path = directory / 'pipeline.lock'
     if not path.exists():
@@ -64,12 +75,35 @@ def completed(job):
     return all(d.get(k) == v for k, v in job['completion'].items())
 
 
+def ready(job, done):
+    if not set(job.get('deps', ())).issubset(done):
+        return False
+    marker = job.get('ready_file')
+    if marker:
+        if not Path(marker).is_file():
+            return False
+        d = read_json(marker)
+        return all(d.get(k) == v for k, v in job.get('ready_fields', {}).items())
+    return True
+
+
+def upstream_finished_without_artifact(job):
+    marker = job.get('upstream_status_file')
+    if not marker or not Path(marker).is_file():
+        return False
+    state = read_json(marker)
+    return state.get('phase') in ('complete', 'finished_with_failures') and not ready(job, set(job.get('deps', ())))
+
+
 def run_queue(output, jobs, *, gpus, predecessor, environment, cwd, timeout=28800):
     output = Path(output)
     host = socket.gethostname()
     allowed = (4, 5, 6, 7) if host == 'jbrserver1' else (0,) if host == 'jbr-TRX50' else ()
     if not gpus or any(g not in allowed for g in gpus):
         raise ValueError(f'Unauthorized GPU pool: {host} {gpus}')
+    ids = {j['id'] for j in jobs}
+    if len(ids) != len(jobs) or any(not set(j.get('deps', ())).issubset(ids) for j in jobs):
+        raise ValueError('Duplicate job IDs or unknown dependencies')
     owner = acquire_lock(output / 'queue.lock')
     if owner is None:
         raise RuntimeError('This queue already has an owner')
@@ -118,6 +152,12 @@ def run_queue(output, jobs, *, gpus, predecessor, environment, cwd, timeout=2880
                 else:
                     print('RETRY ' + job['id'] + ' log=' + str(log.name), flush=True)
             waiting = predecessor_pending(predecessor)
+            for job in jobs:
+                if job['id'] not in done | set(failed) and any(d in failed for d in job.get('deps', ())):
+                    failed[job['id']] = dict(reason='dependency_failed', dependencies=job['deps'])
+                elif job['id'] not in done | set(failed) and upstream_finished_without_artifact(job):
+                    failed[job['id']] = dict(reason='upstream_finished_without_required_artifact',
+                        status=job['upstream_status_file'])
             active_ids = {v[0]['id'] for v in active.values()}
             if not waiting:
                 for gpu in gpus:
@@ -127,7 +167,8 @@ def run_queue(output, jobs, *, gpus, predecessor, environment, cwd, timeout=2880
                     idle_since.setdefault(gpu, time.monotonic())
                     if time.monotonic()-idle_since[gpu] < 5:
                         continue
-                    job = next((j for j in jobs if j['id'] not in done | set(failed) | active_ids), None)
+                    job = next((j for j in jobs if j['id'] not in done | set(failed) | active_ids
+                                and ready(j, done)), None)
                     if job is None:
                         break
                     lease = acquire_lock(lease_root / f'gpu{gpu}.lock')
@@ -152,7 +193,9 @@ def run_queue(output, jobs, *, gpus, predecessor, environment, cwd, timeout=2880
                     active[gpu] = (job, proc, log, lease, time.monotonic())
                     active_ids.add(job['id'])
                     print(f'START gpu={gpu} job={job["id"]} pid={proc.pid}', flush=True)
-            phase = 'waiting_for_predecessor' if waiting else 'running' if active else 'waiting_for_idle_gpu'
+            awaiting_artifact = not any(ready(j, done) for j in jobs if j['id'] not in done | set(failed))
+            phase = ('waiting_for_predecessor' if waiting else 'running' if active
+                     else 'waiting_for_artifact' if awaiting_artifact else 'waiting_for_idle_gpu')
             write_json(status_path, state(phase))
             if time.monotonic()-last_report > 60:
                 print(f'QUEUE {phase}; completed={len(done)}/{len(jobs)}; active={active_ids}; failed={list(failed)}', flush=True)
