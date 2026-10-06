@@ -288,7 +288,7 @@ def main():
         from architectures.simvla.adapters.refresh_calibration.train import train
         train(c,a.variant,a.k,a.smoke); return 0
     if a.command=='sd-train-cell': sd_train_cell(c,a.variant,a.k); return 0
-    if a.command=='sd-eval': sd_eval(c,a.variant,a.k,a.smoke); summarize(c,'sd1'); return 0
+    if a.command=='sd-eval': sd_eval(c,a.variant,a.k,a.smoke); return 0
     if a.command=='rb-cell': rb_cell(c,a.variant,a.k); summarize(c,'rb2'); return 0
     if a.command=='rb-profile': rb_profile(c,a.variant,a.k); summarize(c,'rb2'); return 0
     if a.command in ('rb-smoke','rb-eval'):
