@@ -67,7 +67,7 @@ def attach(policy, payload, row, k, compiler=None):
             self._refresh_language, self.condition_layout.valid_mask, self.condition_layout.group_ids)
         self.metrics.counters["num_refresh_preparations"] += 1
         self.metrics.counters["num_calibration_writes"] += int(row == "ridge")
-        self.metrics.counters["num_observation_encoder_calls"] += int(row == "ridge")
+        self.metrics.counters["num_observation_encoder_calls"] += int(row == "ridge" or model.anchor_exact)
         return condition, action, noise
 
     def update(self, batch, *, age, policy_query_index):
@@ -101,7 +101,7 @@ def check_counts(policy, row, calls=None, k_c=None):
     expected = dict(num_full_vlm_calls=full, num_condition_updater_calls=q-full,
         num_action_transformer_calls=3*q, num_generation_decoder_only_steps=0,
         num_refresh_preparations=full, num_calibration_writes=full if row == "ridge" else 0,
-        num_observation_encoder_calls=q if row == "ridge" else q-full)
+        num_observation_encoder_calls=q if row == "ridge" or policy.native_v0.anchor_exact else q-full)
     for name, value in expected.items():
         if int(policy.metrics.counters.get(name, 0)) != value:
             raise RuntimeError(f"{row}: {name} invocation mismatch")

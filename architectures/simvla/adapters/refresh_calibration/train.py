@@ -130,6 +130,7 @@ def validate(c, model, action, heldout, bank, directory, label, k, smoke, bootst
             if wrong is not None:
                 _, state = prediction(model, batch, age, lang)
                 state.correction = wrong.correction
+                model.update_reference(state)
                 mismatch = model.predict(state, batch["image_sequence"][:, age], batch["proprio_sequence"][:, age])
                 decoded = action.decode_action_from_condition(mismatch, batch["proprio_sequence"][:, age],
                     steps=3, initial_noise=batch["explicit_noises"][:, age - 1], return_debug=True).final_action_latent
@@ -164,10 +165,14 @@ def train(c, variant, k, smoke=False):
     model = RefreshCalibratedCondition("fixed" if bootstrap else variant, **c["model"]).to(device)
     common_sha = None
     if not bootstrap:
-        common = path_for(c, "bootstrap", 8, smoke)
+        external = c.get("common_initialization")
+        common = Path(external["path"]) if external else path_for(c, "bootstrap", 8, smoke)
+        if external and sha(common) != external["sha256"]:
+            raise RuntimeError("External common initialization checksum changed")
         saved = torch.load(common, map_location="cpu", weights_only=False)
-        expected = c["smoke_steps"] if smoke else c["bootstrap_steps"]
-        if saved["identity"] != run_id or saved["step"] != expected or saved["variant"] != "bootstrap":
+        expected = external["step"] if external else c["smoke_steps"] if smoke else c["bootstrap_steps"]
+        expected_identity = external["identity"] if external else run_id
+        if saved["identity"] != expected_identity or saved["step"] != expected or saved["variant"] != "bootstrap":
             raise RuntimeError("Shared initialization is not complete")
         if set(saved["language_bank"]) != set(bank) or any(not torch.equal(saved["language_bank"][t], bank[t]) for t in bank):
             raise RuntimeError("Frozen instruction embeddings changed")

@@ -72,16 +72,19 @@ class RefreshState:
     language: torch.Tensor
     correction: torch.Tensor | None
     anchor_code: torch.Tensor | None
+    reference_features: torch.Tensor | None = None
+    reference_prediction: torch.Tensor | None = None
 
 
 class RefreshCalibratedCondition(nn.Module):
-    def __init__(self, variant, dim=960, width=64, ridge_lambda=.01):
+    def __init__(self, variant, dim=960, width=64, ridge_lambda=.01, anchor_exact=False):
         super().__init__()
         if variant not in VARIANTS:
             raise ValueError(variant)
         if ridge_lambda <= 0 or not math.isfinite(ridge_lambda):
             raise ValueError("Invalid ridge regularization")
         self.variant, self.ridge_lambda = variant, ridge_lambda
+        self.anchor_exact = bool(anchor_exact)
         self.features = ObservationFeatures(dim, width)
         self.readout = nn.Linear(width + 1, dim, bias=False)
         if variant == "anchor_input":
@@ -98,21 +101,35 @@ class RefreshCalibratedCondition(nn.Module):
         return ridge_write(x, anchor.float() - self.readout(x), valid, self.ridge_lambda)
 
     def prepare(self, anchor, images, proprio, language, valid, groups):
-        correction = code = None
+        correction = code = x = None
         if self.variant == "ridge":
             x = self.features(images, proprio, language, groups)
             correction = self.fit_correction(x, anchor, valid)
         elif self.variant == "anchor_input":
             code = self.anchor_encoder(anchor.float())
-        return RefreshState(anchor, valid, groups, language, correction, code)
+        state = RefreshState(anchor, valid, groups, language, correction, code)
+        if self.anchor_exact:
+            state.reference_features = x if x is not None else self.features(images, proprio, language, groups)
+            self.update_reference(state)
+        return state
 
-    def predict(self, state, images, proprio):
-        x = self.features(images, proprio, state.language, state.groups)
+    def update_reference(self, state):
+        if self.anchor_exact:
+            state.reference_prediction = self.mapping(state, state.reference_features)
+
+    def mapping(self, state, x):
         condition = self.readout(x)
         if self.variant == "ridge":
             condition = condition + x @ state.correction
         elif self.variant == "anchor_input":
             condition = condition + self.anchor_readout(torch.cat((x, state.anchor_code), -1))
+        return condition
+
+    def predict(self, state, images, proprio):
+        x = self.features(images, proprio, state.language, state.groups)
+        condition = self.mapping(state, x)
+        if self.anchor_exact:
+            condition = state.anchor.float() + (condition - state.reference_prediction)
         return torch.where(state.valid.unsqueeze(-1), condition, state.anchor)
 
     def initialize_common(self, state):
