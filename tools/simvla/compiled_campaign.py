@@ -330,9 +330,12 @@ def run_child(c, output, command, suite, seed, row):
     with log_path.open("a") as log:
         entry = (["-m", c["campaign_module"]] if c.get("campaign_module")
                  else [str(Path(__file__).resolve())])
+        lease_fd = os.environ.get("GNAROSHI_GPU_LEASE_FD")
+        inherited_fds = (int(lease_fd),) if lease_fd is not None else ()
         process = subprocess.Popen([sys.executable, "-u", *entry, command,
             "--suite", suite, "--seed", seed, "--row", row, "--output", str(output)], stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=True, env={**os.environ, "PYTHONHASHSEED": str(SEEDS[seed][0])})
+            start_new_session=True, pass_fds=inherited_fds,
+            env={**os.environ, "PYTHONHASHSEED": str(SEEDS[seed][0])})
         started = time.monotonic()
         try:
             while process.poll() is None:
