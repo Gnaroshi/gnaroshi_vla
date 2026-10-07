@@ -31,6 +31,15 @@ def predecessor_pending(directory):
             raise FileNotFoundError('Missing predecessor lock: ' + str(path))
         lock = acquire_lock(path)
         if lock is None:
+            if directory.get('allow_when_all_assigned'):
+                state_path = path.parent / 'queue_status.json'
+                if state_path.is_file():
+                    d = read_json(state_path)
+                    required = ('pending', 'completed', 'failed', 'active', 'total_jobs')
+                    if all(k in d for k in required):
+                        assigned = len(d['completed']) + len(d['failed']) + len(d['active'])
+                        if not d['pending'] and assigned == d['total_jobs']:
+                            return False
             return True
         lock.close()
         return False
