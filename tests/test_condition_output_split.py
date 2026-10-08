@@ -213,15 +213,16 @@ def test_extra_head_does_not_copy_patched_forward(pair):
 
 @pytest.mark.parametrize('actions',[1,5,6,39,40,41,900])
 @pytest.mark.parametrize('interval',[4,8])
-def test_full_and_light_call_counts(actions,interval):
+@pytest.mark.parametrize('nfe',[1,3])
+def test_full_and_light_call_counts(actions,interval,nfe):
     from types import SimpleNamespace
     from tools.simvla.condition_output_split_eval import check_policy
     queries=(actions+4)//5; full=(queries+interval-1)//interval; light=queries-full
     counts=dict(num_policy_queries=queries,num_full_vlm_calls=full,
         num_condition_updater_calls=light,num_action_condition_updater_calls=light,
-        num_action_transformer_calls=3*queries)
+        num_action_transformer_calls=nfe*queries)
     actual=dict(observation_encoder=light,condition_updater=light,action_condition_updater=light) if light else {}
-    policy=SimpleNamespace(k_c=interval,step_index=actions,metrics=SimpleNamespace(counters=counts),
+    policy=SimpleNamespace(k_c=interval,nfe=nfe,step_index=actions,metrics=SimpleNamespace(counters=counts),
         _condition_component_calls=actual)
     check_policy(policy)
     counts['num_action_transformer_calls']+=1

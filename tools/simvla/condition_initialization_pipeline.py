@@ -42,7 +42,7 @@ def configurations():
     return configs
 
 
-def jobs(configs):
+def jobs(configs, export_module='tools.simvla.condition_initialization_pipeline'):
     plan=[]
     for phase,c in configs.items():
         out=Path(c['output']); run_id=identity(c); path=out/'runtime_config.json'
@@ -53,7 +53,7 @@ def jobs(configs):
                 plan.append(dict(id=key,cmd=prefix+[module,'--config',str(path),'--arm',arm]+extra,
                     summary=str(summary),completion=dict(identity=run_id,**completion),deps=deps))
                 return key
-            deps=[f'fresh_3k_train_{arm}'] if phase=='fresh_10k' else []
+            deps=[f'fresh_3k_train_{arm}'] if phase=='fresh_10k' and 'fresh_3k' in configs else []
             smoke=add('smoke_train','tools.simvla.condition_output_split_train',['--smoke'],
                 out/'smoke'/arm/'summary.json',dict(verdict='SMOKE_PASS',steps=14),deps)
             env=add('smoke_env','tools.simvla.condition_output_split_eval',['--smoke','--k-c','8'],
@@ -61,7 +61,7 @@ def jobs(configs):
             trained=add('train','tools.simvla.condition_output_split_train',[],out/'train'/arm/'summary.json',
                 dict(verdict='TRAIN_AND_OFFLINE_COMPLETE',steps=c['steps']),[env])
             if phase!='fresh_3k':
-                add('export','tools.simvla.condition_initialization_pipeline',['--export'],
+                add('export',export_module,['--export'],
                     out/'exports'/f'{arm}.json',dict(verdict='BUNDLE_EXPORTED'),[trained])
     return plan
 

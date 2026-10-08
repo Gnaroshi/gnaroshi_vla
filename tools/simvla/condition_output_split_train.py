@@ -11,7 +11,6 @@ from methods.latentloop.modules.condition_output_split import ARMS, ConditionOut
 from methods.latentloop.modules.trend_condition import scaled_mse
 from methods.latentloop.modules.action_aligned_joint import action_loss
 from tools.simvla.rollout_state_repair import sample_from_sequence
-from tools.simvla.observation_correction_train import action_prediction
 from tools.simvla.error_compensation_common import configure, identity, snapshots, read_json, write_json, sha
 from architectures.simvla.adapters.latentloop.native_v0_runtime import move_batch, append_jsonl
 from architectures.simvla.adapters.latentloop.native_v0_checkpoint import atomic_torch_save
@@ -19,6 +18,29 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.shared_refinem
 from architectures.simvla.adapters.latentloop.efficient_multirate.exact_teacher_cache import collate_exact_teacher_sequences
 from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mechanism import _balanced_indices
 from architectures.simvla.adapters.latentloop.efficient_multirate.action_aligned_train import state_hash
+
+
+def student_steps(c):
+    n = c.get('student_steps', 3)
+    if type(n) is not int or n not in (1, 3):
+        raise ValueError('Student action steps must be 1 or 3')
+    return n
+
+
+def action_prediction(action, condition, s, *, steps=3, grad=True):
+    return action.decode_action_from_condition(condition, s['proprio'], steps=steps,
+        initial_noise=s['noise'], requires_grad=grad, return_debug=True).final_action_latent
+
+
+def check_continuation_contract(previous, current, c):
+    for key in ('data','heldout','batch_size','seed','teacher_steps',
+            'source_checkpoint_sha256','condition_weight','current_action_gradient','future_condition_gradient'):
+        if previous[key] != current[key]:
+            raise RuntimeError('Continuation data/objective mismatch: '+key)
+    if previous['action_mode'] != current['action_mode']:
+        if not (c.get('solver_transition') == 'naive3_to_naive1'
+                and previous['action_mode'] == 'naive3' and current['action_mode'] == 'naive1'):
+            raise RuntimeError('Unapproved continuation action solver change')
 
 
 def build_initial_model(parent, c, arm):
@@ -88,7 +110,7 @@ def validate(c, model, action, heldout, out, smoke):
                 condition,d = model.predict(ctx,age,s['images'],s['proprio'])
                 torch.cuda.synchronize(); condition_ms=1000*(time.perf_counter()-began)
                 torch.cuda.synchronize(); began=time.perf_counter()
-                predicted=action_prediction(action,condition,s,grad=False)
+                predicted=action_prediction(action,condition,s,steps=student_steps(c),grad=False)
                 torch.cuda.synchronize(); action_ms=1000*(time.perf_counter()-began)
                 target=action.action_space.normalize_action(s['target_action'])
                 record=dict(window=index,interval=interval,age=age,
@@ -118,7 +140,7 @@ def train(c, arm, smoke=False):
     optimizer=torch.optim.AdamW(model.parameters(),lr=c['learning_rate'],weight_decay=0)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,
         lambda n:lr_factor(n,total,min(c['warmup_steps'],max(1,total//10))))
-    contract=dict(arm=arm,steps=total,training_intervals=[4,8],action_mode='naive3',teacher_steps=10,
+    contract=dict(arm=arm,steps=total,training_intervals=[4,8],action_mode=f'naive{student_steps(c)}',teacher_steps=10,
         source_checkpoint_sha256=sha(c['condition_checkpoint']),data=data.contract(),heldout=heldout.contract(),
         initial_weights_sha256=initial_hash,batch_size=2,seed=c['seed'],
         condition_loss='Mean anchor-variance-scaled raw MSE at every unrolled age',
@@ -134,9 +156,9 @@ def train(c, arm, smoke=False):
             total_training_steps=c.get('sample_step_offset',0)+total)
     if continuation:
         previous=continuation['contract']
-        for key in ('data','heldout','batch_size','seed','action_mode','teacher_steps',
-                'source_checkpoint_sha256','condition_weight','current_action_gradient','future_condition_gradient'):
-            if previous[key]!=contract[key]: raise RuntimeError('Continuation data/objective mismatch: '+key)
+        check_continuation_contract(previous,contract,c)
+    if 'solver_transition' in c:
+        contract['solver_transition']=c['solver_transition']
     write_json(out/'training_contract.json',contract)
     latest=out/'latest.pt'; start=0; elapsed=0.
     if latest.exists():
@@ -177,7 +199,7 @@ def train(c, arm, smoke=False):
                 condition,bases,_=unroll(model,seq,age,interval)
                 loss_c=sum(scaled_mse(base,seq['teacher_conditions'][:,j],s['anchor'],s['valid'])
                     for j,base in enumerate(bases))/len(bases)
-                pred=action_prediction(action,condition,s)
+                pred=action_prediction(action,condition,s,steps=student_steps(c))
                 loss_a=action_loss(pred,action.action_space.normalize_action(s['target_action']))
                 loss=loss_a+c['condition_weight']*loss_c
                 if not torch.isfinite(loss): raise RuntimeError('Nonfinite loss')
