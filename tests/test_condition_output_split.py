@@ -1,4 +1,5 @@
 import copy
+import os
 
 import pytest
 import torch
@@ -6,6 +7,26 @@ from torch.nn import functional as F
 
 from methods.latentloop.modules.native_simvla_v0 import NativeSimVLAV0
 from methods.latentloop.modules.condition_output_split import ARMS,ConditionOutputSplit,geometry
+
+
+def test_rb2_environment_is_self_contained(monkeypatch):
+    from tools.simvla.condition_output_split_rb2 import environment
+    for key in ('CUBLAS_WORKSPACE_CONFIG','OMP_NUM_THREADS','TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD'):
+        monkeypatch.delenv(key,raising=False)
+    monkeypatch.setenv('MUJOCO_GL','osmesa')
+    monkeypatch.setenv('GALLIUM_DRIVER','llvmpipe')
+    monkeypatch.setenv('LIBGL_ALWAYS_SOFTWARE','1')
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES','4,5,6,7')
+    env=environment(0)
+    assert env['PATH']==os.environ['PATH']
+    assert env['CUDA_VISIBLE_DEVICES']=='0'
+    assert env['CUBLAS_WORKSPACE_CONFIG']==':4096:8'
+    assert env['MUJOCO_GL']==env['PYOPENGL_PLATFORM']=='egl'
+    assert env['OMP_NUM_THREADS']==env['MKL_NUM_THREADS']=='1'
+    assert env['TORCHINDUCTOR_COMPILE_THREADS']=='2'
+    assert env['TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD']=='1'
+    assert 'GALLIUM_DRIVER' not in env and 'LIBGL_ALWAYS_SOFTWARE' not in env
+    with pytest.raises(ValueError): environment(4)
 
 
 @pytest.fixture

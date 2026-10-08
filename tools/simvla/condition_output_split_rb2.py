@@ -78,7 +78,12 @@ def environment(gpu):
     for key in ('GALLIUM_DRIVER','LIBGL_ALWAYS_SOFTWARE','EGL_DEVICE_ID','LP_NUM_THREADS'):
         env.pop(key,None)
     env.update(CUDA_VISIBLE_DEVICES='0',MUJOCO_EGL_DEVICE_ID='0',MUJOCO_GL='egl',PYOPENGL_PLATFORM='egl',
-        USE_TF='0',TOKENIZERS_PARALLELISM='false',PYTHONPATH=str(ROOT))
+        USE_TF='0',TOKENIZERS_PARALLELISM='false',PYTHONPATH=str(ROOT),
+        CUBLAS_WORKSPACE_CONFIG=':4096:8',CUDA_DEVICE_MAX_CONNECTIONS='1',
+        OMP_NUM_THREADS='1',MKL_NUM_THREADS='1',TORCHINDUCTOR_COMPILE_THREADS='2',
+        TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD='1',PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True',
+        HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',
+        TORCHINDUCTOR_CACHE_DIR=str(STORAGE/'results/simvla/compile_benchmark/paired_long_inputs_v1/compiler_cache'))
     return env
 
 
@@ -87,6 +92,10 @@ def main():
     p.add_argument('--preflight',action='store_true'); p.add_argument('--output',type=Path)
     p.add_argument('--row',choices=ROWS); p.add_argument('--suite',default='libero_10',choices=('libero_10',))
     p.add_argument('--seed',default='seed01',choices=('seed01',)); a=p.parse_args()
+    # Direct smoke/worker invocations need the same settings as queued children,
+    # before Replay or the campaign worker creates a CUDA context.
+    environment_values=environment(0)
+    os.environ.clear(); os.environ.update(environment_values)
     c=read_json(a.output/'runtime_config.json') if a.output else base_config()
     configure(c); sys.path.insert(0,c['libero_root']); os.environ['LIBERO_CONFIG_PATH']=c['libero_config']
     if a.command in ('smoke','worker'):
