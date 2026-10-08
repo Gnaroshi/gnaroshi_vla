@@ -17,6 +17,11 @@ ROWS = {f'fresh_nfe{n}_{a}': dict(nfe=n, arm=a, mode='detached')
     for n in (1, 2) for a in matched.ARMS}
 
 
+def check_origin(contract):
+    if contract['continuation']['contract'].get('initialization') != 'fresh':
+        raise RuntimeError('Initial 3K model was not freshly initialized')
+
+
 def configuration():
     c = read_json(solver_paths(1)[0] / 'fresh_10k/runtime_config.json')
     models = {}
@@ -24,10 +29,11 @@ def configuration():
         source = solver_paths(spec['nfe'])[0] / 'fresh_10k'
         summary = read_json(source / 'train' / spec['arm'] / 'summary.json')
         if (summary['verdict'] != 'TRAIN_AND_OFFLINE_COMPLETE' or summary['total_training_steps'] != 10000
-                or summary['initialization'] != 'fresh' or sha(summary['checkpoint']) != summary['checkpoint_sha256']):
+                or summary['initialization'] != 'continuation' or sha(summary['checkpoint']) != summary['checkpoint_sha256']):
             raise RuntimeError('Fresh checkpoint contract mismatch: ' + row)
         payload = load_payload(summary['checkpoint'], spec['arm'], summary['identity'], steps=7000,
             action_mode=f'naive{spec["nfe"]}')
+        check_origin(payload['contract'])
         control = read_json(solver_paths(spec['nfe'])[0] / 'pretrained_10k/train' / spec['arm'] / 'training_contract.json')
         for key in ('arm', 'training_intervals', 'action_mode', 'teacher_steps', 'data', 'heldout',
                 'batch_size', 'seed', 'condition_loss', 'action_loss', 'condition_weight',
@@ -64,9 +70,12 @@ def jobs(c):
 def report():
     rows = {}
     comparisons = {}
+    run_id = read_json(OUTPUT / 'contract.json')['identity']
     for row, spec in ROWS.items():
         folder = OUTPUT / 'online' / f'kc4_{row}'
         episodes = [read_json(p) for p in (folder / 'episodes').glob('*.json')]
+        if any(e['identity'] != run_id or e['row'] != row or e['k_c'] != 4 for e in episodes):
+            raise RuntimeError('Mixed episode provenance: ' + row)
         actions = sum(e['episode_length'] for e in episodes)
         rows[row] = dict(episodes=len(episodes), successes=sum(e['success'] for e in episodes),
             policy_ms_per_action=sum(e['policy_ms_total'] for e in episodes) / actions if actions else None,
@@ -77,8 +86,23 @@ def report():
             comparisons[row] = dict(fresh=x, pretrained=y,
                 fresh_minus_pretrained_sr_pp=100 * (x['success_rate'] - y['success_rate']),
                 fresh_minus_pretrained_ms_per_action=x['policy_ms_per_action'] - y['policy_ms_per_action'])
-    write_json(OUTPUT / 'live_comparison.json', dict(updated_unix=time.time(), rows=rows,
-        comparisons=comparisons, timing_scope='sd1 eager only; keep rb2 compiled results separate'))
+    state_path = OUTPUT / 'queue_status.json'
+    state = read_json(state_path) if state_path.exists() else {}
+    now = time.time()
+    start = now
+    parent = matched.OUTPUT / 'live_comparison.json'
+    if state.get('phase') == 'waiting_for_predecessor' and parent.exists():
+        start = max(now, matched.datetime.fromisoformat(read_json(parent)['estimated_finish_kst']).timestamp())
+    eta = matched.estimate_remaining({'kc4_' + r: d for r, d in rows.items()},
+        state.get('active', {}), state.get('pending', []), start)
+    eta['remaining_hours'] += (start - now) / 3600
+    data = dict(updated_kst=matched.datetime.fromtimestamp(now, matched.KST).isoformat(timespec='seconds'),
+        rows=rows, comparisons=comparisons, queue=state, **eta,
+        timing_scope='sd1 eager only; keep rb2 compiled results separate')
+    write_json(OUTPUT / 'live_comparison.json', data)
+    print(f'FOLLOWUP_ETA finish={eta["estimated_finish_kst"]} remaining={eta["remaining_hours"]:.2f}h', flush=True)
+    if now >= matched.datetime.fromisoformat(matched.REVIEW_AT).timestamp() and not (OUTPUT / 'morning_snapshot.json').exists():
+        write_json(OUTPUT / 'morning_snapshot.json', data)
 
 
 def main():
