@@ -21,6 +21,48 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.condition_mech
 from architectures.simvla.adapters.latentloop.efficient_multirate.action_aligned_train import state_hash
 
 
+def build_initial_model(parent, c, arm):
+    mode=c.get('initialization','pretrained')
+    if mode not in ('pretrained','fresh','continuation'):
+        raise ValueError('Unknown initialization: '+mode)
+    if mode=='fresh':
+        from methods.latentloop.modules.native_simvla_v0 import NativeSimVLAV0
+        from architectures.simvla.adapters.latentloop.efficient_multirate.efficient_delta import install_exact_uint8_delta_path
+        ref=next(parent.parameters())
+        torch.manual_seed(c['seed'])
+        parent=NativeSimVLAV0(num_views=parent.num_views,proprio_dim=parent.proprio_dim,
+            condition_dim=parent.condition_dim,delta_dim=parent.delta_dim,rank_dim=parent.rank_dim,
+            max_tokens=parent.condition_updater.max_tokens,
+            num_token_groups=parent.condition_updater.num_token_groups).to(ref)
+        install_exact_uint8_delta_path(parent)
+    return ConditionOutputSplit(parent,arm)
+
+
+def load_continuation(model,c,arm):
+    if c.get('initialization')!='continuation':
+        return None
+    spec=c['initial_models'][arm]
+    summary=read_json(spec['summary'])
+    if (summary['identity']!=spec['identity'] or summary['steps']!=3000
+            or summary['verdict']!='TRAIN_AND_OFFLINE_COMPLETE'):
+        raise RuntimeError('Unfinished or mismatched continuation source')
+    checkpoint=summary['checkpoint']
+    if sha(checkpoint)!=summary['checkpoint_sha256']:
+        raise RuntimeError('Continuation checkpoint hash changed')
+    from tools.simvla.condition_output_split_eval import load_payload
+    saved=load_payload(checkpoint,arm,spec['identity'],steps=3000)
+    model.load_state_dict(saved['model'],strict=True)
+    return dict(checkpoint_sha256=summary['checkpoint_sha256'],identity=spec['identity'],
+        prior_steps=3000,prior_training_seconds=summary['training_seconds'],contract=saved['contract'])
+
+
+def sampling_step(c, local_step):
+    n=c.get('sample_step_offset',0)+local_step
+    if n<1: raise ValueError('Sample step must be positive')
+    interval=4 if n%2 else 8
+    return random.Random(c['seed']*100000+n),interval,((n-1)//2)%(interval-1)+1
+
+
 def unroll(model, sequence, age, interval):
     ctx = model.prepare(sequence['anchor_condition'], sequence['image_sequence'][:,0],
         sequence['proprio_sequence'][:,0], sequence['valid_mask'], sequence['group_ids'], interval)
@@ -69,7 +111,8 @@ def train(c, arm, smoke=False):
     out.mkdir(parents=True,exist_ok=True)
     run_id=identity(c)
     device,parent,frozen,action,data,heldout=load_runtime(c,snapshots(c))
-    model=ConditionOutputSplit(parent,arm).to(device).eval().requires_grad_(True)
+    model=build_initial_model(parent,c,arm).to(device).eval().requires_grad_(True)
+    continuation=load_continuation(model,c,arm)
     frozen_hash,initial_hash=state_hash(frozen),state_hash(model)
     total=c['smoke_steps'] if smoke else c['steps']
     optimizer=torch.optim.AdamW(model.parameters(),lr=c['learning_rate'],weight_decay=0)
@@ -85,6 +128,15 @@ def train(c, arm, smoke=False):
         future_condition_gradient='carry_output can reach earlier extra heads; carry_base reaches base updater and encoder',
         optimizer=dict(name='AdamW',lr=c['learning_rate'],weight_decay=0,clip=1,
             schedule='warmup then cosine to 0.1x',warmup=min(c['warmup_steps'],max(1,total//10))))
+    if 'initialization' in c:
+        contract.update(initialization=c['initialization'],sample_step_offset=c.get('sample_step_offset',0),
+            continuation=continuation,optimizer_initialization='fresh at phase start',
+            total_training_steps=c.get('sample_step_offset',0)+total)
+    if continuation:
+        previous=continuation['contract']
+        for key in ('data','heldout','batch_size','seed','action_mode','teacher_steps',
+                'source_checkpoint_sha256','condition_weight','current_action_gradient','future_condition_gradient'):
+            if previous[key]!=contract[key]: raise RuntimeError('Continuation data/objective mismatch: '+key)
     write_json(out/'training_contract.json',contract)
     latest=out/'latest.pt'; start=0; elapsed=0.
     if latest.exists():
@@ -98,7 +150,7 @@ def train(c, arm, smoke=False):
     if not smoke and c.get('wandb_project'):
         try:
             import wandb
-            tracker=wandb.init(project=c['wandb_project'],name='condition_output_split_'+arm,
+            tracker=wandb.init(project=c['wandb_project'],name=c.get('run_label','condition_output_split')+'_'+arm,
                 id=run_id[:12]+'_'+arm,resume='allow',config=contract,dir=str(out),
                 settings=wandb.Settings(init_timeout=20))
         except Exception as exc:
@@ -111,9 +163,7 @@ def train(c, arm, smoke=False):
     try:
         progress=trange(start+1,total+1,desc=arm,mininterval=2)
         for n in progress:
-            rng=random.Random(c['seed']*100000+n)
-            interval=4 if n%2 else 8
-            age=((n-1)//2)%(interval-1)+1
+            rng,interval,age=sampling_step(c,n)
             optimizer.zero_grad(set_to_none=True)
             metrics=dict(step=n,interval=interval,age=age,action_l1=0.,condition_mse=0.)
             for _ in range(2):
@@ -158,7 +208,10 @@ def train(c, arm, smoke=False):
     write_json(out/'summary.json',dict(identity=run_id,verdict='SMOKE_PASS' if smoke else 'TRAIN_AND_OFFLINE_COMPLETE',
         steps=total,checkpoint=str(latest),checkpoint_sha256=sha(latest),training_seconds=saved['seconds'],
         parameters=sum(p.numel() for p in model.parameters()),initial_weights_sha256=initial_hash,
-        architecture=arm,frozen_teacher_unchanged=True))
+        architecture=arm,frozen_teacher_unchanged=True,
+        initialization=c.get('initialization','pretrained'),
+        total_training_steps=c.get('sample_step_offset',0)+total,
+        prior_training_seconds=continuation['prior_training_seconds'] if continuation else 0))
 if __name__=='__main__':
     p=argparse.ArgumentParser(); p.add_argument('--config',required=True)
     p.add_argument('--arm',choices=ARMS,required=True); p.add_argument('--smoke',action='store_true')

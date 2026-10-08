@@ -29,6 +29,88 @@ def test_rb2_environment_is_self_contained(monkeypatch):
     with pytest.raises(ValueError): environment(4)
 
 
+def test_fresh_initialization_ignores_parent_weights():
+    from tools.simvla.condition_output_split_train import build_initial_model
+    parent=NativeSimVLAV0(condition_dim=16,max_tokens=8)
+    torch.nn.init.constant_(parent.condition_updater.up.weight,4.)
+    first=build_initial_model(copy.deepcopy(parent),dict(initialization='fresh',seed=17),'carry_output')
+    for p in parent.parameters():
+        with torch.no_grad(): p.add_(5.)
+    second=build_initial_model(parent,dict(initialization='fresh',seed=17),'carry_base')
+    for key,value in first.state_dict().items():
+        torch.testing.assert_close(value,second.state_dict()[key],rtol=0,atol=0)
+    assert first.condition_updater.up.weight.count_nonzero()==0
+    assert first.action_condition_updater.up.weight.count_nonzero()==0
+    images=torch.randint(0,256,(1,2,64,64,3),dtype=torch.uint8)
+    z=torch.randn(1,4,16); q=torch.zeros(1,8)
+    ctx=first.prepare(z,images,q,torch.ones(1,4,dtype=torch.bool),torch.zeros(1,4,dtype=torch.long),8)
+    predicted,_=first.predict(ctx,1,images,q)
+    torch.testing.assert_close(predicted,z,rtol=0,atol=0)
+
+
+def test_pretrained_initialization_keeps_base_encoder_and_weights():
+    from tools.simvla.condition_output_split_train import build_initial_model
+    parent=NativeSimVLAV0(condition_dim=16,max_tokens=8)
+    torch.nn.init.constant_(parent.condition_updater.up.weight,.4)
+    model=build_initial_model(parent,{},'carry_base')
+    assert model.delta_encoder is parent.delta_encoder
+    assert torch.all(model.condition_updater.up.weight==.4)
+    assert model.action_condition_updater.up.weight.count_nonzero()==0
+
+
+def test_phase_two_sampling_continues_without_repeating_phase_one():
+    from tools.simvla.condition_output_split_train import sampling_step
+    for step in (1,14,100,7000):
+        a,ka,aa=sampling_step(dict(seed=7,sample_step_offset=3000),step)
+        b,kb,ab=sampling_step(dict(seed=7),3000+step)
+        assert (ka,aa)==(kb,ab)
+        assert [a.randrange(100000) for _ in range(2)]==[b.randrange(100000) for _ in range(2)]
+
+
+def test_continuation_validates_and_restores_full_model(tmp_path):
+    import json
+    from tools.simvla.condition_output_split_train import load_continuation
+    from tools.simvla.compile_benchmark import sha
+    model=ConditionOutputSplit(NativeSimVLAV0(condition_dim=16,max_tokens=8),'carry_base')
+    path=tmp_path/'model.pt'; summary=tmp_path/'summary.json'
+    torch.save(dict(format='simvla_condition_output_split_v1',arm='carry_base',step=3000,identity='source',
+        contract=dict(action_mode='naive3',training_intervals=[4,8]),model=model.state_dict()),path)
+    summary.write_text(json.dumps(dict(identity='source',steps=3000,verdict='TRAIN_AND_OFFLINE_COMPLETE',
+        checkpoint=str(path),checkpoint_sha256=sha(path),training_seconds=10.)))
+    c=dict(initialization='continuation',initial_models=dict(carry_base=dict(summary=str(summary),identity='source')))
+    other=ConditionOutputSplit(NativeSimVLAV0(condition_dim=16,max_tokens=8),'carry_base')
+    restored=load_continuation(other,c,'carry_base')
+    assert restored['prior_steps']==3000
+    for key,value in model.state_dict().items():
+        torch.testing.assert_close(value,other.state_dict()[key],rtol=0,atol=0)
+    c['initial_models']['carry_base']['identity']='wrong'
+    with pytest.raises(RuntimeError): load_continuation(other,c,'carry_base')
+
+
+def test_initialization_pipeline_dependencies(tmp_path,monkeypatch):
+    from tools.simvla import condition_initialization_pipeline as pipeline
+    monkeypatch.setattr(pipeline,'identity',lambda c:'test')
+    configs={p:dict(output=str(tmp_path/p),python='python',steps=3000 if p=='fresh_3k' else 7000)
+        for p in pipeline.PHASES}
+    jobs=pipeline.jobs(configs); by_id={j['id']:j for j in jobs}
+    assert len(jobs)==len(by_id)==22
+    assert sum('_export_' in j['id'] for j in jobs)==4
+    for arm in ARMS:
+        assert by_id[f'fresh_10k_smoke_train_{arm}']['deps']==[f'fresh_3k_train_{arm}']
+        assert by_id[f'pretrained_10k_smoke_train_{arm}']['deps']==[]
+    for j in jobs:
+        assert set(j['deps']).issubset(by_id)
+
+
+def test_initialization_evaluation_does_not_repeat_three_k_rows():
+    from tools.simvla.condition_initialization_rb2 import ROWS,jobs
+    assert len(ROWS)==8
+    assert set(ROWS.values())=={(init,arm,k) for init in ('pretrained','fresh') for arm in ARMS for k in (4,8)}
+    for job in jobs():
+        assert job['completion']['episodes']==500
+        assert '_10k/' in job['ready_file']
+
+
 @pytest.fixture
 def pair():
     torch.set_num_threads(1); torch.manual_seed(42)
