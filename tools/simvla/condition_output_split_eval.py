@@ -16,7 +16,7 @@ from tools.simvla.trend_condition_eval import ComponentTimers
 def load_payload(path, arm, expected_identity=None, steps=3000, action_mode='naive3'):
     p=torch.load(path,map_location='cpu',weights_only=False)
     if (p['format']!='simvla_condition_output_split_v1' or p['arm']!=arm or p['step']!=steps
-            or action_mode not in ('naive1','naive3')
+            or action_mode not in ('naive1','naive2','naive3')
             or p['contract']['action_mode']!=action_mode or p['contract']['training_intervals']!=[4,8]):
         raise RuntimeError('Condition output split checkpoint mismatch')
     if expected_identity is not None and p['identity']!=expected_identity:
@@ -26,7 +26,7 @@ def load_payload(path, arm, expected_identity=None, steps=3000, action_mode='nai
 
 def attach(policy, parent, payload, arm, interval, compiler=None):
     nfe=int(payload['contract']['action_mode'].removeprefix('naive'))
-    if nfe not in (1,3) or policy.nfe!=nfe:
+    if nfe not in (1,2,3) or policy.nfe!=nfe:
         raise RuntimeError('Training and deployed action solver differ')
     model=ConditionOutputSplit(parent,arm).to('cuda').eval().requires_grad_(False)
     model.load_state_dict(payload['model'],strict=True)
@@ -85,7 +85,7 @@ def check_policy(policy):
     expected=dict(observation_encoder=light,condition_updater=light,action_condition_updater=light)
     if (c['num_full_vlm_calls']!=full or c.get('num_condition_updater_calls',0)!=light
             or c.get('num_action_condition_updater_calls',0)!=light
-            or policy.nfe not in (1,3) or c['num_action_transformer_calls']!=policy.nfe*queries
+            or policy.nfe not in (1,2,3) or c['num_action_transformer_calls']!=policy.nfe*queries
             or c.get('num_generation_decoder_only_steps',0)!=0
             or queries!=(policy.step_index+4)//5
             or any(policy._condition_component_calls.get(key,0)!=value for key,value in expected.items())

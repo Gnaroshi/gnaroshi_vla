@@ -213,7 +213,7 @@ def test_extra_head_does_not_copy_patched_forward(pair):
 
 @pytest.mark.parametrize('actions',[1,5,6,39,40,41,900])
 @pytest.mark.parametrize('interval',[4,8])
-@pytest.mark.parametrize('nfe',[1,3])
+@pytest.mark.parametrize('nfe',[1,2,3])
 def test_full_and_light_call_counts(actions,interval,nfe):
     from types import SimpleNamespace
     from tools.simvla.condition_output_split_eval import check_policy

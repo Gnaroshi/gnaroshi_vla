@@ -17,7 +17,19 @@ EXTRA = ['tools/simvla/condition_solver_pipeline.py', 'tools/simvla/condition_so
          'architectures/simvla/wrappers/run_condition_solver.sh']
 
 
-def configurations():
+def solver_paths(nfe):
+    if type(nfe) is not int or nfe not in (1,2):
+        raise ValueError('This continuation supports NFE1 or NFE2')
+    return (PRIOR.parent / f'solver_matched_nfe{nfe}_seed01_v1',
+            DEST if nfe==1 else DEST+'_nfe2')
+
+
+def predecessor(nfe):
+    return dict(path=str(PRIOR if nfe==1 else OUTPUT), lock='queue.lock')
+
+
+def configurations(nfe=1):
+    output, dest = solver_paths(nfe)
     configs = {}
     for phase in PHASES:
         original = read_json(PRIOR / phase / 'runtime_config.json')
@@ -27,20 +39,20 @@ def configurations():
                     or control['total_training_steps'] != 10000
                     or sha(control['checkpoint']) != control['checkpoint_sha256']):
                 raise RuntimeError('Incomplete naive3 matched control')
-        c = {**original, 'output': str(OUTPUT / phase), 'student_steps': 1,
-             'solver_transition': 'naive3_to_naive1', 'run_label': 'condition_solver_nfe1_' + phase,
-             'rb2_destination': DEST + '/' + phase,
+        c = {**original, 'output': str(output / phase), 'student_steps': nfe,
+             'solver_transition': f'naive3_to_naive{nfe}', 'run_label': f'condition_solver_nfe{nfe}_' + phase,
+             'rb2_destination': dest + '/' + phase,
              'extra_source_files': sorted(set(original['extra_source_files'] + EXTRA)),
-             'training_description': 'Reuse identical completed 3K initial models, samples 3001..10000, batch2, optimizer reset and 7K cosine. Change student naive3 to naive1 only. Original10 teacher and Condition targets, trainable modules and gradient paths unchanged. Four existing naive3 10K controls reused.',
-             'evaluation_plan': 'After both existing rb2 queues: each final model K4/K8, 500 LIBERO-Long seed01 episodes. Compiled RTX5090 full policy latency, same H10/R5. No SR stopping gate.'}
+             'training_description': f'Reuse identical completed 3K initial models, samples 3001..10000, batch2, optimizer reset and 7K cosine. Change student naive3 to naive{nfe} only. Original10 teacher and Condition targets, trainable modules and gradient paths unchanged. Four existing naive3 10K controls reused.',
+             'evaluation_plan': 'After existing rb2 queues: each final model K4/K8, 500 LIBERO-Long seed01 episodes. Compiled RTX5090 full policy latency, same H10/R5. No SR stopping gate.'}
         prepare(c)
         write_json(Path(c['output']) / 'runtime_config.json', c)
         configs[phase] = c
     return configs
 
 
-def transfer_status(status):
-    host, remote = DEST.split(':', 1)
+def transfer_status(status, dest=DEST):
+    host, remote = dest.split(':', 1)
     for attempt in range(2):
         try:
             subprocess.run(['ssh', host, 'mkdir', '-p', remote], check=True, timeout=30)
@@ -55,32 +67,34 @@ def main():
     p.add_argument('--preflight', action='store_true')
     p.add_argument('--export', action='store_true')
     p.add_argument('--config'); p.add_argument('--arm', choices=ARMS)
+    p.add_argument('--student-steps', type=int, choices=(1,2), default=1)
     a = p.parse_args()
     if a.export:
         export_arm(read_json(a.config), a.arm)
         return 0
-    configs = configurations()
+    output, dest = solver_paths(a.student_steps)
+    configs = configurations(a.student_steps)
     plan = jobs(configs, export_module='tools.simvla.condition_solver_pipeline')
-    write_json(OUTPUT / 'planned_jobs.json', plan)
+    write_json(output / 'planned_jobs.json', plan)
     if a.preflight:
-        print('CPU_PREFLIGHT_PASS: four matched 7K naive1 continuations, existing naive3 controls reused', flush=True)
+        print(f'CPU_PREFLIGHT_PASS: four matched 7K naive{a.student_steps} continuations, existing naive3 controls reused', flush=True)
         return 0
-    status = OUTPUT / 'pipeline_status.json'
-    write_json(status, dict(phase='running')); transfer_status(status)
+    status = output / 'pipeline_status.json'
+    write_json(status, dict(phase='running')); transfer_status(status, dest)
     rc = 1
     try:
-        rc = run_queue(OUTPUT, plan, gpus=(4,5,6,7),
-            predecessor=dict(path=str(PRIOR), lock='queue.lock'),
+        rc = run_queue(output, plan, gpus=(4,5,6,7),
+            predecessor=predecessor(a.student_steps),
             environment=lambda gpu: environment(configs[PHASES[0]], gpu), cwd=ROOT, timeout=12*3600)
     finally:
         rows = {}
         for phase in PHASES:
             for arm in ARMS:
-                path = OUTPUT / phase / 'train' / arm / 'summary.json'
+                path = output / phase / 'train' / arm / 'summary.json'
                 if path.exists(): rows[f'{phase}_{arm}'] = read_json(path)
-        write_json(OUTPUT / 'training_summary.json', dict(rows=rows, matched_naive3_root=str(PRIOR)))
+        write_json(output / 'training_summary.json', dict(rows=rows, matched_naive3_root=str(PRIOR)))
         write_json(status, dict(phase='complete' if not rc else 'finished_with_failures'))
-        transfer_status(status)
+        transfer_status(status, dest)
     return rc
 
 

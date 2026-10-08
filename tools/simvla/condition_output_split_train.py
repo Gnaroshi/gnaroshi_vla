@@ -22,8 +22,8 @@ from architectures.simvla.adapters.latentloop.efficient_multirate.action_aligned
 
 def student_steps(c):
     n = c.get('student_steps', 3)
-    if type(n) is not int or n not in (1, 3):
-        raise ValueError('Student action steps must be 1 or 3')
+    if type(n) is not int or n not in (1, 2, 3):
+        raise ValueError('Student action steps must be 1, 2 or 3')
     return n
 
 
@@ -38,8 +38,8 @@ def check_continuation_contract(previous, current, c):
         if previous[key] != current[key]:
             raise RuntimeError('Continuation data/objective mismatch: '+key)
     if previous['action_mode'] != current['action_mode']:
-        if not (c.get('solver_transition') == 'naive3_to_naive1'
-                and previous['action_mode'] == 'naive3' and current['action_mode'] == 'naive1'):
+        if not (previous['action_mode'] == 'naive3' and current['action_mode'] in ('naive1','naive2')
+                and c.get('solver_transition') == 'naive3_to_'+current['action_mode']):
             raise RuntimeError('Unapproved continuation action solver change')
 
 
