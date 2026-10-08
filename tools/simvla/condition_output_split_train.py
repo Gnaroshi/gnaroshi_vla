@@ -7,7 +7,7 @@ import time
 import torch
 from tqdm import trange
 
-from methods.latentloop.modules.condition_output_split import ARMS, ConditionOutputSplit, geometry
+from methods.latentloop.modules.condition_output_split import ARMS, GRADIENT_CONTRACTS, ConditionOutputSplit, geometry
 from methods.latentloop.modules.trend_condition import scaled_mse
 from methods.latentloop.modules.action_aligned_joint import action_loss
 from tools.simvla.rollout_state_repair import sample_from_sequence
@@ -32,9 +32,33 @@ def action_prediction(action, condition, s, *, steps=3, grad=True):
         initial_noise=s['noise'], requires_grad=grad, return_debug=True).final_action_latent
 
 
+def check_gradient_control(current, control, *, smoke=False):
+    keys = ('arm','training_intervals','action_mode','teacher_steps','source_checkpoint_sha256',
+        'data','heldout','initial_weights_sha256','batch_size','seed','condition_loss','action_loss',
+        'condition_weight','initialization','sample_step_offset','continuation','optimizer_initialization',
+        'solver_transition')
+    if not smoke:
+        keys += ('steps','total_training_steps','optimizer')
+    if current.get('action_gradient_mode') != 'joint' or control.get('action_gradient_mode','detached') != 'detached':
+        raise RuntimeError('Gradient comparison modes do not match')
+    for key in keys:
+        if current[key] != control[key]:
+            raise RuntimeError('Matched gradient control differs: '+key)
+
+
 def check_continuation_contract(previous, current, c):
+    gradient_change = previous.get('action_gradient_mode','detached') != current.get('action_gradient_mode','detached')
+    if gradient_change:
+        if not (c.get('gradient_transition') == 'detached_to_joint'
+                and previous.get('action_gradient_mode','detached') == 'detached'
+                and current.get('action_gradient_mode') == 'joint'
+                and tuple(previous[k] for k in ('current_action_gradient','future_condition_gradient')) == GRADIENT_CONTRACTS['detached']
+                and tuple(current[k] for k in ('current_action_gradient','future_condition_gradient')) == GRADIENT_CONTRACTS['joint']):
+            raise RuntimeError('Unapproved continuation gradient change')
     for key in ('data','heldout','batch_size','seed','teacher_steps',
             'source_checkpoint_sha256','condition_weight','current_action_gradient','future_condition_gradient'):
+        if gradient_change and key in ('current_action_gradient','future_condition_gradient'):
+            continue
         if previous[key] != current[key]:
             raise RuntimeError('Continuation data/objective mismatch: '+key)
     if previous['action_mode'] != current['action_mode']:
@@ -57,7 +81,7 @@ def build_initial_model(parent, c, arm):
             max_tokens=parent.condition_updater.max_tokens,
             num_token_groups=parent.condition_updater.num_token_groups).to(ref)
         install_exact_uint8_delta_path(parent)
-    return ConditionOutputSplit(parent,arm)
+    return ConditionOutputSplit(parent,arm,gradient_mode=c.get('action_gradient_mode','detached'))
 
 
 def load_continuation(model,c,arm):
@@ -146,19 +170,23 @@ def train(c, arm, smoke=False):
         condition_loss='Mean anchor-variance-scaled raw MSE at every unrolled age',
         action_loss='First-five normalized continuous action L1 at sampled final age, original10 same-noise target',
         condition_weight=c['condition_weight'],
-        current_action_gradient='Only action_condition_updater; base and observation feature detached at its input',
-        future_condition_gradient='carry_output can reach earlier extra heads; carry_base reaches base updater and encoder',
+        current_action_gradient=GRADIENT_CONTRACTS[model.gradient_mode][0],
+        future_condition_gradient=GRADIENT_CONTRACTS[model.gradient_mode][1],
         optimizer=dict(name='AdamW',lr=c['learning_rate'],weight_decay=0,clip=1,
             schedule='warmup then cosine to 0.1x',warmup=min(c['warmup_steps'],max(1,total//10))))
     if 'initialization' in c:
         contract.update(initialization=c['initialization'],sample_step_offset=c.get('sample_step_offset',0),
             continuation=continuation,optimizer_initialization='fresh at phase start',
             total_training_steps=c.get('sample_step_offset',0)+total)
+    if 'action_gradient_mode' in c:
+        contract.update(action_gradient_mode=model.gradient_mode,gradient_transition=c.get('gradient_transition'))
     if continuation:
         previous=continuation['contract']
         check_continuation_contract(previous,contract,c)
     if 'solver_transition' in c:
         contract['solver_transition']=c['solver_transition']
+    if 'matched_controls' in c:
+        check_gradient_control(contract,c['matched_controls'][arm]['contract'],smoke=smoke)
     write_json(out/'training_contract.json',contract)
     latest=out/'latest.pt'; start=0; elapsed=0.
     if latest.exists():
@@ -188,7 +216,7 @@ def train(c, arm, smoke=False):
             rng,interval,age=sampling_step(c,n)
             optimizer.zero_grad(set_to_none=True)
             metrics=dict(step=n,interval=interval,age=age,action_l1=0.,condition_mse=0.)
-            for _ in range(2):
+            for sample_index in range(2):
                 seq=move_batch(collate_exact_teacher_sequences([data[rng.randrange(len(data))]]),device)
                 s=sample_from_sequence(seq,age)
                 if n<=14:
@@ -201,6 +229,21 @@ def train(c, arm, smoke=False):
                     for j,base in enumerate(bases))/len(bases)
                 pred=action_prediction(action,condition,s,steps=student_steps(c))
                 loss_a=action_loss(pred,action.action_space.normalize_action(s['target_action']))
+                if model.gradient_mode == 'joint' and n == 1 and sample_index == 0:
+                    groups = {'observation_encoder':list(model.delta_encoder.parameters()),
+                        'condition_updater':list(model.condition_updater.parameters()),
+                        'action_condition_updater':list(model.action_condition_updater.parameters())}
+                    parameters = [p for ps in groups.values() for p in ps]
+                    gradients = torch.autograd.grad(loss_a,parameters,retain_graph=True,allow_unused=True)
+                    norms,offset = {},0
+                    for name,ps in groups.items():
+                        gs=gradients[offset:offset+len(ps)]; offset+=len(ps)
+                        norm=sum(float(g.detach().float().square().sum()) for g in gs if g is not None)**.5
+                        if not 0 < norm < float('inf'):
+                            raise RuntimeError('Missing/nonfinite action gradient: '+name)
+                        norms[name]=norm
+                    write_json(out/'action_gradient_check.json',dict(verdict='ACTION_GRADIENT_PASS',
+                        identity=run_id,arm=arm,student_steps=student_steps(c),norms=norms))
                 loss=loss_a+c['condition_weight']*loss_c
                 if not torch.isfinite(loss): raise RuntimeError('Nonfinite loss')
                 (loss/2).backward()

@@ -8,6 +8,15 @@ from torch.nn import functional as F
 from .native_simvla_v0 import NativeV0ObservationPair, TokenSharedConditionUpdater
 
 ARMS = ('carry_output', 'carry_base')
+GRADIENT_MODES = ('detached', 'joint')
+GRADIENT_CONTRACTS = {
+    'detached': (
+        'Only action_condition_updater; base and observation feature detached at its input',
+        'carry_output can reach earlier extra heads; carry_base reaches base updater and encoder'),
+    'joint': (
+        'Action loss reaches both updaters and observation encoder through frozen action inputs',
+        'Unbroken gradients through carried outputs; carry_base excludes earlier extra heads'),
+}
 
 
 @dataclass
@@ -23,10 +32,13 @@ class SplitContext:
 
 
 class ConditionOutputSplit(nn.Module):
-    def __init__(self, parent, arm, max_age=7):
+    def __init__(self, parent, arm, max_age=7, gradient_mode='detached'):
         super().__init__()
         if arm not in ARMS:
             raise ValueError(arm)
+        if gradient_mode not in GRADIENT_MODES:
+            raise ValueError(gradient_mode)
+        self.gradient_mode = gradient_mode
         self.arm, self.max_age = arm, max_age
         self.delta_encoder = parent.delta_encoder
         self.condition_updater = parent.condition_updater
@@ -57,9 +69,9 @@ class ConditionOutputSplit(nn.Module):
     def update(self, previous, code, *, valid_mask, group_ids, age):
         kwargs = dict(valid_mask=valid_mask, group_ids=group_ids, age=age)
         base = self.condition_updater(previous, code, **kwargs).condition
-        # Current action loss trains the extra head only. In carry_output,
-        # later condition loss can also reach it through the carried output.
-        output = self.action_condition_updater(base.detach(), code.detach(), **kwargs).condition
+        action_base, action_code = ((base.detach(), code.detach())
+            if self.gradient_mode == 'detached' else (base, code))
+        output = self.action_condition_updater(action_base, action_code, **kwargs).condition
         carried = output if self.arm == 'carry_output' else base
         return output, base, carried
 

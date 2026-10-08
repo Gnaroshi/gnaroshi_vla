@@ -6,7 +6,7 @@ from types import MethodType
 
 import torch
 
-from methods.latentloop.modules.condition_output_split import ARMS, ConditionOutputSplit
+from methods.latentloop.modules.condition_output_split import ARMS, GRADIENT_MODES, ConditionOutputSplit
 from tools.simvla.error_compensation_common import identity, read_json
 from tools.simvla.error_compensation_eval import make_policy as original_policy, run
 from tools.simvla.observation_correction_eval import tensor_age_call
@@ -21,6 +21,8 @@ def load_payload(path, arm, expected_identity=None, steps=3000, action_mode='nai
         raise RuntimeError('Condition output split checkpoint mismatch')
     if expected_identity is not None and p['identity']!=expected_identity:
         raise RuntimeError('Source identity mismatch')
+    if p['contract'].get('action_gradient_mode','detached') not in GRADIENT_MODES:
+        raise RuntimeError('Unknown checkpoint gradient contract')
     return p
 
 
@@ -28,7 +30,8 @@ def attach(policy, parent, payload, arm, interval, compiler=None):
     nfe=int(payload['contract']['action_mode'].removeprefix('naive'))
     if nfe not in (1,2,3) or policy.nfe!=nfe:
         raise RuntimeError('Training and deployed action solver differ')
-    model=ConditionOutputSplit(parent,arm).to('cuda').eval().requires_grad_(False)
+    model=ConditionOutputSplit(parent,arm,
+        gradient_mode=payload['contract'].get('action_gradient_mode','detached')).to('cuda').eval().requires_grad_(False)
     model.load_state_dict(payload['model'],strict=True)
     timers=ComponentTimers() if compiler is None else None
     counts=Counter()
