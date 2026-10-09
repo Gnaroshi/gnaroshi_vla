@@ -4,6 +4,7 @@ import csv
 import os
 from pathlib import Path
 import sys
+import subprocess
 from types import MethodType
 
 from tools.simvla import compiled_campaign as campaign
@@ -160,7 +161,7 @@ def source_audit(old):
 def reuse(row, contract, spec):
     root, original_row = REFERENCES[row]
     old = read_json(root/'campaign_contract.json')
-    for key in ('artifacts', 'hf_assets', 'libero_config', 'libero_config_sha256', 'packages', 'gpu', 'options', 'measurement'):
+    for key in ('artifacts', 'hf_assets', 'libero_config', 'libero_config_sha256', 'gpu', 'options', 'measurement'):
         if old[key] != contract[key]:
             raise RuntimeError('Reference runtime differs: ' + key)
     if old['manifest_hashes']['libero_10/seed01'] != contract['manifest_hashes']['libero_10/seed01']:
@@ -168,6 +169,7 @@ def reuse(row, contract, spec):
     if ROWS[row][0] == 'ours' and old['config']['model_checkpoint'] != spec:
         raise RuntimeError('Reference checkpoint specification differs')
     audit = source_audit(old)
+    package_change = audit_packages(old, contract)
     directory = root/'rows/libero_10/seed01'/original_row
     result = validate_reference(directory, old, original_row)
     for p in (directory/'episodes').glob('*.json'):
@@ -176,9 +178,29 @@ def reuse(row, contract, spec):
             raise RuntimeError('Reference invocation count differs')
     report = dict(verdict='EVALUATION_COMPLETE', row=row, episodes=500, reused=True, result=result,
         source=str(directory/'summary.json'), source_sha256=sha(directory/'summary.json'),
-        outcomes_sha256=sha(directory/'outcomes.csv'), audited_source_changes=audit)
+        outcomes_sha256=sha(directory/'outcomes.csv'), audited_source_changes=audit,
+        audited_package_metadata=package_change)
     write_json(OUTPUT/'completed'/f'{row}.json', report)
     return report
+
+
+def audit_packages(old, new):
+    before, after = set(old['packages']), set(new['packages'])
+    if before == after:
+        return None
+    revision = '8f1084e3132a39270c3a13ebe37270a43ece2a01'
+    editable = f'-e git+https://github.com/Lifelong-Robot-Learning/LIBERO.git@{revision}#egg=libero'
+    if before-after != {'libero==0.1.0'} or after-before != {editable}:
+        raise RuntimeError('Unreviewed package change')
+    root = Path(new['config']['libero_root'])
+    if str(root) != old['config']['libero_root']:
+        raise RuntimeError('Explicit LIBERO import path changed')
+    actual = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+    if actual != revision:
+        raise RuntimeError('LIBERO editable revision changed')
+    return dict(old=sorted(before-after), new=sorted(after-before), explicit_import_root=str(root),
+        git_revision=actual, initialization_sha256=sha(root/'libero/libero/__init__.py'),
+        reason='Both workers prepend the same explicit LIBERO root and set the same LIBERO_CONFIG_PATH; distribution metadata changed from version to editable URL.')
 
 
 def cell(c, row):

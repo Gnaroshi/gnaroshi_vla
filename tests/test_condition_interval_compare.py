@@ -112,3 +112,22 @@ def test_model_spec_is_exact_requested_checkpoint(monkeypatch):
     assert subject.model_spec()['sha256'] == subject.OURS_SHA
     monkeypatch.setattr(subject, 'ready_spec', lambda *a: dict(sha256='another'))
     with pytest.raises(RuntimeError): subject.model_spec()
+
+
+def test_package_audit_rejects_other_runtime_changes():
+    assert subject.audit_packages(dict(packages=['torch==x']), dict(packages=['torch==x'])) is None
+    with pytest.raises(RuntimeError):
+        subject.audit_packages(dict(packages=['torch==x']), dict(packages=['torch==y']))
+
+
+def test_package_audit_checks_explicit_import_root_and_revision(tmp_path, monkeypatch):
+    revision = '8f1084e3132a39270c3a13ebe37270a43ece2a01'
+    old = dict(packages=['torch==x', 'libero==0.1.0'], config=dict(libero_root=str(tmp_path)))
+    new = dict(packages=['torch==x', f'-e git+https://github.com/Lifelong-Robot-Learning/LIBERO.git@{revision}#egg=libero'], config=dict(libero_root=str(tmp_path)))
+    path = tmp_path/'libero/libero/__init__.py'; path.parent.mkdir(parents=True); path.write_text('')
+    monkeypatch.setattr(subject.subprocess, 'check_output', lambda *a, **kw: revision+'\n')
+    assert subject.audit_packages(old, new)['git_revision'] == revision
+    with pytest.raises(RuntimeError):
+        subject.audit_packages(old, {**new, 'config': dict(libero_root='different')})
+    monkeypatch.setattr(subject.subprocess, 'check_output', lambda *a, **kw: 'other\n')
+    with pytest.raises(RuntimeError): subject.audit_packages(old, new)
