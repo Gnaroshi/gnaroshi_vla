@@ -111,17 +111,19 @@ def load_continuation(model,c,arm):
         return None
     spec=c['initial_models'][arm]
     summary=read_json(spec['summary'])
-    if (summary['identity']!=spec['identity'] or summary['steps']!=3000
+    prior_steps = c.get('continuation_source_steps', 3000)
+    if (summary['identity']!=spec['identity'] or summary['steps']!=prior_steps
             or summary['verdict']!='TRAIN_AND_OFFLINE_COMPLETE'):
         raise RuntimeError('Unfinished or mismatched continuation source')
     checkpoint=summary['checkpoint']
     if sha(checkpoint)!=summary['checkpoint_sha256']:
         raise RuntimeError('Continuation checkpoint hash changed')
     from tools.simvla.condition_output_split_eval import load_payload
-    saved=load_payload(checkpoint,arm,spec['identity'],steps=3000)
+    saved=load_payload(checkpoint,arm,spec['identity'],steps=prior_steps,
+        action_mode=c.get('continuation_source_action_mode', 'naive3'))
     model.load_state_dict(saved['model'],strict=True)
     return dict(checkpoint_sha256=summary['checkpoint_sha256'],identity=spec['identity'],
-        prior_steps=3000,prior_training_seconds=summary['training_seconds'],contract=saved['contract'])
+        prior_steps=prior_steps,prior_training_seconds=summary['training_seconds'],contract=saved['contract'])
 
 
 def sampling_step(c, local_step):
@@ -131,14 +133,42 @@ def sampling_step(c, local_step):
     return random.Random(c['seed']*100000+n),interval,((n-1)//2)%(interval-1)+1
 
 
-def unroll(model, sequence, age, interval):
+def unroll(model, sequence, age, interval, *, codes=None):
     ctx = model.prepare(sequence['anchor_condition'], sequence['image_sequence'][:,0],
         sequence['proprio_sequence'][:,0], sequence['valid_mask'], sequence['group_ids'], interval)
     bases = []
-    for j in range(1, age+1):
-        output, diagnostics = model.predict(ctx,j,sequence['image_sequence'][:,j],sequence['proprio_sequence'][:,j])
-        bases.append(diagnostics['base'])
+    handle = model.delta_encoder.register_forward_hook(lambda _m, _inputs, output: codes.append(output)) if codes is not None else None
+    try:
+        for j in range(1, age+1):
+            output, diagnostics = model.predict(ctx,j,sequence['image_sequence'][:,j],sequence['proprio_sequence'][:,j])
+            bases.append(diagnostics['base'])
+    finally:
+        if handle is not None: handle.remove()
     return output, bases, diagnostics
+
+
+@torch.no_grad()
+def validate_features(c, model, auxiliary, heldout, out, smoke):
+    indices = _balanced_indices(heldout.identities, limit=2 if smoke else 30, seed=c['seed'])
+    records = []
+    previous_codes = {}
+    for index in indices:
+        sequence = move_batch(collate_exact_teacher_sequences([heldout[index]]), 'cuda')
+        for interval in (4, 8):
+            codes = []
+            unroll(model, sequence, interval-1, interval, codes=codes)
+            _, values = auxiliary.objective(codes, sequence, c['feature_alignment']['mode'])
+            _, zero = auxiliary.objective([torch.zeros_like(x) for x in codes], sequence,
+                c['feature_alignment']['mode'])
+            record = dict(window=index, interval=interval, **{k:float(v) for k,v in values.items()},
+                zero_code={k:float(v) for k,v in zero.items()})
+            if interval in previous_codes:
+                _, other = auxiliary.objective(previous_codes[interval], sequence,c['feature_alignment']['mode'])
+                record['other_window_code'] = {k:float(v) for k,v in other.items()}
+            previous_codes[interval] = [x.detach() for x in codes]
+            records.append(record)
+    write_json(out/'feature_validation.json', dict(records=records,
+        target='Image-token LayerNorm(original condition), or consecutive difference; cached teacher, heldout episodes'))
 
 
 @torch.no_grad()
@@ -188,7 +218,13 @@ def train(c, arm, smoke=False):
     continuation=load_continuation(model,c,arm)
     frozen_hash,initial_hash=state_hash(frozen),state_hash(model)
     total=c['smoke_steps'] if smoke else c['steps']
-    optimizer=torch.optim.AdamW(model.parameters(),lr=c['learning_rate'],weight_decay=0)
+    auxiliary = None
+    if c.get('feature_alignment', {}).get('mode', 'none') != 'none':
+        from methods.latentloop.modules.condition_feature_supervision import ConditionFeatureSupervision
+        auxiliary = ConditionFeatureSupervision(model.delta_dim, model.condition_dim,
+            model.condition_updater.max_tokens, c['seed']).to(device)
+    trainable = list(model.parameters()) + (list(auxiliary.parameters()) if auxiliary is not None else [])
+    optimizer=torch.optim.AdamW(trainable,lr=c['learning_rate'],weight_decay=0)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,
         lambda n:lr_factor(n,total,min(c['warmup_steps'],max(1,total//10))))
     contract=dict(arm=arm,steps=total,training_intervals=[4,8],action_mode=f'naive{student_steps(c)}',teacher_steps=10,
@@ -212,6 +248,8 @@ def train(c, arm, smoke=False):
             action_loss='Mean first-five normalized continuous action L1 over paired noise targets at sampled final age',
             noise_contract='Cached original10 target plus independently seeded Gaussian original10 targets; same noise per teacher/student pair; updater inputs independent of noise',
             heldout_action_noise_samples=c.get('heldout_action_noise_samples', 1))
+    if 'feature_alignment' in c:
+        contract['feature_alignment'] = c['feature_alignment']
     if continuation:
         previous=continuation['contract']
         check_continuation_contract(previous,contract,c)
@@ -226,6 +264,8 @@ def train(c, arm, smoke=False):
         if saved['identity']!=run_id or saved['contract']!=contract:
             raise RuntimeError('Incompatible resume')
         model.load_state_dict(saved['model'],strict=True)
+        if auxiliary is not None:
+            auxiliary.load_state_dict(saved['feature_reader'], strict=True)
         optimizer.load_state_dict(saved['optimizer']); scheduler.load_state_dict(saved['scheduler'])
         start,elapsed=saved['step'],saved['seconds']
     began=time.monotonic(); tracker=None
@@ -240,14 +280,15 @@ def train(c, arm, smoke=False):
     def save(n):
         atomic_torch_save(dict(format='simvla_condition_output_split_v1',identity=run_id,arm=arm,
             step=n,contract=contract,model=model.state_dict(),optimizer=optimizer.state_dict(),
-            scheduler=scheduler.state_dict(),seconds=elapsed+time.monotonic()-began),latest)
+            scheduler=scheduler.state_dict(),seconds=elapsed+time.monotonic()-began,
+            **({'feature_reader':auxiliary.state_dict()} if auxiliary is not None else {})),latest)
         print(f'CHECKPOINT step={n} path={latest}',flush=True)
     try:
         progress=trange(start+1,total+1,desc=arm,mininterval=2)
         for n in progress:
             rng,interval,age=sampling_step(c,n)
             optimizer.zero_grad(set_to_none=True)
-            metrics=dict(step=n,interval=interval,age=age,action_l1=0.,condition_mse=0.)
+            metrics=dict(step=n,interval=interval,age=age,action_l1=0.,condition_mse=0.,feature_loss=0.)
             for sample_index in range(2):
                 seq=move_batch(collate_exact_teacher_sequences([data[rng.randrange(len(data))]]),device)
                 s=sample_from_sequence(seq,age)
@@ -256,7 +297,8 @@ def train(c, arm, smoke=False):
                         teacher=action.decode_action_from_condition(s['target_condition'],s['proprio'],steps=10,initial_noise=s['noise'])
                     difference=float((teacher-s['target_action']).abs().max())
                     if difference>2e-4: raise RuntimeError(f'Cache/runtime mismatch {difference}')
-                condition,bases,_=unroll(model,seq,age,interval)
+                codes = [] if auxiliary is not None else None
+                condition,bases,_=unroll(model,seq,age,interval,codes=codes)
                 loss_c=sum(scaled_mse(base,seq['teacher_conditions'][:,j],s['anchor'],s['valid'])
                     for j,base in enumerate(bases))/len(bases)
                 pairs = noise_supervision(c, action, s, c.get('sample_step_offset', 0)+n, sample_index)
@@ -280,11 +322,28 @@ def train(c, arm, smoke=False):
                     write_json(out/'action_gradient_check.json',dict(verdict='ACTION_GRADIENT_PASS',
                         identity=run_id,arm=arm,student_steps=student_steps(c),norms=norms))
                 loss=loss_a+c['condition_weight']*loss_c
+                if auxiliary is not None:
+                    feature_loss, feature_values = auxiliary.objective(codes,seq,c['feature_alignment']['mode'])
+                    if n == 1 and sample_index == 0:
+                        gs = torch.autograd.grad(feature_loss, tuple(model.delta_encoder.parameters()),
+                            retain_graph=True, allow_unused=True)
+                        encoder_norm = sum(float(g.detach().square().sum()) for g in gs if g is not None)**.5
+                        if not 0 < encoder_norm < float('inf'):
+                            raise RuntimeError('Missing direct feature-supervision encoder gradient')
+                        write_json(out/'feature_gradient_check.json',dict(verdict='FEATURE_GRADIENT_PASS',
+                            identity=run_id,encoder_gradient_norm=encoder_norm,teacher_target_requires_grad=False))
+                    loss = loss + c['feature_alignment']['weight']*feature_loss
+                    metrics['feature_loss'] += float(feature_loss.detach())/2
+                    for key,value in feature_values.items():
+                        metric='feature_'+key+'_mse'
+                        metrics[metric]=metrics.get(metric,0.)+float(value.detach())/2
                 if not torch.isfinite(loss): raise RuntimeError('Nonfinite loss')
                 (loss/2).backward()
                 metrics['action_l1']+=float(loss_a.detach())/2
                 metrics['condition_mse']+=float(loss_c.detach())/2
             norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True)
+            if auxiliary is not None:
+                torch.nn.utils.clip_grad_norm_(auxiliary.parameters(),1.,error_if_nonfinite=True)
             if not norm>0: raise RuntimeError('Missing gradients')
             assert_frozen(frozen)
             optimizer.step(); scheduler.step()
@@ -304,10 +363,13 @@ def train(c, arm, smoke=False):
     if state_hash(frozen)!=frozen_hash: raise RuntimeError('Frozen model changed')
     if start==0 and state_hash(model)==initial_hash: raise RuntimeError('Unchanged trainable model')
     validate(c,model,action,heldout,out,smoke)
+    if auxiliary is not None:
+        validate_features(c,model,auxiliary,heldout,out,smoke)
     saved=torch.load(latest,map_location='cpu',weights_only=False)
     write_json(out/'summary.json',dict(identity=run_id,verdict='SMOKE_PASS' if smoke else 'TRAIN_AND_OFFLINE_COMPLETE',
         steps=total,checkpoint=str(latest),checkpoint_sha256=sha(latest),training_seconds=saved['seconds'],
         parameters=sum(p.numel() for p in model.parameters()),initial_weights_sha256=initial_hash,
+        training_only_parameters=sum(p.numel() for p in auxiliary.parameters()) if auxiliary is not None else 0,
         architecture=arm,frozen_teacher_unchanged=True,
         initialization=c.get('initialization','pretrained'),
         total_training_steps=c.get('sample_step_offset',0)+total,
