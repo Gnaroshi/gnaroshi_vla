@@ -17,7 +17,8 @@ def load_payload(path, arm, expected_identity=None, steps=3000, action_mode='nai
     p=torch.load(path,map_location='cpu',weights_only=False)
     if (p['format']!='simvla_condition_output_split_v1' or p['arm']!=arm or p['step']!=steps
             or action_mode not in ('naive1','naive3')
-            or p['contract']['action_mode']!=action_mode or p['contract']['training_intervals']!=[4,8]):
+            or p['contract']['action_mode']!=action_mode
+            or p['contract']['training_intervals'] not in ([4,8],[2],[3],[4])):
         raise RuntimeError('Condition output split checkpoint mismatch')
     if expected_identity is not None and p['identity']!=expected_identity:
         raise RuntimeError('Source identity mismatch')
@@ -105,7 +106,7 @@ def make_policy(c,arm,*,smoke=False,k_c=8):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(); p.add_argument('--config',required=True)
-    p.add_argument('--arm',choices=ARMS,required=True); p.add_argument('--k-c',type=int,choices=(4,8),required=True)
+    p.add_argument('--arm',choices=ARMS,required=True); p.add_argument('--k-c',type=int,choices=(2,3,4,8),required=True)
     p.add_argument('--smoke',action='store_true'); a=p.parse_args()
     def checker(policy,row,calls,k):
         result=check_policy(policy)

@@ -32,6 +32,7 @@ def test_continuation_only_allows_explicit_solver_transition():
     keys=('data','heldout','batch_size','seed','teacher_steps','source_checkpoint_sha256',
           'condition_weight','current_action_gradient','future_condition_gradient')
     previous={key:'identical' for key in keys}; previous['action_mode']='naive3'
+    previous['training_intervals']=[4,8]
     current={**previous,'action_mode':'naive1'}
     with pytest.raises(RuntimeError): check_continuation_contract(previous,current,{})
     allowed=dict(solver_transition='naive3_to_naive1')

@@ -41,6 +41,10 @@ def check_continuation_contract(previous, current, c):
         if not (c.get('solver_transition') == 'naive3_to_naive1'
                 and previous['action_mode'] == 'naive3' and current['action_mode'] == 'naive1'):
             raise RuntimeError('Unapproved continuation action solver change')
+    if previous['training_intervals'] != current['training_intervals']:
+        expected = dict(source=previous['training_intervals'], target=current['training_intervals'])
+        if c.get('interval_transition') != expected:
+            raise RuntimeError('Unapproved continuation interval change')
 
 
 def build_initial_model(parent, c, arm):
@@ -65,24 +69,36 @@ def load_continuation(model,c,arm):
         return None
     spec=c['initial_models'][arm]
     summary=read_json(spec['summary'])
-    if (summary['identity']!=spec['identity'] or summary['steps']!=3000
+    source_steps=c.get('continuation_source_steps',3000)
+    if (summary['identity']!=spec['identity'] or summary['steps']!=source_steps
             or summary['verdict']!='TRAIN_AND_OFFLINE_COMPLETE'):
         raise RuntimeError('Unfinished or mismatched continuation source')
     checkpoint=summary['checkpoint']
     if sha(checkpoint)!=summary['checkpoint_sha256']:
         raise RuntimeError('Continuation checkpoint hash changed')
     from tools.simvla.condition_output_split_eval import load_payload
-    saved=load_payload(checkpoint,arm,spec['identity'],steps=3000)
+    saved=load_payload(checkpoint,arm,spec['identity'],steps=source_steps,
+        action_mode=c.get('continuation_source_action_mode','naive3'))
     model.load_state_dict(saved['model'],strict=True)
     return dict(checkpoint_sha256=summary['checkpoint_sha256'],identity=spec['identity'],
-        prior_steps=3000,prior_training_seconds=summary['training_seconds'],contract=saved['contract'])
+        prior_steps=summary.get('total_training_steps',source_steps),
+        prior_training_seconds=summary['training_seconds']+summary.get('prior_training_seconds',0),
+        contract=saved['contract'])
+
+
+def training_intervals(c):
+    values=c.get('training_intervals',[4,8])
+    if values not in ([4,8],[2],[3],[4]) or any(type(x) is not int for x in values):
+        raise ValueError('Unsupported training intervals')
+    return values
 
 
 def sampling_step(c, local_step):
     n=c.get('sample_step_offset',0)+local_step
     if n<1: raise ValueError('Sample step must be positive')
-    interval=4 if n%2 else 8
-    return random.Random(c['seed']*100000+n),interval,((n-1)//2)%(interval-1)+1
+    intervals=training_intervals(c)
+    interval=intervals[(n-1)%len(intervals)]
+    return random.Random(c['seed']*100000+n),interval,((n-1)//len(intervals))%(interval-1)+1
 
 
 def unroll(model, sequence, age, interval):
@@ -101,7 +117,7 @@ def validate(c, model, action, heldout, out, smoke):
     records = []
     for index in indices:
         sequence = move_batch(collate_exact_teacher_sequences([heldout[index]]),'cuda')
-        for interval in (4,8):
+        for interval in c.get('offline_validation_intervals',[4,8]):
             ctx = model.prepare(sequence['anchor_condition'],sequence['image_sequence'][:,0],
                 sequence['proprio_sequence'][:,0],sequence['valid_mask'],sequence['group_ids'],interval)
             for age in range(1,interval):
@@ -140,7 +156,7 @@ def train(c, arm, smoke=False):
     optimizer=torch.optim.AdamW(model.parameters(),lr=c['learning_rate'],weight_decay=0)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,
         lambda n:lr_factor(n,total,min(c['warmup_steps'],max(1,total//10))))
-    contract=dict(arm=arm,steps=total,training_intervals=[4,8],action_mode=f'naive{student_steps(c)}',teacher_steps=10,
+    contract=dict(arm=arm,steps=total,training_intervals=training_intervals(c),action_mode=f'naive{student_steps(c)}',teacher_steps=10,
         source_checkpoint_sha256=sha(c['condition_checkpoint']),data=data.contract(),heldout=heldout.contract(),
         initial_weights_sha256=initial_hash,batch_size=2,seed=c['seed'],
         condition_loss='Mean anchor-variance-scaled raw MSE at every unrolled age',
@@ -159,6 +175,8 @@ def train(c, arm, smoke=False):
         check_continuation_contract(previous,contract,c)
     if 'solver_transition' in c:
         contract['solver_transition']=c['solver_transition']
+    if 'interval_transition' in c:
+        contract['interval_transition']=c['interval_transition']
     write_json(out/'training_contract.json',contract)
     latest=out/'latest.pt'; start=0; elapsed=0.
     if latest.exists():
