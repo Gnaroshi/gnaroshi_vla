@@ -50,7 +50,7 @@ class ConditionOutputSplit(nn.Module):
         nn.init.zeros_(self.action_condition_updater.up.bias)
 
     def prepare(self, anchor, images, proprio, valid_mask, group_ids, interval=8):
-        if interval not in (4, 8) or interval - 1 > self.max_age:
+        if type(interval) is not int or interval not in (2, 3, 4, 8) or interval - 1 > self.max_age:
             raise ValueError('Unsupported refresh interval')
         return SplitContext(anchor, anchor, images, proprio, valid_mask.bool(), group_ids, interval)
 
