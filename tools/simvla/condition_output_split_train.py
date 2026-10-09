@@ -1,5 +1,6 @@
 """Paired 3K training with explicit condition/action gradient routing."""
 import argparse
+import hashlib
 from pathlib import Path
 import random
 import time
@@ -30,6 +31,27 @@ def student_steps(c):
 def action_prediction(action, condition, s, *, steps=3, grad=True):
     return action.decode_action_from_condition(condition, s['proprio'], steps=steps,
         initial_noise=s['noise'], requires_grad=grad, return_debug=True).final_action_latent
+
+
+def noise_supervision(c, action, sample, step, sample_index, *, heldout=False):
+    """Keep paired teacher/student noise; local RNG never changes window sampling."""
+    count = c.get('heldout_action_noise_samples' if heldout else 'action_noise_samples', 1)
+    if type(count) is not int or count not in (1, 2, 3):
+        raise ValueError('Unsupported noise sample count')
+    pairs = [(sample, action.action_space.normalize_action(sample['target_action']).detach())]
+    scope = 'heldout' if heldout else 'train'
+    for index in range(1, count):
+        key = f"condition_noise:{scope}:{c['seed']}:{step}:{sample_index}:{index}"
+        seed = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], 'little') % (2**63 - 1)
+        generator = torch.Generator(device=sample['noise'].device).manual_seed(seed)
+        noise = torch.randn(sample['noise'].shape, generator=generator,
+            device=sample['noise'].device, dtype=sample['noise'].dtype)
+        with torch.no_grad():
+            target = action.decode_action_from_condition(sample['target_condition'],
+                sample['proprio'], steps=10, initial_noise=noise)
+            target = action.action_space.normalize_action(target).detach()
+        pairs.append(({**sample, 'noise': noise}, target))
+    return pairs
 
 
 def check_gradient_control(current, control, *, smoke=False):
@@ -144,6 +166,11 @@ def validate(c, model, action, heldout, out, smoke):
                     output=geometry(condition,s['target_condition'],s['valid']))
                 if age==1:
                     record['hold']=geometry(s['anchor'],s['target_condition'],s['valid'])
+                if c.get('heldout_action_noise_samples', 1) > 1:
+                    pairs = noise_supervision(c, action, s, index, age, heldout=True)
+                    record['unseen_noise_action_l1'] = [float(action_loss(
+                        action_prediction(action, condition, extra, steps=student_steps(c), grad=False), target))
+                        for extra, target in pairs[1:]]
                 records.append(record)
     write_json(out/'validation.json',dict(records=records,indices=indices,
         identities=[heldout.identities[i] for i in indices],
@@ -180,6 +207,11 @@ def train(c, arm, smoke=False):
             total_training_steps=c.get('sample_step_offset',0)+total)
     if 'action_gradient_mode' in c:
         contract.update(action_gradient_mode=model.gradient_mode,gradient_transition=c.get('gradient_transition'))
+    if 'action_noise_samples' in c:
+        contract.update(action_noise_samples=c['action_noise_samples'],
+            action_loss='Mean first-five normalized continuous action L1 over paired noise targets at sampled final age',
+            noise_contract='Cached original10 target plus independently seeded Gaussian original10 targets; same noise per teacher/student pair; updater inputs independent of noise',
+            heldout_action_noise_samples=c.get('heldout_action_noise_samples', 1))
     if continuation:
         previous=continuation['contract']
         check_continuation_contract(previous,contract,c)
@@ -227,9 +259,12 @@ def train(c, arm, smoke=False):
                 condition,bases,_=unroll(model,seq,age,interval)
                 loss_c=sum(scaled_mse(base,seq['teacher_conditions'][:,j],s['anchor'],s['valid'])
                     for j,base in enumerate(bases))/len(bases)
-                pred=action_prediction(action,condition,s,steps=student_steps(c))
-                loss_a=action_loss(pred,action.action_space.normalize_action(s['target_action']))
-                if model.gradient_mode == 'joint' and n == 1 and sample_index == 0:
+                pairs = noise_supervision(c, action, s, c.get('sample_step_offset', 0)+n, sample_index)
+                loss_a = sum(action_loss(action_prediction(action, condition, item, steps=student_steps(c)), target)
+                    for item, target in pairs) / len(pairs)
+                # Zero-initialized residuals learn their output projection before encoder gradients open.
+                gradient_check_step = 2 if c.get('initialization') == 'fresh' else 1
+                if model.gradient_mode == 'joint' and n == gradient_check_step and sample_index == 0:
                     groups = {'observation_encoder':list(model.delta_encoder.parameters()),
                         'condition_updater':list(model.condition_updater.parameters()),
                         'action_condition_updater':list(model.action_condition_updater.parameters())}
