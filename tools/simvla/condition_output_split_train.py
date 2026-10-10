@@ -35,6 +35,11 @@ def action_prediction(action, condition, s, *, steps=3, grad=True):
 def check_continuation_contract(previous, current, c):
     for key in ('data','heldout','batch_size','seed','teacher_steps',
             'source_checkpoint_sha256','condition_weight','current_action_gradient','future_condition_gradient'):
+        if key == 'future_condition_gradient' and c.get('freeze_condition_predictor'):
+            if (previous[key] != 'carry_output can reach earlier extra heads; carry_base reaches base updater and encoder'
+                    or current[key] != 'Frozen delta_encoder and condition_updater at every age'):
+                raise RuntimeError('Unexpected frozen-condition gradient transition')
+            continue
         if previous[key] != current[key]:
             raise RuntimeError('Continuation data/objective mismatch: '+key)
     if previous['action_mode'] != current['action_mode']:
@@ -111,6 +116,20 @@ def unroll(model, sequence, age, interval):
     return output, bases, diagnostics
 
 
+def configure_trainable_modules(model, c):
+    model.requires_grad_(True)
+    if c.get('freeze_condition_predictor', False):
+        if model.arm != 'carry_base':
+            raise ValueError('Fixed predictor requires carry_base')
+        model.delta_encoder.requires_grad_(False)
+        model.condition_updater.requires_grad_(False)
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def condition_predictor_hash(model):
+    return state_hash(torch.nn.ModuleDict(dict(encoder=model.delta_encoder,updater=model.condition_updater)))
+
+
 @torch.no_grad()
 def validate(c, model, action, heldout, out, smoke):
     indices = _balanced_indices(heldout.identities,limit=2 if smoke else 30,seed=c['seed'])
@@ -151,9 +170,11 @@ def train(c, arm, smoke=False):
     device,parent,frozen,action,data,heldout=load_runtime(c,snapshots(c))
     model=build_initial_model(parent,c,arm).to(device).eval().requires_grad_(True)
     continuation=load_continuation(model,c,arm)
+    trainable=configure_trainable_modules(model,c)
+    predictor_hash=condition_predictor_hash(model)
     frozen_hash,initial_hash=state_hash(frozen),state_hash(model)
     total=c['smoke_steps'] if smoke else c['steps']
-    optimizer=torch.optim.AdamW(model.parameters(),lr=c['learning_rate'],weight_decay=0)
+    optimizer=torch.optim.AdamW(trainable,lr=c['learning_rate'],weight_decay=0)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,
         lambda n:lr_factor(n,total,min(c['warmup_steps'],max(1,total//10))))
     contract=dict(arm=arm,steps=total,training_intervals=training_intervals(c),action_mode=f'naive{student_steps(c)}',teacher_steps=10,
@@ -170,6 +191,11 @@ def train(c, arm, smoke=False):
         contract.update(initialization=c['initialization'],sample_step_offset=c.get('sample_step_offset',0),
             continuation=continuation,optimizer_initialization='fresh at phase start',
             total_training_steps=c.get('sample_step_offset',0)+total)
+    if c.get('freeze_condition_predictor',False):
+        contract.update(frozen_condition_predictor=True,condition_loss_requires_grad=False,
+            frozen_condition_weights_sha256=predictor_hash,
+            trainable_parameters=sum(p.numel() for p in trainable),
+            future_condition_gradient='Frozen delta_encoder and condition_updater at every age')
     if continuation:
         previous=continuation['contract']
         check_continuation_contract(previous,contract,c)
@@ -242,6 +268,8 @@ def train(c, arm, smoke=False):
             try: tracker.finish()
             except Exception: pass
     if state_hash(frozen)!=frozen_hash: raise RuntimeError('Frozen model changed')
+    if c.get('freeze_condition_predictor',False) and condition_predictor_hash(model)!=predictor_hash:
+        raise RuntimeError('Frozen condition predictor changed')
     if start==0 and state_hash(model)==initial_hash: raise RuntimeError('Unchanged trainable model')
     validate(c,model,action,heldout,out,smoke)
     saved=torch.load(latest,map_location='cpu',weights_only=False)
@@ -251,7 +279,10 @@ def train(c, arm, smoke=False):
         architecture=arm,frozen_teacher_unchanged=True,
         initialization=c.get('initialization','pretrained'),
         total_training_steps=c.get('sample_step_offset',0)+total,
-        prior_training_seconds=continuation['prior_training_seconds'] if continuation else 0))
+        prior_training_seconds=continuation['prior_training_seconds'] if continuation else 0,
+        trainable_parameters=sum(p.numel() for p in trainable),
+        frozen_condition_predictor=c.get('freeze_condition_predictor',False),
+        condition_predictor_unchanged=condition_predictor_hash(model)==predictor_hash))
 if __name__=='__main__':
     p=argparse.ArgumentParser(); p.add_argument('--config',required=True)
     p.add_argument('--arm',choices=ARMS,required=True); p.add_argument('--smoke',action='store_true')
