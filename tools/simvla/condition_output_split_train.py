@@ -84,6 +84,11 @@ def build_initial_model(parent, c, arm):
             max_tokens=parent.condition_updater.max_tokens,
             num_token_groups=parent.condition_updater.num_token_groups).to(ref)
         install_exact_uint8_delta_path(parent)
+    if c.get('bounded_history_variant'):
+        from methods.latentloop.modules.bounded_history import BoundedHistoryCondition
+        if arm != 'carry_base' or mode != 'fresh' or c.get('freeze_condition_predictor'):
+            raise ValueError('Bounded-history comparison requires a fresh, fully trainable carry_base model')
+        return BoundedHistoryCondition(parent,c['bounded_history_variant'])
     return ConditionOutputSplit(parent,arm)
 
 
@@ -111,7 +116,7 @@ def load_continuation(model,c,arm):
 
 def training_intervals(c):
     values=c.get('training_intervals',[4,8])
-    if values not in ([4,8],[2],[3],[4]) or any(type(x) is not int for x in values):
+    if values not in ([4,8],[2],[3],[4],[8]) or any(type(x) is not int for x in values):
         raise ValueError('Unsupported training intervals')
     return values
 
@@ -157,6 +162,7 @@ def validate(c, model, action, heldout, out, smoke):
         for interval in c.get('offline_validation_intervals',[4,8]):
             ctx = model.prepare(sequence['anchor_condition'],sequence['image_sequence'][:,0],
                 sequence['proprio_sequence'][:,0],sequence['valid_mask'],sequence['group_ids'],interval)
+            history_factor = None
             for age in range(1,interval):
                 s = sample_from_sequence(sequence,age)
                 torch.cuda.synchronize(); began=time.perf_counter()
@@ -176,6 +182,15 @@ def validate(c, model, action, heldout, out, smoke):
                     output=geometry(condition,s['target_condition'],s['valid']))
                 if age==1:
                     record['hold']=geometry(s['anchor'],s['target_condition'],s['valid'])
+                if 'gate' in d:
+                    gate=d['gate'][s['valid']].float()
+                    history_factor=(1-gate) if history_factor is None else history_factor*(1-gate)
+                    record['history_path']=dict(gate_mean=float(gate.mean()),gate_min=float(gate.min()),
+                        gate_max=float(gate.max()),conditional_history_factor_max=float((1-gate).max()),
+                        cumulative_factor_max=float(history_factor.max()),
+                        cumulative_factor_mean=float(history_factor.mean()),
+                        factor_is_full_history_jacobian=c.get('bounded_history_variant')=='bounded',
+                        candidate=geometry(d['candidate'],s['target_condition'],s['valid']))
                 records.append(record)
     write_json(out/'validation.json',dict(records=records,indices=indices,
         identities=[heldout.identities[i] for i in indices],
@@ -213,6 +228,14 @@ def train(c, arm, smoke=False):
         contract.update(initialization=c['initialization'],sample_step_offset=c.get('sample_step_offset',0),
             continuation=continuation,optimizer_initialization='fresh at phase start',
             total_training_steps=c.get('sample_step_offset',0)+total)
+    if c.get('bounded_history_variant'):
+        contract.update(bounded_history_variant=c['bounded_history_variant'],
+            current_action_gradient='Frozen NFE1 action network to condition_updater and delta_encoder; no detach',
+            future_condition_gradient='All unrolled outputs to the shared updater and encoder; original refresh anchor fixed',
+            history_formula='previous + gate*(source + raw_residual - previous)',
+            history_source='refresh anchor' if c['bounded_history_variant']=='bounded' else 'previous prediction',
+            history_guarantee='For bounded arm only: fixed anchor and observations imply delta_output=(1-gate)*delta_previous',
+            trainable_parameters=sum(p.numel() for p in trainable))
     if c.get('freeze_condition_predictor',False):
         contract.update(frozen_condition_predictor=True,condition_loss_requires_grad=False,
             frozen_condition_weights_sha256=predictor_hash,

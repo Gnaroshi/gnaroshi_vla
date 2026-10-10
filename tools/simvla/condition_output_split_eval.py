@@ -18,7 +18,7 @@ def load_payload(path, arm, expected_identity=None, steps=3000, action_mode='nai
     if (p['format']!='simvla_condition_output_split_v1' or p['arm']!=arm or p['step']!=steps
             or action_mode not in ('naive1','naive3')
             or p['contract']['action_mode']!=action_mode
-            or p['contract']['training_intervals'] not in ([4,8],[2],[3],[4])):
+            or p['contract']['training_intervals'] not in ([4,8],[2],[3],[4],[8])):
         raise RuntimeError('Condition output split checkpoint mismatch')
     if expected_identity is not None and p['identity']!=expected_identity:
         raise RuntimeError('Source identity mismatch')
@@ -34,9 +34,17 @@ def attach(policy, parent, payload, arm, interval, compiler=None, use_action_con
     nfe=int(payload['contract']['action_mode'].removeprefix('naive'))
     if nfe not in (1,3) or policy.nfe!=nfe:
         raise RuntimeError('Training and deployed action solver differ')
-    model=ConditionOutputSplit(parent,arm).to('cuda').eval().requires_grad_(False)
+    variant=payload['contract'].get('bounded_history_variant')
+    if variant:
+        from methods.latentloop.modules.bounded_history import BoundedHistoryCondition
+        if arm!='carry_base':raise ValueError('Bounded history requires carry_base')
+        model=BoundedHistoryCondition(parent,variant)
+        use_action_condition_updater=False
+    else:
+        model=ConditionOutputSplit(parent,arm)
+    model=model.to('cuda').eval().requires_grad_(False)
     model.load_state_dict(payload['model'],strict=True)
-    if not use_action_condition_updater:
+    if not use_action_condition_updater and not variant:
         if arm != 'carry_base':
             raise ValueError('Predictor-only control requires carry_base')
         model.update=MethodType(predictor_only_update,model)
@@ -45,6 +53,7 @@ def attach(policy, parent, payload, arm, interval, compiler=None, use_action_con
     counts=Counter()
     for attr,name in [('delta_encoder','observation_encoder'),('condition_updater','condition_updater'),
             ('action_condition_updater','action_condition_updater')]:
+        if variant and attr=='action_condition_updater':continue
         module=getattr(model,attr)
         if compiler is not None and attr=='action_condition_updater':
             module.forward=compiler.wrap(name,module.forward)
