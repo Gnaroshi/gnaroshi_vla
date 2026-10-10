@@ -25,12 +25,22 @@ def load_payload(path, arm, expected_identity=None, steps=3000, action_mode='nai
     return p
 
 
-def attach(policy, parent, payload, arm, interval, compiler=None):
+def predictor_only_update(self, previous, code, *, valid_mask, group_ids, age):
+    base = self.condition_updater(previous, code, valid_mask=valid_mask, group_ids=group_ids, age=age).condition
+    return base, base, base
+
+
+def attach(policy, parent, payload, arm, interval, compiler=None, use_action_condition_updater=True):
     nfe=int(payload['contract']['action_mode'].removeprefix('naive'))
     if nfe not in (1,3) or policy.nfe!=nfe:
         raise RuntimeError('Training and deployed action solver differ')
     model=ConditionOutputSplit(parent,arm).to('cuda').eval().requires_grad_(False)
     model.load_state_dict(payload['model'],strict=True)
+    if not use_action_condition_updater:
+        if arm != 'carry_base':
+            raise ValueError('Predictor-only control requires carry_base')
+        model.update=MethodType(predictor_only_update,model)
+    policy._uses_action_condition_updater=use_action_condition_updater
     timers=ComponentTimers() if compiler is None else None
     counts=Counter()
     for attr,name in [('delta_encoder','observation_encoder'),('condition_updater','condition_updater'),
@@ -68,7 +78,7 @@ def attach(policy, parent, payload, arm, interval, compiler=None):
         condition,_=model.predict(self._split_context,age,batch['raw_rgb'],batch['proprio'])
         self.metrics.counters['num_condition_updater_calls']+=1
         self.metrics.counters['num_observation_encoder_calls']+=1
-        self.metrics.counters['num_action_condition_updater_calls']+=1
+        self.metrics.counters['num_action_condition_updater_calls']+=int(use_action_condition_updater)
         action,seed=self._decode(condition,batch['proprio'],policy_query_index=policy_query_index)
         self.cached_condition,self.cached_action_chunk=condition.detach(),action.detach()
         return condition,action,seed
@@ -76,16 +86,20 @@ def attach(policy, parent, payload, arm, interval, compiler=None):
     policy._v0_update=MethodType(update,policy)
     if timers is not None:
         policy.extra_episode_metrics=lambda:dict(component_timing=timers.report(),
-            condition_parameters=sum(p.numel() for p in model.parameters()))
+            condition_parameters=sum(p.numel() for p in model.parameters()),
+            active_condition_parameters=sum(p.numel() for name,p in model.named_parameters()
+                if use_action_condition_updater or not name.startswith('action_condition_updater.')),
+            uses_action_condition_updater=use_action_condition_updater)
     policy.reset(); return policy
 
 
 def check_policy(policy):
     c=policy.metrics.counters; queries=int(c['num_policy_queries']); k=policy.k_c
     full=(queries+k-1)//k; light=queries-full
-    expected=dict(observation_encoder=light,condition_updater=light,action_condition_updater=light)
+    extra=light if getattr(policy,'_uses_action_condition_updater',True) else 0
+    expected=dict(observation_encoder=light,condition_updater=light,action_condition_updater=extra)
     if (c['num_full_vlm_calls']!=full or c.get('num_condition_updater_calls',0)!=light
-            or c.get('num_action_condition_updater_calls',0)!=light
+            or c.get('num_action_condition_updater_calls',0)!=extra
             or policy.nfe not in (1,3) or c['num_action_transformer_calls']!=policy.nfe*queries
             or c.get('num_generation_decoder_only_steps',0)!=0
             or queries!=(policy.step_index+4)//5

@@ -32,9 +32,27 @@ def action_prediction(action, condition, s, *, steps=3, grad=True):
         initial_noise=s['noise'], requires_grad=grad, return_debug=True).final_action_latent
 
 
+def teacher_steps(c):
+    steps = c.get('teacher_steps', 10)
+    if type(steps) is not int or steps not in (1, 10):
+        raise ValueError('Teacher action steps must be 1 or 10')
+    return steps
+
+
+@torch.no_grad()
+def action_target(c, action, s):
+    if teacher_steps(c) == 10:
+        return action.action_space.normalize_action(s['target_action'])
+    return action_prediction(action, s['target_condition'], s, steps=1, grad=False)
+
+
 def check_continuation_contract(previous, current, c):
     for key in ('data','heldout','batch_size','seed','teacher_steps',
             'source_checkpoint_sha256','condition_weight','current_action_gradient','future_condition_gradient'):
+        if key == 'teacher_steps' and previous[key] != current[key]:
+            if (previous[key], current[key]) != (10, 1) or c.get('teacher_transition') != dict(source=10, target=1):
+                raise RuntimeError('Unapproved continuation teacher change')
+            continue
         if key == 'future_condition_gradient' and c.get('freeze_condition_predictor'):
             if (previous[key] != 'carry_output can reach earlier extra heads; carry_base reaches base updater and encoder'
                     or current[key] != 'Frozen delta_encoder and condition_updater at every age'):
@@ -148,8 +166,11 @@ def validate(c, model, action, heldout, out, smoke):
                 predicted=action_prediction(action,condition,s,steps=student_steps(c),grad=False)
                 torch.cuda.synchronize(); action_ms=1000*(time.perf_counter()-began)
                 target=action.action_space.normalize_action(s['target_action'])
+                original_one = action_prediction(action,s['target_condition'],s,steps=1,grad=False)
                 record=dict(window=index,interval=interval,age=age,
                     action_l1=float(action_loss(predicted,target)),condition_ms=condition_ms,action_ms=action_ms,
+                    action_l1_vs_original1=float(action_loss(predicted,original_one)),
+                    original1_l1_vs_original10=float(action_loss(original_one,target)),
                     addition_rms=float(d['addition'][s['valid']].square().mean().sqrt()),
                     base=geometry(d['base'],s['target_condition'],s['valid']),
                     output=geometry(condition,s['target_condition'],s['valid']))
@@ -159,6 +180,7 @@ def validate(c, model, action, heldout, out, smoke):
     write_json(out/'validation.json',dict(records=records,indices=indices,
         identities=[heldout.identities[i] for i in indices],
         reference='Original backbone condition and cached original NFE10 normalized continuous actions',
+        additional_reference='Same observation, proprioception and noise; original condition decoded at NFE1',
         timing='sd1 eager device-synchronized component time; separate from rb2 full-policy latency'))
 
 
@@ -177,7 +199,7 @@ def train(c, arm, smoke=False):
     optimizer=torch.optim.AdamW(trainable,lr=c['learning_rate'],weight_decay=0)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,
         lambda n:lr_factor(n,total,min(c['warmup_steps'],max(1,total//10))))
-    contract=dict(arm=arm,steps=total,training_intervals=training_intervals(c),action_mode=f'naive{student_steps(c)}',teacher_steps=10,
+    contract=dict(arm=arm,steps=total,training_intervals=training_intervals(c),action_mode=f'naive{student_steps(c)}',teacher_steps=teacher_steps(c),
         source_checkpoint_sha256=sha(c['condition_checkpoint']),data=data.contract(),heldout=heldout.contract(),
         initial_weights_sha256=initial_hash,batch_size=2,seed=c['seed'],
         condition_loss='Mean anchor-variance-scaled raw MSE at every unrolled age',
@@ -203,6 +225,10 @@ def train(c, arm, smoke=False):
         contract['solver_transition']=c['solver_transition']
     if 'interval_transition' in c:
         contract['interval_transition']=c['interval_transition']
+    if teacher_steps(c) == 1:
+        contract.update(action_loss='First-five normalized continuous action L1 at sampled final age, original condition NFE1 same-noise target',
+            teacher_transition=c.get('teacher_transition'),
+            teacher_target_requires_grad=False)
     write_json(out/'training_contract.json',contract)
     latest=out/'latest.pt'; start=0; elapsed=0.
     if latest.exists():
@@ -244,7 +270,7 @@ def train(c, arm, smoke=False):
                 loss_c=sum(scaled_mse(base,seq['teacher_conditions'][:,j],s['anchor'],s['valid'])
                     for j,base in enumerate(bases))/len(bases)
                 pred=action_prediction(action,condition,s,steps=student_steps(c))
-                loss_a=action_loss(pred,action.action_space.normalize_action(s['target_action']))
+                loss_a=action_loss(pred,action_target(c,action,s))
                 loss=loss_a+c['condition_weight']*loss_c
                 if not torch.isfinite(loss): raise RuntimeError('Nonfinite loss')
                 (loss/2).backward()
@@ -281,6 +307,7 @@ def train(c, arm, smoke=False):
         total_training_steps=c.get('sample_step_offset',0)+total,
         prior_training_seconds=continuation['prior_training_seconds'] if continuation else 0,
         trainable_parameters=sum(p.numel() for p in trainable),
+        teacher_steps=teacher_steps(c),student_steps=student_steps(c),
         frozen_condition_predictor=c.get('freeze_condition_predictor',False),
         condition_predictor_unchanged=condition_predictor_hash(model)==predictor_hash))
 if __name__=='__main__':
