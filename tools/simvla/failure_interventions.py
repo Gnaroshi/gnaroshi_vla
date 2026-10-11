@@ -245,7 +245,7 @@ def build_policy(mode, c):
         samples = move(torch.load(Path(c['recorded_input'])/'recorded_inputs.pt', map_location='cpu', weights_only=False)[:1])
         compiler = Compiler(True)
         replay = replay_factory(c, mode, compiler, samples)
-        manifest = dict(action_noise_seed_base=6828326409295398833)
+        manifest = dict(suite='libero_10', action_noise_seed_base=6828326409295398833)
         policy = policy_factory(replay, c, mode, manifest)
     else:
         from tools.simvla.condition_output_split_eval import make_policy
