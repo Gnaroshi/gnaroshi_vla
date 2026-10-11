@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import fcntl
 import hashlib
 import json
 import os
@@ -452,11 +453,34 @@ def worker(mode, stage, smoke=False):
 
 
 def summarize():
-    summaries = {}
-    for p in (OUTPUT/'models').glob('*/*_summary.json'):
-        summaries[str(p.relative_to(OUTPUT))] = read_json(p)
-    write_json(OUTPUT/'comparison_summary.json', dict(stages=summaries, complete=len(summaries)==12,
-        interpretation='Outcome-selected paired diagnosis; compare arms within the same model, episode, branch and continuation. Instrumented latency only.'))
+    # Several sd1 workers can finish together; serialize the shared report only.
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    with (OUTPUT/'summary.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        summaries, paired = {}, []
+        for p in (OUTPUT/'models').glob('*/*_summary.json'):
+            summary = read_json(p)
+            summaries[str(p.relative_to(OUTPUT))] = summary
+            groups = {}
+            for row in summary['rows']:
+                if 'point' not in row:
+                    continue
+                key = (row['case']['task_id'], row['case']['trial_id'], row['point']['query'])
+                groups.setdefault(key, {})[row['arm']] = row
+            for (task, trial, query), arms in groups.items():
+                if set(arms) != set(ARMS):
+                    raise RuntimeError('Incomplete factorial comparison')
+                paired.append(dict(mode=summary['mode'], stage=summary['stage'], task_id=task,
+                    trial_id=trial, query=query,
+                    success={a: arms[a]['success'] for a in ARMS},
+                    episode_length={a: arms[a]['episode_length'] for a in ARMS},
+                    condition_success_difference_nfe1=int(arms['original_1']['success'])-int(arms['predicted_1']['success']),
+                    solver_success_difference_predicted=int(arms['predicted_10']['success'])-int(arms['predicted_1']['success']),
+                    combined_success_difference=int(arms['original_10']['success'])-int(arms['predicted_1']['success']),
+                    evidence={a: arms[a]['result'] for a in ARMS}))
+        write_json(OUTPUT/'comparison_summary.json', dict(stages=summaries, paired=paired,
+            complete=len(summaries)==12,
+            interpretation='Outcome-selected paired diagnosis; compare arms within the same model, episode, branch and continuation. Instrumented latency only.'))
 
 
 def jobs(smoke_only=False):
