@@ -42,3 +42,45 @@ def test_invalid_inputs():
     m.decide(0, m.known_decision(0))
     with pytest.raises(ValueError):
         m.decide(1, m.known_decision(1), math.nan)
+
+
+@pytest.mark.parametrize('strategy', STRATEGIES)
+def test_policy_routing_counts_and_context_reset(strategy):
+    from collections import Counter, deque
+    from types import SimpleNamespace
+    import torch
+    from architectures.simvla.adapters.latentloop.refresh_allocation_policy import attach, check
+
+    class Policy:
+        task_id, trial_id, nfe = 0, 1, 1
+        action_adapter = SimpleNamespace(action_space=SimpleNamespace(normalize_action=lambda x:x))
+
+        def reset(self):
+            self.query_index = self.step_index = self.context_age = 0
+            self.metrics = SimpleNamespace(counters=Counter())
+            self.query_trace = []
+            self.action_queue = deque()
+
+        def _full_refresh(self, batch, *, policy_query_index):
+            self.context_age = 0
+            self.metrics.counters['num_full_vlm_calls'] += 1
+            self.metrics.counters['num_action_transformer_calls'] += 1
+            return None,torch.full((1,10,7),float(policy_query_index)),policy_query_index
+
+        def _v0_update(self, batch, *, age, policy_query_index):
+            assert age == self.context_age + 1
+            assert 1 <= age <= 7
+            self.context_age = age
+            self.metrics.counters['num_condition_updater_calls'] += 1
+            self.metrics.counters['num_action_transformer_calls'] += 1
+            return None,torch.full((1,10,7),float(policy_query_index%5)),policy_query_index
+
+    model = attach(Policy(),strategy)
+    for repeat in range(2):
+        model.reset()
+        for _ in range(180):
+            model._refill_action_queue({})
+            assert len(model.action_queue) == 5
+            model.step_index += 5
+            check(model)
+        assert model._allocation.last_query == 179
