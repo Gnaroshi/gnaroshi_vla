@@ -80,7 +80,7 @@ def extract(study, shard):
                     reference=captured[0].reshape(1,-1,960).cpu()
                     torch.testing.assert_close(features,reference,atol=0,rtol=0)
                 finally:handle.remove()
-            if features.shape!=(1,98,960) or not torch.isfinite(features).all():
+            if features.shape!=(1,72,960) or not torch.isfinite(features).all():
                 raise RuntimeError(f'Unexpected vision features {features.shape}')
             path.parent.mkdir(parents=True,exist_ok=True)
             atomic_torch_save(dict(identity=c['identity'],query_id=query,features=features,
@@ -91,7 +91,7 @@ def extract(study, shard):
                 print(f'VISION_CACHE shard={shard} {n+1}/{len(ids)}',flush=True)
         write_json(out/f'shard_{shard}.json',dict(verdict='FEATURES_COMPLETE',identity=c['identity'],
             shard=shard,queries=len(ids),seconds=time.monotonic()-began,records=records,
-            dtype='float32',shape=[1,98,960],source='Original frozen vision encoder and connector; no text transformer'))
+            dtype='float32',shape=[1,72,960],source='Original frozen vision encoder and connector; no text transformer'))
 
 
 class CachedFeatures:
@@ -114,7 +114,7 @@ class CachedFeatures:
 
 def profile(study):
     from tools.simvla.refresh_allocation import setup
-    from tools.simvla.condition_output_split_rb2 import move
+    from tools.simvla.compiled_campaign import move
     from tools.simvla.compile_runtime import Compiler
     from architectures.simvla.adapters.latentloop.native_v0_runtime import load_frozen_simvla,configure_strict_torch_determinism
     c=study.checked();cfg=c['model']['config'];setup(cfg)

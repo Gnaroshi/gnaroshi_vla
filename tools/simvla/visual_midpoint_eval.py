@@ -81,7 +81,7 @@ def evaluate(arm, smoke=False):
         if arm=='bridge_f4':
             from pathlib import Path
             from tools.simvla.condition_interval_compare import replay_factory,policy_factory
-            from tools.simvla.condition_output_split_rb2 import move
+            from tools.simvla.compiled_campaign import move
             from tools.simvla.compile_runtime import Compiler
             from tools.simvla.compile_benchmark import sha
             compiler=Compiler(True)

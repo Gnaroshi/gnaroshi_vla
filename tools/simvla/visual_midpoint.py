@@ -29,8 +29,8 @@ def prepare():
         git_head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
         steps=10000, warmup=500, learning_rate=1e-4, condition_weight=0.05, seed=7,
         training_ages=[4,5,6,7], batch_size=2, student_nfe=1, teacher_nfe=10,
-        objective=parent['objective'], arms=list(ARMS),
-        change='Frozen original vision encoder and connector at age4 only or ages4..7. Current 98x960 vision tokens enter learned attention before the late updater activation. Ages1..3 unchanged.',
+        objective='First5 normalized action L1 against original NFE10 same-noise actions plus0.05 mean anchor-scaled Condition MSE over every unrolled age. Both arms train the late updater, its CNN and visual attention; early updater and all original SimVLA parameters remain frozen.', arms=list(ARMS),
+        change='Frozen original vision encoder and connector at age4 only or ages4..7. Current 72x960 vision tokens enter learned attention before the late updater activation. Ages1..3 unchanged.',
         comparison='Reuse completed protected recurrent K8 and original recurrent K4; new midpoint and late_every K8 Long500. New matched-runtime Latent Bridge f4 uses independent env per episode. No SR-based early stop.')
     c['identity'] = prior.digest(c)
     path = OUTPUT/'contract.json'
