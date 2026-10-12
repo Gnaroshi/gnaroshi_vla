@@ -15,7 +15,8 @@ def contract():
     c=study.checked()
     c=dict(c,parent_identity=c['identity'],
         intervention='Use refresh image_input for scheduled vision measurements; keep current raw_rgb, proprio, CNN deltas and all trained weights unchanged.',
-        followup_source_sha256=sha(__file__))
+        followup_source_sha256=sha(__file__),
+        attribution_source_sha256=sha(ROOT/'tools/simvla/visual_midpoint_attribution.py'))
     c['identity']=prior.digest(c)
     return c
 
@@ -40,20 +41,40 @@ def attach_stale(attach,policy,model,interval,compiler):
     return policy
 
 
-def evaluate_stale():
+def evaluate_stale(arm='midpoint'):
     from tools.simvla import visual_midpoint_eval as evaluation
     c=contract();write_json(OUTPUT/'stale_contract.json',c)
     original=evaluation.attach_visual
     evaluation.attach_visual=lambda *a,**kw:attach_stale(original,*a,**kw)
     evaluation.study=SimpleNamespace(OUTPUT=OUTPUT,checked=lambda:c,
         model_payload=study.model_payload,initial_model=study.initial_model,previous=study.previous)
-    evaluation.evaluate('midpoint')
+    evaluation.evaluate(arm)
+
+
+def stale_job(c, arm, deps=()):
+    return dict(id='stale_'+arm,cmd=[sys.executable,'-u','-m',
+        'tools.simvla.visual_midpoint_followup','stale','--arm',arm],deps=list(deps),
+        ready_file=str(study.OUTPUT/'eval_smoke'/arm/'summary.json'),
+        ready_fields=dict(verdict='EVAL_SMOKE_PASS',identity=c['identity'],arm=arm),
+        summary=str(OUTPUT/'rows'/arm/'summary.json'),
+        completion=dict(verdict='EVAL_COMPLETE',identity=contract()['identity'],episodes=500))
+
+
+def attribution_job(arm, smoke=False):
+    name='attribution_smoke' if smoke else 'attribution'
+    return dict(id=name+'_'+arm,cmd=[sys.executable,'-u','-m',
+        'tools.simvla.visual_midpoint_attribution','--arm',arm]+(['--smoke'] if smoke else []),
+        deps=[] if smoke else ['stale_'+arm],
+        summary=str(OUTPUT/name/arm/'summary.json'),
+        completion=dict(verdict='ATTRIBUTION_SMOKE_PASS' if smoke else 'ATTRIBUTION_COMPLETE',
+            identity=contract()['identity'],arm=arm))
 
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('command',choices=('all','stale'),default='all',nargs='?')
+    p.add_argument('--arm',choices=study.ARMS,default='midpoint')
     a=p.parse_args()
-    if a.command=='stale':evaluate_stale();return 0
+    if a.command=='stale':evaluate_stale(a.arm);return 0
     c=study.checked();plan=[]
     if prior.IS_RB2:
         # The first launch observed a terminal status from a superseded setup
@@ -64,12 +85,13 @@ def main():
                 plan.append(job)
         deps=['eval_midpoint','eval_late_every']
     else:deps=[]
-    plan.append(dict(id='stale_midpoint',cmd=[sys.executable,'-u','-m',
-        'tools.simvla.visual_midpoint_followup','stale'],deps=deps,
-        ready_file=str(study.OUTPUT/'rows/midpoint/summary.json'),
-        ready_fields=dict(verdict='EVAL_COMPLETE',identity=c['identity'],episodes=500),
-        summary=str(OUTPUT/'rows/midpoint/summary.json'),
-        completion=dict(verdict='EVAL_COMPLETE',identity=contract()['identity'],episodes=500)))
+    arms=('midpoint',) if prior.IS_RB2 else study.ARMS
+    if not prior.IS_RB2:
+        for arm in arms:plan.append(attribution_job(arm,smoke=True))
+    for arm in arms:
+        plan.append(stale_job(c,arm,deps if prior.IS_RB2 else ['attribution_smoke_'+arm]))
+    if not prior.IS_RB2:
+        for arm in arms:plan.append(attribution_job(arm))
     write_json(OUTPUT/'plan.json',dict(jobs=plan,source_sha256=sha(__file__),
         purpose='Matched trained model, same vision call schedule, replace only current vision images with refresh images.'))
     return run_queue(OUTPUT/'queue',plan,gpus=(0,) if prior.IS_RB2 else (4,5,6,7),

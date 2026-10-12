@@ -87,3 +87,31 @@ def test_stale_intervention_changes_only_vision_input_and_clears_at_reset():
     assert current['image_input']=='current'
     policy.reset()
     with pytest.raises(RuntimeError):policy._v0_update(current,age=4,policy_query_index=4)
+
+
+@pytest.mark.parametrize('arm',['midpoint','late_every'])
+def test_stale_job_ready_after_smoke_without_waiting_for_full_eval(monkeypatch,arm):
+    from tools.simvla import visual_midpoint_followup as followup
+    from tools.simvla.gpu_followup_queue import ready
+    monkeypatch.setattr(followup,'contract',lambda:dict(identity='control'))
+    job=followup.stale_job(dict(identity='parent'),arm)
+    assert job['ready_file'].endswith(f'/eval_smoke/{arm}/summary.json')
+    assert job['ready_fields']==dict(verdict='EVAL_SMOKE_PASS',identity='parent',arm=arm)
+    assert job['deps']==[]
+    assert job['cmd'][-2:]==['--arm',arm]
+    assert job['completion']['identity']=='control'
+    assert followup.attribution_job(arm)['deps']==['stale_'+arm]
+
+
+def test_attribution_uses_selected_vision_without_changing_image_input():
+    from tools.simvla.visual_midpoint_attribution import InterventionFeatures
+    calls=[]
+    def current(age,images):
+        calls.append(age)
+        return images+age
+    images=torch.ones(2)
+    refresh=torch.zeros(2)
+    assert torch.equal(InterventionFeatures(current,refresh,'current')(4,images),torch.full((2,),5.))
+    assert torch.equal(InterventionFeatures(current,refresh,'refresh')(7,images),refresh)
+    assert calls==[4]
+    assert torch.equal(images,torch.ones(2))
