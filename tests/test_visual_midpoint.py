@@ -70,3 +70,20 @@ def test_no_vision_calls_during_preserved_k4_prefix():
     ctx=model.prepare(torch.randn(1,6,32),images,q,torch.ones(1,6,dtype=torch.bool),torch.zeros(1,6,dtype=torch.long),4)
     for age in (1,2,3):model.predict(ctx,age,images,q)
     assert model.feature_provider is None
+
+
+def test_stale_intervention_changes_only_vision_input_and_clears_at_reset():
+    from types import SimpleNamespace
+    from tools.simvla.visual_midpoint_followup import attach_stale
+    calls=[]
+    policy=SimpleNamespace(_full_refresh=lambda b,**kw:None,
+        _v0_update=lambda b,**kw:calls.append(b),reset=lambda:None)
+    policy=attach_stale(lambda *a:a[0],policy,None,8,None)
+    first=dict(image_input='old',raw_rgb='old_rgb',proprio='old_q')
+    current=dict(image_input='current',raw_rgb='current_rgb',proprio='current_q')
+    policy._full_refresh(first,policy_query_index=0)
+    policy._v0_update(current,age=4,policy_query_index=4)
+    assert calls==[dict(image_input='old',raw_rgb='current_rgb',proprio='current_q')]
+    assert current['image_input']=='current'
+    policy.reset()
+    with pytest.raises(RuntimeError):policy._v0_update(current,age=4,policy_query_index=4)
