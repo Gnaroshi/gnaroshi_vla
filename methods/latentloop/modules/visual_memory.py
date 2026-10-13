@@ -13,7 +13,7 @@ class SpatialPairEncoder(nn.Module):
     def __init__(self, rank=64):
         super().__init__()
         self.net=nn.Sequential(nn.Conv2d(9,32,5,stride=2,padding=2),nn.GroupNorm(4,32),nn.GELU(),
-            nn.Conv2d(32,rank,3,stride=2,padding=1),nn.GroupNorm(8,rank),nn.GELU(),nn.AdaptiveAvgPool2d((6,6)))
+            nn.Conv2d(32,rank,3,stride=2,padding=1),nn.GroupNorm(8,rank),nn.GELU(),nn.AvgPool2d(4,stride=4))
 
     @staticmethod
     def rgb(images):

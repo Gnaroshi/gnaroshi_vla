@@ -63,6 +63,24 @@ def test_uint8_live_float_spatial_input_parity_and_view_order():
     torch.testing.assert_close(module(a.flip(1),b.flip(1)),x.reshape(1,2,36,64).flip(1).reshape_as(x))
 
 
+def test_fixed_pool_matches_24_to_6_adaptive_pool():
+    x=torch.randn(2,64,24,24)
+    torch.testing.assert_close(torch.nn.AvgPool2d(4,4)(x),torch.nn.functional.adaptive_avg_pool2d(x,(6,6)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
+def test_cuda_strict_deterministic_spatial_backward():
+    previous=torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        encoder=SpatialPairEncoder().cuda()
+        a=torch.rand(1,2,224,224,3,device='cuda')
+        encoder(a,a.flip(2)).square().mean().backward()
+        assert encoder.net[0].weight.grad.abs().sum()>0
+    finally:
+        torch.use_deterministic_algorithms(previous)
+
+
 def test_spatial_branch_initial_parity_then_action_surrogate_gradient():
     torch.manual_seed(7);plain=MemoryReference(32,64,False)
     rich=MemoryReference(32,64,True);rich.load_state_dict(plain.state_dict(),strict=False)
