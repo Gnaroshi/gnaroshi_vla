@@ -38,3 +38,16 @@ def test_artifact_hash_mismatch_is_rejected(monkeypatch, field):
     marker['artifact_sha256'][field] = 'wrong'
     with pytest.raises(RuntimeError, match='Base artifact differs'):
         remote.validate_origin(source, destination, marker)
+
+
+def test_missing_f5_runs_before_three_ours_rows(monkeypatch):
+    monkeypatch.setattr(remote.training.prior, 'IS_RB2', True)
+    monkeypatch.setattr(remote.campaign, 'MODULE', 'tools.simvla.visual_readout_remote')
+    c = dict(identity='test', manifest=dict(episodes=[dict(task_id=t, trial_id=i)
+        for t in range(10) for i in range(50)]))
+    plan = remote.jobs(c)
+    assert len(plan) == 11 and plan[0]['id'] == 'bridge_f5_smoke'
+    by_id = {j['id']: j for j in plan}
+    assert by_id['bridge_f5_eval']['deps'] == ['bridge_f5_smoke']
+    assert 'bridge_f5_eval' in by_id['eval_smoke_warm_retain']['deps']
+    assert 'merge_warm_retain' in by_id['eval_smoke_distilled_readout']['deps']
