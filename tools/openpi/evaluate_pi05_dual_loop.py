@@ -82,13 +82,9 @@ def run(args):
         final_hashes = {r['initial_state_identifier'] for r in manifest['episodes'] if r['suite']=='libero_10'}
         collected=[]
         for task_id in range(10):
-            states=suite.get_task_init_states(task_id)
-            if len(states)<80:raise ValueError('Need disjoint initial states50..79 for DAgger')
             for trial in range(50,80):
-                h=hashlib.sha256(np.ascontiguousarray(np.asarray(states[trial])).tobytes()).hexdigest()
-                if h in final_hashes:raise ValueError('DAgger/final initial state overlap')
                 collected.append(dict(suite='libero_10',benchmark_task_index=task_id,trial=trial,
-                    initial_state_identifier=h,environment_seed=107+trial,
+                    initial_state_identifier='seeded_reset',environment_seed=100007+100*task_id+trial,
                     query_noise_key_prefix='%d:libero_10:%d:%d:'%(config['noise_seed'],task_id,trial),max_episode_steps=520))
         manifest=dict(manifest,episodes=collected)
         atomic_json(output/'collection_manifest.json',manifest)
@@ -121,9 +117,10 @@ def run(args):
             if " ".join(task.language.lower().split()) != " ".join(instruction.lower().split()):
                 raise ValueError("LIBERO task order/language changed")
             initial_states = suite.get_task_init_states(task_id)
-            init_hash = hashlib.sha256(np.ascontiguousarray(np.asarray(initial_states[trial])).tobytes()).hexdigest()
-            if init_hash != frozen["initial_state_identifier"]:
-                raise ValueError("LIBERO initial state changed")
+            if not collecting:
+                init_hash = hashlib.sha256(np.ascontiguousarray(np.asarray(initial_states[trial])).tobytes()).hexdigest()
+                if init_hash != frozen["initial_state_identifier"]:
+                    raise ValueError("LIBERO initial state changed")
             if frozen["query_noise_key_prefix"] != "%d:libero_10:%d:%d:" % (config["noise_seed"], task_id, trial):
                 raise ValueError("paired policy noise differs from manifest")
             if env is None or previous_task != task_id:
@@ -132,8 +129,14 @@ def run(args):
                 env = make_env(task, int(frozen["environment_seed"]))
                 previous_task = task_id
             env.seed(int(frozen["environment_seed"]))
-            env.reset()
-            obs = env.set_init_state(initial_states[trial])
+            obs=env.reset()
+            if collecting:
+                initial=np.ascontiguousarray(env.get_sim_state())
+                init_hash=hashlib.sha256(initial.tobytes()).hexdigest()
+                if init_hash in final_hashes:raise RuntimeError('On-policy reset overlaps final evaluation')
+                np.save(episode_path.with_name(episode_path.stem+'_init.npy'),initial)
+            else:
+                obs = env.set_init_state(initial_states[trial])
             for _ in range(10):
                 obs, _, _, _ = env.step(DUMMY_ACTION)
             started = time.perf_counter()

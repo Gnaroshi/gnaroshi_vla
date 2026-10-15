@@ -31,7 +31,7 @@ def configure():
         bridge_loss_source_sha256=sha256(upstream/'scripts/pi0/train_pi0_bridge_kv.py'),
         bridge_upstream_commit=subprocess.check_output(['git','-C',str(upstream),'rev-parse','HEAD'],text=True).strip(),
         training_objective='Ours: NFE1 same-noise first5 action L1 +0.05 relative raw KV MSE, recurrent BPTT. Bridge: official delta MSE +1-cosine(next KV), teacher forcing then detached self-conditioned K8 extension.',
-        data_adaptation='Same222 LIBERO-Long demonstrations,42 heldout demonstrations. Cacheless per-window targets. Bridge additionally collects300 on-policy episodes per interval4/8 on initial states50..79 disjoint from final0..49;5K mixed demonstration/on-policy refinement per stage. Fixed step budgets differ from authors epochs.',
+        data_adaptation='Same222 LIBERO-Long demonstrations,42 heldout demonstrations. Cacheless per-window targets. Bridge additionally collects300 on-policy episodes per interval4/8 with seeded fresh resets; stored simulator states must not match final50 initial states.5K mixed demonstration/on-policy refinement per stage. Fixed step budgets differ from authors epochs.',
         interface_adaptation='Official Pi0BridgeKV768x10/12heads; full local prefix including instruction tokens; original previous raw8-state and previous first7-action inputs. No zeroing of instruction KV.',
         condition_initialization='fresh shared SimVLA recurrent core with age embeddings1..7; K2/3/4 use10K checkpoint; K8 separately extends with7 recursive queries for5K steps.',
         condition_weights={'condition':0.05,'first5_action':1.0},
