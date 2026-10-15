@@ -93,6 +93,14 @@ class ServingPolicy:
                 self.previous_action=torch.as_tensor(postprocess_policy_actions(self.base,transformed['state'],action)['actions'][0],device='cuda')[None]
             required={'vision_embedding','action_expert'}|({'bridge'} if self.method=='bridge' else {'delta_encoder','condition_updater'} if self.method=='ours' else set())
             if not required.issubset(self.graphs):raise RuntimeError('Missing compile graphs: '+str(required-set(self.graphs)))
+            self.reset()
+            rebuilt,_,_=self.query(observation,noise,raw_state,events=False)
+            sampler=getattr(self.model.sample_actions,'_torchdynamo_orig_callable',self.model.sample_actions)
+            native=sampler('cuda',observation,noise=noise.clone(),num_steps=1)
+            difference=float((native-rebuilt).abs().max())
+            if difference>1e-5:raise RuntimeError('Compiled K1 prefix/action reconstruction differs: '+str(difference))
+            self.metadata.update(k1_max_action_diff=difference,compile_graphs=dict(self.graphs))
+            if hasattr(self,'runtime_path'):atomic_json(self.runtime_path,self.metadata)
             torch.cuda.synchronize();self.reset();self.warmed=True
         if identity!=self.episode or request.get('reset'):
             if int(request['query_index'])!=0:raise ValueError('Episode must start at query0')
@@ -120,5 +128,6 @@ if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--config',required=True);p.add_argument('--row',required=True)
     p.add_argument('--checkpoint');p.add_argument('--port',type=int,required=True);p.add_argument('--ready',required=True)
     a=p.parse_args();policy=ServingPolicy(read_json(a.config),a.row,a.checkpoint)
+    policy.runtime_path=Path(a.ready).parent/'runtime.json'
     atomic_json(a.ready,policy.metadata)
     WebsocketPolicyServer(policy,host='127.0.0.1',port=a.port,metadata=policy.metadata).serve_forever()

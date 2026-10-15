@@ -38,6 +38,9 @@ def test_zero_delta_and_official_loss_equivalence():
     official=importlib.util.module_from_spec(spec);spec.loader.exec_module(official)
     batch=dict(prev_kv=kv_tensor(prefix),next_kv=kv_tensor(target),delta_kv=kv_tensor(target)-kv_tensor(prefix),
         prev_emb=emb.embeddings,curr_emb=emb.embeddings,state=torch.zeros(1,8),action=torch.zeros(1,7))
+    for head in model.layer_heads:
+        torch.nn.init.normal_(head[-1].weight,std=.01)
+    _,packed=bridge_update(model,prefix,emb,batch['state'],batch['action'])
     expected,_=official.compute_loss(model,batch,'cpu')
     actual=bridge_objective(packed,target)
     torch.testing.assert_close(actual,expected)
