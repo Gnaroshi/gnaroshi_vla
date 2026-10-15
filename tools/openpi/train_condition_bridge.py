@@ -100,10 +100,11 @@ def run(args):
     for step in trange(start,args.steps,desc=args.method+('_k8' if args.extension else '_k4'),mininterval=2):
         optimizer.zero_grad(set_to_none=True)
         for group in optimizer.param_groups:group['lr']=learning_rate(step,args.steps,args.method,refinement)
-        window=data.window(step,length=length)
+        window=None
         if online and step%2:
             loss=online.loss(module,step);metrics=[dict(source='on_policy',loss=float(loss.detach()))]
         else:
+            window=data.window(step,length=length)
             loss,metrics=objective(model,module,window,c,step,postprocess,args.method,args.extension)
         if not torch.isfinite(loss):raise RuntimeError('Nonfinite loss')
         loss.backward();norm=torch.nn.utils.clip_grad_norm_(module.parameters(),1.,error_if_nonfinite=True)

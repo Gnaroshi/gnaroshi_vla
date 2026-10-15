@@ -21,16 +21,18 @@ class OnlineBridgePairs:
         for attempt in range(len(self.paths)):
             path=self.paths[int(rng.integers(len(self.paths)))]
             with np.load(path) as saved:
-                available=[i for i in range(1,len(saved['state'])) if i%self.interval]
+                raw_states=saved['state']
+                available=[i for i in range(1,len(raw_states)) if i%self.interval]
                 if not available:continue
                 t=int(rng.choice(available));anchor=t-t%self.interval
+                front,wrist,first_action,prompt=saved['image'],saved['wrist'],saved['first_action'],str(saved['prompt'])
                 observations=[]
                 for i in range(anchor,t+1):
-                    raw={'observation/image':saved['image'][i],'observation/wrist_image':saved['wrist'][i],
-                        'observation/state':saved['state'][i],'prompt':str(saved['prompt'])}
+                    raw={'observation/image':front[i],'observation/wrist_image':wrist[i],
+                        'observation/state':raw_states[i],'prompt':prompt}
                     observations.append(prepare_policy_observation(self.base,raw)[0])
-                states=torch.as_tensor(saved['state'][anchor:t],device='cuda',dtype=torch.float32)
-                actions=torch.as_tensor(saved['first_action'][anchor:t],device='cuda',dtype=torch.float32)
+                states=torch.as_tensor(raw_states[anchor:t],device='cuda',dtype=torch.float32)
+                actions=torch.as_tensor(first_action[anchor:t],device='cuda',dtype=torch.float32)
             with torch.no_grad():
                 previous=self.hook.extract(observations[0]).state
                 for i in range(1,len(observations)-1):
