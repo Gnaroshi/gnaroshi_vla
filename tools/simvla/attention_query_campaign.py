@@ -1,5 +1,7 @@
 """Three matched attention-query interventions, followed by full Long500 rows."""
 import sys
+import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,12 +21,12 @@ def jobs(c):
 
     for i,arm in enumerate(training.ARMS):
         # Every arm loads the same fixed parent, never the preceding arm.
-        deps=['train_'+training.ARMS[i-1]] if i else []
+        deps=[]
         add('smoke_'+arm,['train-smoke','--arm',arm],out/'train_smoke'/arm/'summary.json',
             'TRAIN_SMOKE_PASS',deps,steps=2)
         add('train_'+arm,['train','--arm',arm],out/'train'/arm/'summary.json',
             'TRAIN_COMPLETE',['smoke_'+arm],steps=10000)
-        deps=['train_'+arm]+(['merge_'+training.ARMS[i-1]] if i else [])
+        deps=['train_'+arm]
         add('eval_smoke_'+arm,['eval-smoke','--arm',arm],base.shard_output(arm,0)/'eval_smoke'/arm/'summary.json',
             'EVAL_SMOKE_PASS',deps)
         for shard in range(4):
@@ -63,7 +65,51 @@ def main(argv=None):
     base.OUTPUT,base.INCOMING,base.ARMS=training.OUTPUT,training.INCOMING,training.ARMS
     base.MODULE,base.jobs,base.evaluate=MODULE,jobs,evaluate
     base.predecessor=SimpleNamespace(OUTPUT=training.parent.OUTPUT)
+    args=sys.argv[1:] if argv is None else argv
+    if not args or args==['all']:
+        return run_ordered()
     return base.main(argv)
+
+
+def wait_for_parent():
+    spec=dict(path=str(training.parent.OUTPUT),lock='queue.lock')
+    start=time.monotonic()
+    while True:
+        p=training.parent.OUTPUT/'queue_status.json'
+        state=base.read_json(p) if p.exists() else {}
+        if state.get('phase') in ('complete','finished_with_failures') and not base.queue.predecessor_pending(spec):
+            training.parent.model_payload(training.parent.checked(),'attention_joint')
+            return spec
+        if time.monotonic()-start>24*3600:raise TimeoutError('Parent attention campaign did not finish')
+        base.write_json(training.OUTPUT/'queue_status.json',dict(phase='waiting_for_predecessor',
+            predecessor=str(training.parent.OUTPUT),pid=os.getpid(),total_jobs=24,updated_unix=time.time()))
+        print('WAIT attention_joint evaluation and parent queue completion',flush=True)
+        time.sleep(60)
+
+
+def run_ordered():
+    owner=base.queue.acquire_lock(training.OUTPUT/'queue.lock')
+    if owner is None:raise RuntimeError('This campaign already has an owner')
+    try:
+        c=base.prepare();base.audit(c);plan=jobs(c)
+        base.write_json(training.OUTPUT/'planned_jobs.json',plan)
+        predecessor=wait_for_parent()
+        completed=[];failed={}
+        for arm in training.ARMS:
+            local=[j for j in plan if j['id'] in {'smoke_'+arm,'train_'+arm,'eval_smoke_'+arm,'merge_'+arm}
+                   or j['id'].startswith('eval_'+arm+'_')]
+            base.write_json(training.OUTPUT/'queue_status.json',dict(phase='running',active_arm=arm,
+                detail=str(training.OUTPUT/'queues'/arm/'queue_status.json'),completed=completed,
+                failed=failed,total_jobs=24,pid=os.getpid(),updated_unix=time.time()))
+            base.queue.run_queue(training.OUTPUT/'queues'/arm,local,gpus=base.gpu_ids(),
+                predecessor=[predecessor],environment=training.prior.environment,cwd=base.ROOT,timeout=24*3600)
+            state=base.read_json(training.OUTPUT/'queues'/arm/'queue_status.json')
+            completed.extend(state['completed']);failed.update(state['failed'])
+        base.write_json(training.OUTPUT/'queue_status.json',dict(phase='finished_with_failures' if failed else 'complete',
+            completed=completed,failed=failed,active={},pending=[],total_jobs=24,updated_unix=time.time()))
+        return int(bool(failed))
+    finally:
+        owner.close()
 
 
 if __name__=='__main__':

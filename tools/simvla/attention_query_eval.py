@@ -12,6 +12,11 @@ from tools.simvla.age_specialization_eval import attach, check as parent_check, 
 from tools.simvla.compile_benchmark import read_json, write_json
 
 
+def goal_progress(env):
+    base=env.env
+    predicates=base.parsed_problem['goal_state']
+    return dict(predicates=predicates, satisfied=[bool(base._eval_predicate(g)) for g in predicates])
+
 
 def attach_visual(policy,model,interval,compiler):
     from types import MethodType
@@ -134,10 +139,12 @@ def evaluate(arm, smoke=False):
                 graphs=compiler.graph_count() if compiler else 0
                 if shutil.disk_usage(out).free < 10*1024**3:
                     raise RuntimeError('Less than 10 GiB free for complete episode evidence')
-                times,actions,frames,observations=[],[],[],[];tick=last=time.monotonic();success=False
+                times,actions,frames,observations,goals=[],[],[],[],[];tick=last=time.monotonic();success=False
                 for i in range(900):
                     inputs=build_env_obs(obs)
                     if i%2==0:frames.append(video_frame_from_obs(obs))
+                    if not policy.action_queue:
+                        goals.append(dict(action_index=i,**goal_progress(env)))
                     observations.append({k:np.asarray(v).copy() for k,v in obs.items()
                         if 'image' not in k and np.asarray(v).dtype.kind in 'biuf' and np.asarray(v).ndim<=1})
                     torch.cuda.synchronize();began=time.perf_counter();step=policy.act(*inputs,prompt)
@@ -163,7 +170,8 @@ def evaluate(arm, smoke=False):
                 save_episode_video(frames,video,fps=10)
                 if not video.is_file() or video.stat().st_size==0:
                     raise RuntimeError('Episode video missing: '+str(video))
-                record.update(video=str(video),video_stride=2,observation_keys=list(trajectory))
+                record.update(video=str(video),video_stride=2,observation_keys=list(trajectory),
+                    query_goal_progress=goals,terminal_goal_progress=goal_progress(env))
                 write_json(path,record)
                 rows.append(record)
                 write_json(out/'progress.json',dict(completed=len(rows),total=500,successes=sum(r['success'] for r in rows),

@@ -122,5 +122,32 @@ def test_queue_three_independent_arms_and_all_500_ids(monkeypatch,tmp_path):
     assert len({(x['task_id'],x['trial_id']) for x in ids})==500
     for i,arm in enumerate(ARMS):
         assert sum(byid[f'eval_{arm}_{s}']['completion']['episodes'] for s in range(4))==500
-        if i:assert byid['smoke_'+arm]['deps']==['train_'+ARMS[i-1]]
+        assert byid['smoke_'+arm]['deps']==[]
         assert all('codex_outputs' not in x for x in byid['train_'+arm]['cmd'])
+
+
+def test_goal_progress_is_read_only():
+    from tools.simvla.attention_query_eval import goal_progress
+    env=SimpleNamespace(env=SimpleNamespace(parsed_problem={'goal_state':['on','closed']},
+        _eval_predicate=lambda x:x=='on'))
+    assert goal_progress(env)==dict(predicates=['on','closed'],satisfied=[True,False])
+
+
+def test_failed_arm_does_not_block_independent_followups(monkeypatch,tmp_path):
+    from tools.simvla import attention_query_campaign as c
+    monkeypatch.setattr(c.training,'OUTPUT',tmp_path)
+    monkeypatch.setattr(c.base,'OUTPUT',tmp_path)
+    monkeypatch.setattr(c.base,'ARMS',ARMS)
+    monkeypatch.setattr(c.base,'prepare',lambda:{'identity':'test'})
+    monkeypatch.setattr(c.base,'audit',lambda _:None)
+    monkeypatch.setattr(c,'wait_for_parent',lambda:[])
+    calls=[]
+    def run(output,plan,**kwargs):
+        calls.append(plan)
+        state=dict(completed=[],failed={plan[0]['id']:{'reason':'test'}})
+        c.base.write_json(output/'queue_status.json',state)
+        return 1
+    monkeypatch.setattr(c.base.queue,'run_queue',run)
+    assert c.run_ordered()==1
+    assert len(calls)==3 and all(len(plan)==8 for plan in calls)
+    assert all(j['cmd'][-1]==arm or arm in j['id'] for arm,plan in zip(ARMS,calls) for j in plan)
