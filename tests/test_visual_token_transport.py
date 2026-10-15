@@ -126,3 +126,16 @@ def test_queue_order_and_gpu_policy(monkeypatch,tmp_path):
         for arm in training.ARMS:
             total=sum(byid[f'eval_{arm}_{i}']['completion']['episodes'] for i in range(1 if remote else 4))
             assert total==500
+
+
+def test_capacity_metric_and_known_spatial_permutation():
+    from tools.simvla.visual_transport_evidence import camera_local_distances
+    reference=(torch.randn(2,36,64),torch.randn(2,36,64))
+    target=tuple(x.flip(1) for x in reference)
+    distances=camera_local_distances(reference,target)
+    error,indices=distances.min(-1)
+    torch.testing.assert_close(error,torch.zeros(2,36),atol=0,rtol=0)
+    assert torch.equal(indices,torch.arange(36).flip(0)[None].expand(2,-1))
+    held=distances.diagonal(dim1=1,dim2=2)
+    expected=sum(((r-t).square().mean(-1)/t.square().mean(-1).clamp_min(1e-6)) for r,t in zip(reference,target))/2
+    torch.testing.assert_close(held,expected)
