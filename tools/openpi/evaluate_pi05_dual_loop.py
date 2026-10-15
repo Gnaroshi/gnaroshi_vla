@@ -75,14 +75,30 @@ def run(args):
         "numpy": np.__version__, "server": metadata,
         "protocol": {"H": 10, "R": 5, "wait_steps": 10, "max_policy_steps": 520,
                      "renderer": "egl", "camera_resolution": 256, "client_resize": 224}})
+    collecting = bool(getattr(args, 'collect_policy_data', False))
     manifest = json.loads(Path(config["final_manifest"]).read_text())
+    suite = benchmark.get_benchmark_dict()["libero_10"]()
+    if collecting:
+        final_hashes = {r['initial_state_identifier'] for r in manifest['episodes'] if r['suite']=='libero_10'}
+        collected=[]
+        for task_id in range(10):
+            states=suite.get_task_init_states(task_id)
+            if len(states)<80:raise ValueError('Need disjoint initial states50..79 for DAgger')
+            for trial in range(50,80):
+                h=hashlib.sha256(np.ascontiguousarray(np.asarray(states[trial])).tobytes()).hexdigest()
+                if h in final_hashes:raise ValueError('DAgger/final initial state overlap')
+                collected.append(dict(suite='libero_10',benchmark_task_index=task_id,trial=trial,
+                    initial_state_identifier=h,environment_seed=107+trial,
+                    query_noise_key_prefix='%d:libero_10:%d:%d:'%(config['noise_seed'],task_id,trial),max_episode_steps=520))
+        manifest=dict(manifest,episodes=collected)
+        atomic_json(output/'collection_manifest.json',manifest)
     selected = [r for r in manifest["episodes"] if r["suite"] == "libero_10"]
-    if len(selected) != 500 or len({(r["benchmark_task_index"], r["trial"]) for r in selected}) != 500:
+    expected_count=300 if collecting else 500
+    if len(selected) != expected_count or len({(r["benchmark_task_index"], r["trial"]) for r in selected}) != expected_count:
         raise ValueError("expected 10 tasks x 50 unique trials")
     selected.sort(key=lambda r: (r["benchmark_task_index"], r["trial"]))
     if args.smoke:
         selected = selected[:1]
-    suite = benchmark.get_benchmark_dict()["libero_10"]()
     progress = tqdm(selected, desc=args.row, unit="episode", mininterval=2.0)
     env = None
     previous_task = None
@@ -95,6 +111,8 @@ def run(args):
                 prior = json.loads(episode_path.read_text())
                 if prior["config_id"] != config["config_id"]:
                     raise ValueError("episode provenance mismatch")
+                if collecting and not episode_path.with_suffix('.npz').exists():
+                    raise RuntimeError('Saved collection outcome has no matching observations')
                 successes += int(prior["outcome"]["success"])
                 continue
             task = suite.get_task(task_id)
@@ -124,6 +142,7 @@ def run(args):
             done = False
             actions = []
             images = []
+            recorded_observations=[]
             limit = 10 if args.smoke else int(frozen["max_episode_steps"])
             if not args.smoke and limit != 520:
                 raise ValueError("wrong pi0.5 LIBERO-Long episode horizon")
@@ -140,12 +159,18 @@ def run(args):
                     metric = dict(reply["latentloop_metrics"])
                     metric.update(client_roundtrip_ms=(time.perf_counter() - call_start) * 1000,
                                   executed_actions_actual=0)
-                    expected_expert = 10 if args.row in ("baseline", "condition_k2") else 3
-                    expected_grid = 3 if args.row == "naive_nfe3" else 10
+                    if config.get('comparison_contract') == 'condition_bridge_nfe1':
+                        expected_expert, expected_grid = 1, 1
+                    else:
+                        expected_expert = 10 if args.row in ("baseline", "condition_k2") else 3
+                        expected_grid = 3 if args.row == "naive_nfe3" else 10
                     if metric["action_expert_calls"] != expected_expert or metric["flow_iterations"] != expected_grid:
                         raise ValueError("runtime action expert/grid counters differ from requested row")
                     queries.append(metric)
                     plan.extend(chunk[:5])
+                    if collecting:
+                        recorded_observations.append((request['observation/image'],request['observation/wrist_image'],
+                            request['observation/state'],chunk[0]))
                     if trial == 0:
                         images.append(image)
                 action = plan.popleft()
@@ -158,6 +183,12 @@ def run(args):
                        "queries": len(queries), "wall_seconds": time.perf_counter() - started,
                        "row": args.row, "video_warning": ""}
             np.save(output / "episodes" / ("task%02d_trial%03d_actions.npy" % (task_id, trial)), np.asarray(actions))
+            if collecting and recorded_observations:
+                np.savez_compressed(episode_path.with_suffix('.npz'),
+                    image=np.stack([r[0] for r in recorded_observations]),
+                    wrist=np.stack([r[1] for r in recorded_observations]),
+                    state=np.stack([r[2] for r in recorded_observations]),
+                    first_action=np.stack([r[3] for r in recorded_observations]),prompt=np.asarray(task.language))
             if images:
                 try:
                     import imageio
@@ -175,6 +206,12 @@ def run(args):
         if env is not None:
             env.close()
         summarize(output, config["config_id"], args.row, args.smoke)
+    if collecting:
+        paths=sorted((output/'episodes').glob('task*_trial*.npz'))
+        if len(paths)!=300:raise RuntimeError('Incomplete on-policy collection')
+        atomic_json(output/'collection_summary.json',dict(complete=True,episodes=300,config_id=config['config_id'],row=args.row,
+            compressed_observation_bytes=sum(p.stat().st_size for p in paths),KV_cache_bytes=0,
+            final_evaluation_initial_states_disjoint=True))
 
 
 if __name__ == "__main__":
@@ -184,4 +221,5 @@ if __name__ == "__main__":
     p.add_argument("--row", required=True)
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--smoke", action="store_true")
+    p.add_argument("--collect-policy-data", action="store_true")
     run(p.parse_args())
