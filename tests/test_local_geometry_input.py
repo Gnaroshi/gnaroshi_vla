@@ -149,3 +149,22 @@ def test_followups_survive_independent_job_failure(campaign,monkeypatch):
     monkeypatch.setattr(c.base.queue,'run_queue',run)
     assert c.run() == 1
     assert len(calls) == 4
+
+
+def test_initially_satisfied_goal_is_not_new_progress():
+    from tools.simvla.local_geometry_evidence import classify
+    record = dict(query_goal_progress=[dict(satisfied=[False,False,True])],
+                  terminal_goal_progress=dict(satisfied=[False,False,True]))
+    labels = classify(record)
+    assert labels['some_at_end']
+    assert not labels['newly_achieved_after_start']
+
+
+def test_losing_an_achieved_goal_without_simultaneous_success():
+    from tools.simvla.local_geometry_evidence import classify
+    record = dict(query_goal_progress=[dict(satisfied=s) for s in
+                  [[False,False],[True,False],[False,True]]],
+                  terminal_goal_progress=dict(satisfied=[False,True]))
+    labels = classify(record)
+    assert labels['newly_achieved_after_start'] and labels['lost_newly_achieved']
+    assert labels['all_ever_not_simultaneous']
