@@ -189,3 +189,22 @@ def test_runtime_smoke_loads_only_matching_two_step_checkpoint(monkeypatch,tmp_p
     write_json(folder/'summary.json',summary)
     with pytest.raises(RuntimeError):
         runtime.model_payload({'identity':'test'},ARMS[0])
+
+
+def test_final_comparison_uses_equal_budget_control(campaign,monkeypatch,tmp_path):
+    from tools.simvla import local_geometry_final_comparison as final
+    c = campaign
+    monkeypatch.setattr(c.base,'checked',lambda:dict(identity='test',matched_parent_sha256='parent'))
+    monkeypatch.setattr(c.training.parent,'OUTPUT',tmp_path/'parent')
+    c.base.write_json(tmp_path/'parent/rows/visual_predictor_only/summary.json',dict(success_rate=.794))
+    summaries,records = {},{}
+    for index,arm in enumerate(ARMS):
+        summaries[arm] = dict(success_rate=(400+index)/500,policy_ms_per_action=12.+index)
+        records[arm] = [dict(task_id=t,trial_id=n,success=(t*50+n)<400+index)
+                        for t in range(10) for n in range(50)]
+        c.base.write_json(tmp_path/'rows'/arm/'summary.json',summaries[arm])
+    monkeypatch.setattr(c.base,'merged_result',lambda _,arm:(summaries[arm],records[arm]))
+    result = final.summarize()
+    assert result['complete'] and result['equal_budget_control']==ARMS[0]
+    assert result['matched_comparisons'][ARMS[1]]['success_rate_difference_pp']==pytest.approx(.2)
+    assert result['matched_comparisons'][ARMS[2]]['paired_outcomes']['net_success_change']==2
