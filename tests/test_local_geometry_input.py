@@ -168,3 +168,24 @@ def test_losing_an_achieved_goal_without_simultaneous_success():
     labels = classify(record)
     assert labels['newly_achieved_after_start'] and labels['lost_newly_achieved']
     assert labels['all_ever_not_simultaneous']
+
+
+def test_runtime_smoke_loads_only_matching_two_step_checkpoint(monkeypatch,tmp_path):
+    from tools.simvla import local_geometry_inference_smoke as runtime
+    from tools.simvla.compile_benchmark import write_json,sha
+    monkeypatch.setattr(runtime.training,'OUTPUT',tmp_path)
+    folder = tmp_path/'train_smoke'/ARMS[0]
+    folder.mkdir(parents=True)
+    checkpoint = folder/'latest.pt'
+    torch.save(dict(identity='test',arm=ARMS[0],step=2,model={}),checkpoint)
+    summary = dict(verdict='TRAIN_SMOKE_PASS',identity='test',steps=2,
+                   checkpoint=str(checkpoint),checkpoint_sha256=sha(checkpoint))
+    write_json(folder/'summary.json',summary)
+    payload,_ = runtime.model_payload({'identity':'test'},ARMS[0])
+    assert payload['step'] == 2
+    with pytest.raises(RuntimeError):
+        runtime.model_payload({'identity':'other'},ARMS[0])
+    summary['steps'] = 10000
+    write_json(folder/'summary.json',summary)
+    with pytest.raises(RuntimeError):
+        runtime.model_payload({'identity':'test'},ARMS[0])
