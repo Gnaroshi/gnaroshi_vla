@@ -1,5 +1,6 @@
 """Matched 16K-parameter cross-token and tokenwise Condition updates."""
 import copy
+from types import MethodType
 
 import torch
 from torch import nn
@@ -97,6 +98,12 @@ class InteractingUpdater(TokenSharedConditionUpdater):
             gate=torch.where(valid_mask.unsqueeze(-1), gate, torch.zeros_like(gate)))
 
 
+def prepare_with_original_only_bypass(self, anchor, images, proprio, valid_mask, group_ids, interval=8):
+    if type(interval) is int and interval == 1:
+        return None
+    return self._interaction_prepare(anchor, images, proprio, valid_mask, group_ids, interval)
+
+
 def install(model, kind, *, warm, seed=7):
     parent = model.late.condition_updater
     if isinstance(parent, InteractingUpdater):
@@ -110,6 +117,8 @@ def install(model, kind, *, warm, seed=7):
     # Reuse the established training audit for a frozen early updater.
     model.short_training_arm = 'protected_short'
     model.interaction_kind, model.interaction_warm = kind, warm
+    model._interaction_prepare = model.prepare
+    model.prepare = MethodType(prepare_with_original_only_bypass, model)
     return model
 
 

@@ -135,3 +135,19 @@ def test_remote_jobs_require_both_smokes_and_evaluations():
     assert set(plan[-1]['deps'])=={'selected_seed1_eval','selected_seed2_eval'}
     for job in plan:
         assert job['completion']['identity']=='test'
+
+
+@pytest.mark.parametrize('warm', [True,False])
+@pytest.mark.parametrize('kind', ['attention','mlp'])
+def test_actual_parent_classes_support_original_only_bypass(warm,kind):
+    from tools.simvla.geometry_comparison_rb2 import construct
+    native=NativeSimVLAV0()
+    parent=construct(native) if warm else build_model(native,'fresh_joint')
+    model=install(parent,kind,warm=warm)
+    assert model.prepare(None,None,None,None,None,1) is None
+    z=torch.randn(1,7,960);rgb=torch.zeros(1,2,32,32,3,dtype=torch.uint8);q=torch.randn(1,8)
+    valid=torch.ones(1,7,dtype=torch.bool);groups=torch.zeros(1,7,dtype=torch.long)
+    for interval in (4,8):
+        context=model.prepare(z,rgb,q,valid,groups,interval)
+        assert context.interval==interval
+        assert torch.equal(context.previous,z)
