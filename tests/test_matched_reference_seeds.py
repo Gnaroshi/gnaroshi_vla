@@ -57,6 +57,19 @@ def test_queue_independent_retries_and_full_length():
         assert Path(full['summary']).parent.name == row
 
 
+def test_future_predecessor_becomes_priority_when_it_starts(tmp_path):
+    specs = study.predecessor_specs(tmp_path)
+    assert not study.queue.predecessor_pending(specs)
+    lock = study.queue.acquire_lock(tmp_path / 'evaluation/queue.lock')
+    try:
+        assert study.queue.predecessor_pending(specs)
+        assert study.predecessor_specs(tmp_path) == specs
+        assert study.queue.predecessor_pending(specs)
+    finally:
+        lock.close()
+    assert not study.queue.predecessor_pending(specs)
+
+
 @pytest.mark.parametrize('row', study.ROWS)
 def test_scoped_seed_and_restoration(row, monkeypatch):
     from tools.simvla import age_specialization_eval as recurrent

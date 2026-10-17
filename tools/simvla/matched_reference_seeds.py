@@ -199,6 +199,19 @@ def jobs(c):
     return result
 
 
+def predecessor_specs(root):
+    result = []
+    for phase in ('preselection', 'evaluation'):
+        directory = root / phase
+        # The selected-model queue is created only after sd1 exports its weights.
+        # A released placeholder lets the same lock take priority when it starts.
+        handle = queue.acquire_lock(directory / 'queue.lock')
+        if handle is not None:
+            handle.close()
+        result.append(dict(path=str(directory), lock='queue.lock'))
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('all', 'preflight', 'smoke', 'eval', 'summarize'))
@@ -214,8 +227,7 @@ def main():
     write_json(OUTPUT / 'planned_jobs.json', plan)
     print('PREFLIGHT_PASS', len(plan), 'jobs; three missing Long500 second-noise rows', flush=True)
     if args.command == 'preflight':return 0
-    predecessors = [dict(path=str(RESULTS / 'token_interaction/matched_nfe1_v1' / phase), lock='queue.lock')
-                    for phase in ('preselection', 'evaluation')]
+    predecessors = predecessor_specs(RESULTS / 'token_interaction/matched_nfe1_v1')
     rc = queue.run_queue(OUTPUT, plan, gpus=(0,), predecessor=predecessors,
                         environment=prior.environment, cwd=ROOT, timeout=12*3600)
     summarize();return rc
