@@ -67,7 +67,7 @@ def prepare():
         for key in ('checkpoint_revision', 'norm_stats', 'bridge_checkpoint', 'libero_root', 'libero_config'):
             if model['config'][key] != cfg[key]:
                 raise RuntimeError('Reference config changed: ' + key)
-        expected_hash = model['sha256'] if row == ROWS[0] else sha(cfg['bridge_checkpoint'])
+        expected_hash = model['sha256'] if row == 'recurrent_parent_k4' else sha(cfg['bridge_checkpoint'])
         directory = root / 'rows' / row
         records = [read_json(p) for p in (directory / 'episodes').glob('*.json')]
         summary = validate_records(read_json(directory / 'summary.json'), records, m, old['identity'], expected_hash)
@@ -125,7 +125,7 @@ def runtime_scope(row, c):
     from tools.simvla import age_specialization_eval as recurrent
     from tools.simvla import visual_memory_followup_eval as bridge
     from tools.simvla import condition_interval_compare as interval
-    evaluation = recurrent if row == ROWS[0] else bridge
+    evaluation = recurrent if row == 'recurrent_parent_k4' else bridge
     original_study, original_writer = evaluation.study, evaluation.write_json
     original_builder, original_bridge = prior.build_policy, interval.policy_factory
     seed = c['manifest']['action_noise_seed_base']
@@ -158,7 +158,7 @@ def runtime_scope(row, c):
 def evaluate(row, smoke=False):
     c = checked()
     with runtime_scope(row, c) as evaluation:
-        if row == ROWS[0]:
+        if row == 'recurrent_parent_k4':
             evaluation.evaluate('recurrent', 'parent', 4, smoke=smoke)
         else:
             evaluation.evaluate(row, smoke=smoke)
@@ -183,7 +183,7 @@ def summarize():
                 if first['policy_ms_per_action'] is not None and summary['policy_ms_per_action'] is not None else None)
     write_json(OUTPUT / 'comparison_summary.json', dict(identity=c['identity'], rows=rows,
         complete=len(rows) == len(ROWS), seed_scope=c['seed_scope'],
-        other_references='Bridge f2/f3 first-seed results remain available; no two-seed claim for them.'))
+        evaluated_rows=list(ROWS)))
 
 
 def jobs(c):
@@ -225,7 +225,7 @@ def main():
     if args.command == 'summarize':summarize();return 0
     c = prepare();plan = jobs(c)
     write_json(OUTPUT / 'planned_jobs.json', plan)
-    print('PREFLIGHT_PASS', len(plan), 'jobs; three missing Long500 second-noise rows', flush=True)
+    print('PREFLIGHT_PASS', len(plan), 'jobs;', len(ROWS), 'missing Long500 second-noise rows', flush=True)
     if args.command == 'preflight':return 0
     predecessors = predecessor_specs(RESULTS / 'token_interaction/matched_nfe1_v1')
     rc = queue.run_queue(OUTPUT, plan, gpus=(0,), predecessor=predecessors,
